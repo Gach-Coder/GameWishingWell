@@ -1,5 +1,5 @@
 ============================================================
- 许愿井 Wishwell — 安卓 AI 游戏 Agent 平台 · 工程说明
+ 许愿井 GameWishingwell — 安卓 AI 游戏 Agent 平台 · 工程说明
  更新日期：2026-08-01
 ============================================================
 
@@ -32,135 +32,11 @@
 
 三、目录结构
 ------------------------------------------------------------
-GameWishingWell/
-├── settings.gradle.kts          # 模块声明 + 仓库配置（Aliyun 优先）
-├── build.gradle.kts             # 根构建脚本（插件 apply false）
-├── gradle.properties
-├── gradle/libs.versions.toml    # 版本目录（所有依赖版本唯一出处）
-├── gradlew / gradlew.bat        # wrapper（本地已缓存 8.11.1 发行版）
-├── local.properties             # sdk.dir（本机：C:/Users/Gach/AppData/Local/Android/Sdk）
-├── .gitignore
-└── app/
-    ├── build.gradle.kts         # applicationId com.gamewishingwell，版本 0.1.0
-    ├── proguard-rules.pro
-    └── src/
-        ├── main/
-        │   ├── AndroidManifest.xml      # INTERNET 权限；MainActivity exported+launcher
-        │   ├── assets/game_template.html    # 游戏模板外壳（首次生成时提供给模型参考）
-        │   ├── res/values/strings.xml   # app_name=许愿井 Wishwell
-        │   ├── res/values/themes.xml
-        │   ├── res/drawable/ + mipmap-anydpi-v26/   # 自适应启动图标
-        │   └── java/com/gamewishingwell/
-        │       ├── MainActivity.kt      # 单 Activity，setContent{ WishwellTheme{ WishwellApp() } }
-        │       ├── WishwellApplication.kt  # 全局 AppContainer 手动依赖注入
-        │       ├── data/                # 数据层
-        │       │   ├── Game.kt          # GameMeta / GameIndex / ChatMessage 数据模型（可序列化）
-        │       │   ├── GameRepository.kt    # 游戏库 + 草稿的文件读写
-        │       │   ├── SecurePrefs.kt   # Android Keystore AES-GCM 加密存储
-        │       │   └── SettingsRepository.kt  # LLM 配置（StateFlow + 加密持久化）
-        │       ├── llm/                 # LLM 双协议流式客户端
-        │       │   ├── LlmClient.kt     # 统一接口 + mergeConsecutive 工具
-        │       │   ├── ProviderPreset.kt    # 服务商预设（deepseek/kimi/openai/anthropic/custom）
-        │       │   ├── OpenAiCompatibleClient.kt  # /chat/completions SSE
-        │       │   └── AnthropicClient.kt       # /v1/messages SSE
-        │       ├── agent/               # Agent 层（平台灵魂）
-        │       │   ├── GameAgent.kt     # 会话状态机：生成/迭代/重试/修复/保存
-        │       │   ├── GamePrompt.kt    # 系统提示词 + 模板读取
-        │       │   └── HtmlExtractor.kt # 从模型回复抽码 + 校验（纯 JVM，可单测）
-        │       └── ui/                  # Compose UI 层
-        │           ├── Container.kt     # rememberContainer() CompositionLocal 取容器
-        │           ├── Theme.kt         # 亮/暗主题（主色 #5B4BFF）
-        │           ├── WishwellApp.kt   # NavHost 四路由 + 底部导航
-        │           ├── home/HomeScreen.kt       # 游戏库列表 + 继续上次创作
-        │           ├── chat/ChatScreen.kt       # 创作对话页（气泡 + 流式 + 操作条）
-        │           ├── game/GameScreen.kt       # WebView 全屏运行页 + 错误覆盖层
-        │           ├── settings/SettingsScreen.kt  # 服务商/Key/BaseUrl/Model/测试连接
-        │           └── viewmodels/      # Home / Chat / Game / Settings 四个 VM
-        └── test/java/com/gamewishingwell/
-            ├── agent/HtmlExtractorTest.kt  # 9 例：围栏/裸HTML/失败/外部链接/贪婪边界
-            ├── data/JsonTest.kt            # 3 例：序列化 round-trip
-            └── llm/OpenAiClientTest.kt     # 2 例：MockWebServer SSE + 错误处理
+
 
 四、模块与关键文件说明
 ------------------------------------------------------------
 
-【数据层 data/】
-- Game.kt：三个 @Serializable 模型。
-    GameMeta(id, title, description, createdAt, updatedAt, playCount) —— 游戏库索引条目；
-    GameIndex(games) —— 整个游戏库的索引文件结构；
-    ChatMessage(role, content) —— 会话消息，isUser / isSystem 便捷属性。
-- GameRepository.kt：全部磁盘 IO 的封装（协程 + Dispatchers.IO）。
-    · 已保存游戏：filesDir/games/<id>/index.html + session.json，索引 filesDir/games.json
-    · 未保存草稿：filesDir/drafts/latest.html + session.json
-    · 关键方法：listGames / saveGame / updateGameHtml(gameId, html, session, title?)
-      / loadGameHtml / loadGameSession / deleteGame / touchPlay（游玩次数+1）
-      / saveDraft / loadDraftHtml / loadDraftSession / hasDraft / clearDraft
-- SecurePrefs.kt：官方 security-crypto 已废弃，手写 Keystore AES-GCM（12 字节 IV +
-    128 位 tag，256 位密钥，别名 wishwell_master_key），Base64 存进 SharedPreferences。
-    API Key 等敏感配置用它加密落盘。
-- SettingsRepository.kt：LlmSettings(providerId, apiKey, baseUrl, model, systemPrompt)
-    的读写，StateFlow 暴露给 UI；save 时统一 trim 去尾斜杠；isConfigured() 判断是否可发请求。
-
-【LLM 层 llm/】
-- LlmClient.kt：统一接口 streamChat(messages, onDelta, onDone)，流式过程中逐字符回调
-    （打字机效果），异常以 LlmError 抛出。mergeConsecutive() 合并相邻同角色消息
-    （Anthropic 要求角色交替）。
-- ProviderPreset.kt：5 个预置服务商，各自带 baseUrl / 默认模型 / 协议类型：
-    DeepSeek(openai) / Kimi(openai) / OpenAI(openai) / Claude(anthropic) / 自定义(openai)。
-- OpenAiCompatibleClient.kt：POST {baseUrl}/chat/completions，Bearer 认证，
-    stream:true，逐行解析 "data:" 前缀，遇 "[DONE]" 结束，取 choices[0].delta.content。
-- AnthropicClient.kt：POST {baseUrl}/v1/messages，x-api-key + anthropic-version 头，
-    system 从消息中抽出单独传参，normalizeRoles 保证首条为 user 且角色交替，
-    SSE 取 content_block_delta 的 text。
-
-【Agent 层 agent/】
-- GamePrompt.kt：系统提示词，硬性要求模型：
-    只输出一个 ```html 围栏包裹的完整 HTML；禁止外部资源（CDN/图片/字体/JS 库），
-    图形用 Canvas 2D 自绘、音效用 WebAudio 振荡器；适配手机竖屏触控
-    （touch 事件 + preventDefault）；提供全局 restart()；中文界面；
-    迭代时若消息带 <game_code> 则输出修改后的完整 HTML（整体输出不省略）。
-- HtmlExtractor.kt：从模型回复抽码。优先取 ```html ... ``` 围栏（贪婪匹配到最后一
-    个闭合围栏），否则取 <html ... </html>（贪婪到最后一个闭合标签）；都取不到判失败。
-    校验：缺 DOCTYPE 给警告、含外部 URL 给警告（不拦截）。nonCodeText() 剥离代码块
-    得到模型说的话用于对话展示。
-- GameAgent.kt：核心会话状态机。对外暴露 StateFlow<GameSession>：
-    GameSession(messages, currentHtml, streamingText, lastWarning, isGenerating, error)。
-    · loadDraftSession() / loadGameSession(id)：从仓库加载会话（生成中则跳过，防并发覆盖）
-    · sendUserMessage(text)：主流程 —— 校验配置 → 追加 user 消息 → 置 isGenerating →
-      组装 API 消息（无 HTML 时附模板示例；有 HTML 时用 <game_code> 包裹完整旧代码）→
-      流式请求 → 抽码；抽码失败自动带原因重试一次；成功则更新 currentHtml 并落盘
-      （草稿或编辑中的已存游戏），失败则置 error 供 UI 展示
-    · fixWithError(jsError)：把 WebView 运行时错误文本发给模型要求修复
-    · saveCurrentGame(title)：草稿 → 新建游戏库条目；编辑态 → 更新原条目（含标题）
-    · newSession() / testConnection()（1 次连接测试）
-    注意：catch 里先重抛 CancellationException（协程取消不吞掉），避免切页闪现"生成失败"。
-
-【UI 层 ui/】
-- WishwellApp.kt：单 Activity 四路由导航：home / chat?gameId={gameId} /
-    game?source={source}&gameId={gameId} / settings；底部导航 3 tab；刻意不用
-    saveState/restoreState（避免全局 agent 会话串扰，每次进 tab 重新初始化 VM）。
-    · chat 页 onPlay：编辑已存游戏 → 从游戏目录加载最新版；草稿模式 → 加载草稿
-- home/HomeScreen.kt：游戏库列表卡片（标题/描述/时间/游玩次数），点开游玩，
-    菜单"继续编辑 / 删除"，有草稿时顶部"继续上次创作"卡片，空态引导，FAB 新创作。
-- chat/ChatScreen.kt：对话气泡流（用户右 / AI 左），流式时显示"正在生成…"，
-    出错显示 ErrorCard（再试一次/去设置），生成完成后出现操作条：立即游玩/保存/重做，
-    保存弹窗默认标题取首条指令，成功 Toast + 自动回首页。
-- game/GameScreen.kt：全屏黑底 WebView 运行页。WebView 配置：javaScriptEnabled、
-    domStorageEnabled，禁 allowContentAccess；loadDataWithBaseURL(null, html,...) 渲染；
-    WebChromeClient.onConsoleMessage 收集 ERROR → 显示"游戏运行出错"覆盖层，
-    可"让 AI 修复"（回创作页带错误发起修复）或关闭；顶部（返回/标题/草稿可保存），
-    底部操作条：重玩（reload）/ 复制HTML / 修改。草稿来源可从此页直接保存入库。
-- settings/SettingsScreen.kt：ExposedDropdownMenuBox 选服务商（MenuAnchorType），
-    API Key（可显隐）、Base URL、Model、systemPrompt 可编辑，保存 + 测试连接。
-- viewmodels/：薄封装层，调 container 里的仓库/Agent，各自暴露 StateFlow；
-    ChatViewModel 记住 lastInstruction 支持"重做"；GameViewModel 负责加载 HTML、
-    收集 JS 错误、fixErrorAndGo、保存草稿。
-
-【模板 assets/game_template.html】
-一个可玩的接球示例游戏（挡板 + 下落小球 + 得分 HUD + restart 按钮），演示全部
-约定能力：dpr 高分屏自适应、touch 事件 preventDefault 防滚动、requestAnimationFrame
-主循环 + dt 钳制(0.05s) 防跳帧、WebAudio 振荡器音效、全局 restart()。
-首次生成时模型拿到它做参考，之后可完全自由改写。
 
 五、核心流程
 ------------------------------------------------------------
@@ -177,33 +53,6 @@ GameWishingWell/
 5. 错误修复：
    WebView JS 报错 → 覆盖层 → "让 AI 修复" → 错误文本进会话发起新一轮生成。
 
-六、测试（app/src/test，共 14 例，全部通过）
+六、构建与运行
 ------------------------------------------------------------
-- HtmlExtractorTest（9）：围栏抽取 / 裸 HTML / 无 HTML 报错 / 大小写 / 外部链接警告 /
-  无完整 html 退回裸匹配 / 剥离对话文本 / JS 字符串含 </html> 不截断 / 含 ``` 不截断
-- JsonTest（3）：GameIndex 与 ChatMessage 序列化 round-trip
-- OpenAiClientTest（2）：MockWebServer 模拟 SSE 流式解析与错误响应
 
-七、构建与运行
-------------------------------------------------------------
-命令行（无 Android Studio 环境亦可）：
-  ./gradlew assembleDebug                # 产物 app/build/outputs/apk/debug/app-debug.apk
-  ./gradlew testDebugUnitTest            # 单元测试
-  ./gradlew assembleDebug testDebugUnitTest
-模拟器/真机：
-  adb install -r app/build/outputs/apk/debug/app-debug.apk
-  adb shell am start -n com.gamewishingwell/.MainActivity
-也可直接用 Android Studio（D:\APP\AndroidStudio）File → Open 打开本工程。
-
-八、已知限制（非阻塞）
-------------------------------------------------------------
-- LLM 流式请求走 OkHttp execute，不可取消：生成中切走页面，旧流仍会读完（最长
-  180s 读超时），新会话加载因 isGenerating 守卫被跳过，期间短暂显示"生成中"，
-  流结束后自愈。后续可用可取消的协程式 SSE 客户端优化。
-- 每次迭代携带全量 HTML，token 消耗随游戏变大。
-- 模型偶发输出非标准结构 → 抽码 + 自动重试兜底。
-
-九、git 历史
-------------------------------------------------------------
-016ebee  feat: 许愿井 Wishwell MVP — AI 游戏 Agent 平台
-7966e4c  fix: 响应验证修复编辑态保存/游玩、会话并发守卫与抽码边界
