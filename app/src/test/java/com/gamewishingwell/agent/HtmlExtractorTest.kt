@@ -74,4 +74,13 @@ class HtmlExtractorTest {
         assertNotNull(result.html)
         assertTrue(result.html!!.contains("var t = \"```\""))
     }
+
+    @Test
+    fun `中断时从未完成流中抢救可尝试游玩的 HTML`() {
+        val partial = HtmlExtractor.extractPartial("好的，下面是游戏代码：\n```html\n<html><body><canvas id=\"game\"></canvas><script>")
+        assertNotNull(partial)
+        assertTrue(partial!!.startsWith("<html", ignoreCase = true))
+        assertTrue(partial.endsWith("</html>", ignoreCase = true))
+        assertTrue(partial.contains("canvas"))
+    }
 }

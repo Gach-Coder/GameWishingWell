@@ -27,7 +27,12 @@ data class IntentSchema(
     val referenceGame: String? = null,
     val templateId: String? = null,
     val templateSimilarity: Double? = null,
-    val confidence: Double = 0.0
+    val confidence: Double = 0.0,
+    /**
+     * true 表示 templateId 已经由确认门修正合并显式决定；
+     * validate 不再根据 referenceGame 反向重新匹配模板，避免把玩家刚去掉的模板补全系统加回来。
+     */
+    val lockTemplateResolution: Boolean = false
 ) {
     companion object {
         const val INTENT_NEW_GAME = "new_game"
@@ -50,7 +55,9 @@ data class IntentConfirmation(
     /** 人话摘要，确认门回显用。 */
     val summary: String,
     /** 由模板/策划默认值补出来的设计假设，必须逐条回显。 */
-    val designAssumptions: List<String> = emptyList()
+    val designAssumptions: List<String> = emptyList(),
+    /** 确认门回显的每个系统一句话解释，供玩家逐项核对。 */
+    val systemExplanations: List<String> = emptyList()
 )
 
 /** 内部模板库条目：著名对标游戏 → template_id + 特征建议。 */
@@ -103,6 +110,33 @@ object GameSystemCatalog {
     }
 
     fun isValid(system: String): Boolean = ALL.contains(system)
+
+    private val descriptions: Map<String, String> = mapOf(
+        "人物实体" to "玩家可操作的角色，包含移动、朝向与基础状态。",
+        "道具" to "可拾取/使用的物品，提供增益、反馈或推进游戏流程。",
+        "战斗" to "敌人、攻击与受击判定，以及胜负条件。",
+        "技能" to "主动技能，包含冷却、释放与命中反馈。",
+        "属性等级" to "等级/分数成长，升级后带来数值或能力变化。",
+        "关卡场景" to "多个递进关卡或场景，以及关卡切换逻辑。",
+        "AI策略" to "电脑角色的简单状态机或可读决策规则。",
+        "商店经济" to "金币等货币产出，以及购买升级的消费闭环。",
+        "收集" to "掉落物收集、收集计数与完成反馈。",
+        "解谜" to "核心谜题规则与胜利/失败判定。",
+        "物理" to "简化重力/碰撞等确定性运动参数。",
+        "音乐节奏" to "节拍判定、命中反馈与节奏玩法循环。",
+        "塔防" to "防御塔建造、敌人波次与基地生命值。",
+        "合成" to "同元素合成规则与合成升级。",
+        "放置挂机" to "自动产出与时间/离线收益。",
+        "经营模拟" to "资源循环、建造/升级与经营目标。",
+        "竞速" to "速度与操控、完成条件与名次判定。",
+        "平台跳跃" to "跳跃与平台碰撞，以及失败重置。",
+        "弹幕射击" to "玩家射击、敌方弹幕与命中判定。",
+        "反应躲避" to "点按/滑动响应、失误判定与计分。",
+    )
+
+    /** 每个系统的一句话解释，确认门逐项回显给玩家。 */
+    fun describe(system: String): String =
+        descriptions[system] ?: "按该系统的基础规则实现，具体细节由策划层补全。"
 }
 
 object TemplateLibrary {
@@ -178,7 +212,11 @@ object IntentSchemaValidator {
 
         val systems = schema.gameSystems.filter { GameSystemCatalog.isValid(it) }.distinct()
         val template = schema.templateId?.let { TemplateLibrary.findById(it) }
-        val matched = TemplateLibrary.match(schema.referenceGame.orEmpty())
+        val matched = if (schema.lockTemplateResolution) {
+            null
+        } else {
+            TemplateLibrary.match(schema.referenceGame.orEmpty())
+        }
         val templateId = if (template != null) template.id else matched?.first?.id
         val similarity = if (template != null) schema.templateSimilarity else matched?.second
 
@@ -190,7 +228,8 @@ object IntentSchemaValidator {
             referenceGame = schema.referenceGame?.takeIf { it.isNotBlank() },
             templateId = templateId,
             templateSimilarity = similarity?.coerceIn(0.0, 1.0),
-            confidence = schema.confidence.coerceIn(0.0, 1.0)
+            confidence = schema.confidence.coerceIn(0.0, 1.0),
+            lockTemplateResolution = schema.lockTemplateResolution
         )
     }
 
@@ -257,25 +296,14 @@ object IntentEngine {
             else -> IntentSchema.INTENT_NEW_GAME
         }
 
-        var dimension = IntentSchema.DIMENSION_2D
-        if (Regex("2\\.5\\s*d|伪3d|斜45|2.5D", RegexOption.IGNORE_CASE).containsMatchIn(text)) {
-            dimension = IntentSchema.DIMENSION_2_5D
-        } else if (Regex("(?<!2\\.5)3d|三维|立体", RegexOption.IGNORE_CASE).containsMatchIn(text)) {
-            dimension = IntentSchema.DIMENSION_3D
-        }
-
-        val orientation = if (Regex("横板|横版|横屏|landscape", RegexOption.IGNORE_CASE).containsMatchIn(text)) {
-            IntentSchema.ORIENTATION_LANDSCAPE
-        } else {
-            IntentSchema.ORIENTATION_PORTRAIT
-        }
-
+        val dimension = explicitDimension(text) ?: IntentSchema.DIMENSION_2D
+        val orientation = explicitOrientation(text) ?: IntentSchema.ORIENTATION_PORTRAIT
         val systems = GameSystemCatalog.extract(text)
         val match = TemplateLibrary.match(text)
         val confidence = (
             0.55 +
-                (if (dimension != IntentSchema.DIMENSION_2D || Regex("2d|二维", RegexOption.IGNORE_CASE).containsMatchIn(text)) 0.1 else 0.0) +
-                (if (orientation != IntentSchema.ORIENTATION_PORTRAIT || Regex("竖", RegexOption.IGNORE_CASE).containsMatchIn(text)) 0.1 else 0.0) +
+                (if (dimension != IntentSchema.DIMENSION_2D || explicitDimension(text) != null) 0.1 else 0.0) +
+                (if (orientation != IntentSchema.ORIENTATION_PORTRAIT || explicitOrientation(text) != null) 0.1 else 0.0) +
                 (systems.size * 0.05).coerceAtMost(0.2) +
                 (if (match != null) 0.15 else 0.0)
             ).coerceIn(0.0, 1.0)
@@ -293,6 +321,109 @@ object IntentEngine {
             )
         )
     }
+
+    /** 确认门最终要实现的系统集合：用户明确系统 + 模板补全系统；全空时使用默认轻量框架。 */
+    fun plannedSystems(schema: IntentSchema): List<String> {
+        val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
+        val merged = (schema.gameSystems + (ref?.suggestedSystems ?: emptyList()))
+            .filter { GameSystemCatalog.isValid(it) }
+            .distinct()
+        return merged.ifEmpty { DEFAULT_SYSTEMS }
+    }
+
+    /**
+     * 确认门上的用户修正合并：显式字段以玩家修正为准，未提到的字段继承已确认结果；
+     * 玩家明确“不要/去掉”的系统会从模板补全与默认集合中一并移除。
+     */
+    fun mergeCorrection(confirmed: IntentSchema, correction: IntentSchema, correctionText: String): IntentSchema {
+        val dimension = if (explicitDimension(correctionText) != null) correction.visualDimension else confirmed.visualDimension
+        val orientation = if (explicitOrientation(correctionText) != null) correction.screenOrientation else confirmed.screenOrientation
+
+        val removed = negatedSystems(correctionText)
+        val correctionMatch: Pair<GameTemplateRef, Double>? = TemplateLibrary.match(correctionText)
+            ?: correction.templateId?.let { id ->
+                TemplateLibrary.findById(id)?.let { it to (correction.templateSimilarity ?: 0.5) }
+            }
+        val dropsReference = negatesReference(correctionText)
+        val baseline = when {
+            // 明确换对标游戏：系统基线切到新模板，避免旧模板系统被带过来。
+            correctionMatch != null && !dropsReference -> correctionMatch.first.suggestedSystems
+            // 明确不要参考：只保留玩家已经明确过的系统，不再套模板默认值。
+            dropsReference -> confirmed.gameSystems.ifEmpty { DEFAULT_SYSTEMS }
+            else -> plannedSystems(confirmed)
+        }
+        val systems = (baseline + correction.gameSystems)
+            .filterNot { removed.contains(it) }
+            .distinct()
+
+        val dropsTemplate = dropsReference ||
+            (confirmed.templateId != null && removed.any { system ->
+                TemplateLibrary.findById(confirmed.templateId)?.suggestedSystems?.contains(system) == true
+            })
+        val referenceGame: String?
+        val templateId: String?
+        val templateSimilarity: Double?
+        when {
+            dropsReference -> {
+                referenceGame = null
+                templateId = null
+                templateSimilarity = null
+            }
+            correctionMatch != null -> {
+                referenceGame = correctionMatch.first.title
+                templateId = correctionMatch.first.id
+                templateSimilarity = correctionMatch.second
+            }
+            dropsTemplate -> {
+                referenceGame = confirmed.referenceGame
+                templateId = null
+                templateSimilarity = null
+            }
+            else -> {
+                referenceGame = confirmed.referenceGame
+                templateId = confirmed.templateId
+                templateSimilarity = confirmed.templateSimilarity
+            }
+        }
+
+        return IntentSchemaValidator.validate(
+            IntentSchema(
+                intent = confirmed.intent,
+                visualDimension = dimension,
+                screenOrientation = orientation,
+                gameSystems = systems,
+                referenceGame = referenceGame,
+                templateId = templateId,
+                templateSimilarity = templateSimilarity,
+                confidence = maxOf(confirmed.confidence, correction.confidence),
+                lockTemplateResolution = true
+            )
+        )
+    }
+
+    private fun explicitDimension(text: String): String? = when {
+        Regex("2\\.5\\s*d|伪3d|斜45|2.5D", RegexOption.IGNORE_CASE).containsMatchIn(text) -> IntentSchema.DIMENSION_2_5D
+        Regex("(?<!2\\.5)3d|三维|立体", RegexOption.IGNORE_CASE).containsMatchIn(text) -> IntentSchema.DIMENSION_3D
+        Regex("(?<![A-Za-z0-9])2d(?![A-Za-z0-9])|二维|平面", RegexOption.IGNORE_CASE).containsMatchIn(text) -> IntentSchema.DIMENSION_2D
+        else -> null
+    }
+
+    private fun explicitOrientation(text: String): String? = when {
+        Regex("横板|横版|横屏|landscape", RegexOption.IGNORE_CASE).containsMatchIn(text) -> IntentSchema.ORIENTATION_LANDSCAPE
+        Regex("竖版|竖屏|portrait|竖", RegexOption.IGNORE_CASE).containsMatchIn(text) -> IntentSchema.ORIENTATION_PORTRAIT
+        else -> null
+    }
+
+    private fun negatedSystems(text: String): Set<String> =
+        Regex(
+            "(?:不要|别要|去掉|删除|移除|取消|砍掉|去除|没有|别加|不加|无需|不需要|不用)[^。.!！?？;；,，、\n]{0,20}",
+            RegexOption.IGNORE_CASE
+        ).findAll(text)
+            .flatMap { GameSystemCatalog.extract(it.value) }
+            .toSet()
+
+    private fun negatesReference(text: String): Boolean =
+        Regex("不要参考|不参考|去掉对标|不要对标|不用参考|别参考|移除对标|取消对标|不要做成", RegexOption.IGNORE_CASE).containsMatchIn(text)
 
     /** 把正则结果与 Lite LLM 结果合并：合法字段优先采用 LLM，缺失字段回退正则。 */
     fun merge(regexResult: IntentSchema, liteResult: IntentSchema?): IntentSchema {
@@ -314,61 +445,78 @@ object IntentEngine {
         )
     }
 
-    /** 生成确认门的人话摘要。 */
+    /** 生成确认门的人话摘要：画面维度 / 方向 / 游戏系统 / 对标游戏与默认值假设。 */
     fun buildConfirmation(userRequest: String, schema: IntentSchema): IntentConfirmation {
+        val planned = plannedSystems(schema)
+        val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
+        val rawSystems = (schema.gameSystems + (ref?.suggestedSystems ?: emptyList())).distinct()
+
         val sb = StringBuilder()
         when (schema.intent) {
             IntentSchema.INTENT_NEW_GAME -> sb.append("我识别到你想新建一个游戏")
             IntentSchema.INTENT_MODIFY_GAME -> sb.append("我识别到你要在当前游戏上继续修改")
             IntentSchema.INTENT_CHAT -> sb.append("我识别到这是一个普通对话")
         }
-        sb.append("：画面 ${schema.visualDimension}、${schema.screenOrientation}。")
-        if (schema.gameSystems.isNotEmpty()) {
-            sb.append("涉及系统：${schema.gameSystems.joinToString("、")}。")
+        sb.append("：画面维度 ${schema.visualDimension}、画面方向 ${schema.screenOrientation}。")
+        if (rawSystems.isNotEmpty()) {
+            sb.append("游戏系统：${planned.joinToString("、")}。")
         } else {
-            sb.append("未明确指定系统，默认按核心玩法补全。")
+            sb.append("未明确指定游戏系统，默认按核心玩法补全：${planned.joinToString("、")}。")
         }
         if (schema.referenceGame != null) {
             sb.append("参考对标游戏：${schema.referenceGame}")
             if (schema.templateId != null) {
                 sb.append("（已映射模板 ${schema.templateId}，相似度 ${((schema.templateSimilarity ?: 0.0) * 100).toInt()}%）")
+            } else if (schema.lockTemplateResolution) {
+                sb.append("（已按你的修正改为自定义系统组合，不再套用原模板默认值）")
             } else {
                 sb.append("（模板库无对应条目，template:null）")
             }
             sb.append("。")
         }
-        sb.append("确认后进入策划与代码生成。")
+        sb.append("请核对下面的系统解释与默认假设，确认后进入策划与代码生成。")
 
         val assumptions = buildAssumptions(schema)
         return IntentConfirmation(
             userRequest = userRequest,
             intent = schema,
             summary = sb.toString(),
-            designAssumptions = assumptions
+            designAssumptions = assumptions,
+            systemExplanations = planned.map { "${it}：${GameSystemCatalog.describe(it)}" }
         )
     }
 
     /** 被映射/默认值补全的设计假设，逐条回显。 */
     fun buildAssumptions(schema: IntentSchema): List<String> {
         val result = mutableListOf<String>()
-        if (schema.visualDimension == IntentSchema.DIMENSION_2D && schema.referenceGame == null) {
-            result.add("画面维度默认假设为 2D")
-        }
-        if (schema.screenOrientation == IntentSchema.ORIENTATION_PORTRAIT) {
-            result.add("画面方向默认假设为竖版（手机单手操作）")
-        }
         val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
+        val rawSystems = (schema.gameSystems + (ref?.suggestedSystems ?: emptyList())).distinct()
         if (ref != null) {
+            if (schema.visualDimension == ref.suggestedDimension) {
+                result.add("参考「${ref.title}」模板，画面维度按 ${ref.suggestedDimension} 实现")
+            }
+            if (schema.screenOrientation == ref.suggestedOrientation) {
+                result.add("参考「${ref.title}」模板，画面方向按 ${ref.suggestedOrientation} 实现")
+            }
             val added = ref.suggestedSystems.filterNot { schema.gameSystems.contains(it) }
             if (added.isNotEmpty()) {
                 result.add("参考「${ref.title}」模板，将补全系统：${added.joinToString("、")}")
             }
+        } else {
+            if (schema.visualDimension == IntentSchema.DIMENSION_2D) {
+                result.add("画面维度默认假设为 2D")
+            }
+            if (schema.screenOrientation == IntentSchema.ORIENTATION_PORTRAIT) {
+                result.add("画面方向默认假设为竖版（手机单手操作）")
+            }
         }
-        if (schema.gameSystems.isEmpty() && ref == null) {
+        if (rawSystems.isEmpty() && ref == null) {
             result.add("未指定游戏系统，将按“反应躲避 + 收集”的默认轻量框架补全")
         }
         return result
     }
+
+    private val DEFAULT_SYSTEMS = listOf("反应躲避", "收集")
 
     /** Lite LLM 抽取提示词：只输出 Intent Schema JSON。 */
     fun liteLlmPrompt(userText: String): String = """

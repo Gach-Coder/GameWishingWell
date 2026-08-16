@@ -12,9 +12,12 @@ import com.gamewishingwell.llm.LlmError
 import com.gamewishingwell.llm.OpenAiCompatibleClient
 import com.gamewishingwell.llm.Protocol
 import com.gamewishingwell.llm.ProviderPresets
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -72,6 +75,7 @@ object AgentStage {
     const val FAILED = "制作失败"
     const val CHAT = "对话回复中"
     const val FIXING = "修复中"
+    const val INTERRUPTED = "已中断"
 }
 
 /**
@@ -98,6 +102,10 @@ class GameAgent(
 
     private val agentScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val turnMutex = Mutex()
+
+    /** 当前正在执行的 Agent Loop 任务；停止键取消该任务。 */
+    @Volatile
+    private var activeGenerationJob: Job? = null
     private val sessionJson = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -113,6 +121,40 @@ class GameAgent(
     }
 
     private val smokeRunner by lazy { injectedSmokeRunner ?: AndroidSmokeTestRunner(appContext) }
+
+    private fun trackGenerationJob(job: Job): Job {
+        activeGenerationJob = job
+        job.invokeOnCompletion {
+            if (activeGenerationJob === job) activeGenerationJob = null
+        }
+        return job
+    }
+
+    /**
+     * 停止键：随时中断当前 Agent Loop。
+     * 中断后保留最近一次已抽取出的 HTML 候选（如果有），玩家可立即尝试游玩；
+     * 该候选可能尚未通过校验/冒烟，运行错误属于正常现象。
+     */
+    fun stopGeneration() {
+        val current = _session.value
+        val job = activeGenerationJob
+        if (!current.isGenerating) return
+        if (job?.isActive == true) job.cancel()
+        activeGenerationJob = null
+        val interrupted = current.copy(
+            isGenerating = false,
+            streamingText = null,
+            agentStage = AgentStage.INTERRUPTED,
+            error = null,
+            qualityVerdict = null,
+            lastWarning = if (current.currentHtml != null) {
+                "已手动中断：当前保留中断前的代码版本，可能尚未通过完整校验，尝试游玩可能出现运行错误。"
+            } else {
+                "已手动中断：尚未生成可运行的代码，可以继续补充需求后重新开始。"
+            }
+        )
+        _session.value = interrupted
+    }
 
     // ---------- 会话管理 ----------
 
@@ -189,9 +231,9 @@ class GameAgent(
             qualityVerdict = null
         )
         _session.value = base
-        val job = agentScope.launch {
+        val job = trackGenerationJob(agentScope.launch {
             runUserTurn(trimmed, priorConfirmation, isConfirmPhrase)
-        }
+        })
         job.join()
     }
 
@@ -209,38 +251,52 @@ class GameAgent(
             qualityVerdict = null
         )
         _session.value = base
-        val job = agentScope.launch {
+        val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
                 generateFromIntent(pending.userRequest, pending.intent, _session.value.currentHtml, null)
             }
-        }
+        })
         job.join()
     }
 
-    /** 确认门：用户提交修正/补充，合并后直接进入策划与生成。 */
+    /**
+     * 确认门：用户提交修正/补充后只重组摘要并再次回显，仍停留在确认门；
+     * 直到玩家明确点击“按此方案生成”或发送确认语句，才进入策划与生成。
+     */
     suspend fun correctIntent(correction: String) {
         val pending = _session.value.pendingConfirmation ?: return
         if (_session.value.isGenerating) return
-        val merged = IntentEngine.merge(pending.intent, IntentEngine.infer(correction, _session.value.currentHtml))
-        val userRequest = pending.userRequest + "\n补充/修正：" + correction.trim()
+        val trimmed = correction.trim()
+        if (trimmed.isBlank()) return
+
+        val inferred = IntentEngine.infer(trimmed, _session.value.currentHtml)
+        val merged = IntentEngine.mergeCorrection(pending.intent, inferred, trimmed)
+        val userRequest = pending.userRequest + "\n补充/修正：" + trimmed
         val confirmation = IntentEngine.buildConfirmation(userRequest, merged)
-        val base = _session.value.copy(
-            messages = _session.value.messages + ChatMessage("assistant", confirmation.summary),
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = AgentStage.PLANNING,
-            pendingConfirmation = null,
-            budget = RetryBudget(),
-            qualityVerdict = null
-        )
-        _session.value = base
-        val job = agentScope.launch {
-            turnMutex.withLock {
-                generateFromIntent(userRequest, merged, _session.value.currentHtml, null)
+        val assistantReply = buildString {
+            append("已根据你的修正重新整理需求：\n")
+            append(confirmation.summary)
+            if (confirmation.systemExplanations.isNotEmpty()) {
+                append("\n\n系统说明：\n")
+                confirmation.systemExplanations.forEach { append("· $it\n") }
             }
+            append("\n请在下方确认，或继续补充修正。")
         }
-        job.join()
+        val next = _session.value.copy(
+            messages = _session.value.messages +
+                ChatMessage("user", "补充/修正：$trimmed") +
+                ChatMessage("assistant", assistantReply),
+            pendingConfirmation = confirmation,
+            isGenerating = false,
+            streamingText = null,
+            agentStage = AgentStage.CONFIRM,
+            error = null,
+            designPlan = null,
+            qualityVerdict = null,
+            budget = RetryBudget()
+        )
+        _session.value = next
+        persistSessionMessages(next)
     }
 
     /** 把游戏运行时的 JS 错误交给 AI 修复（运行时错误格式：file:line + stack + console 片段）。 */
@@ -286,7 +342,7 @@ class GameAgent(
             gameSystems = s.designPlan?.gameSystems ?: emptyList(),
             confidence = 1.0
         )
-        val job = agentScope.launch {
+        val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
                 generateFromIntent(
                     instruction = instruction,
@@ -296,7 +352,7 @@ class GameAgent(
                     p0Only = degrade
                 )
             }
-        }
+        })
         job.join()
     }
 
@@ -337,6 +393,7 @@ class GameAgent(
 
     private suspend fun runUserTurn(instruction: String, priorConfirmation: IntentConfirmation?, isConfirmPhrase: Boolean) {
         turnMutex.withLock {
+            currentCoroutineContext().ensureActive()
             val s = _session.value
             if (!isConfigured()) {
                 failTurn(s, "请先在「设置」中配置 API Key、地址和模型")
@@ -352,13 +409,15 @@ class GameAgent(
             val local = IntentEngine.infer(instruction, s.currentHtml)
             val lite = try {
                 requestIntentFromLiteLlm(instruction)
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 null
             }
             val current = IntentEngine.merge(local, lite)
-            // 确认门上的补充/修正：把新实体合并进原 Intent Schema，避免丢失已确认系统。
+            // 确认门上的补充/修正：合并回原 Intent Schema，并再次回显等待确认。
             val schema = if (priorConfirmation != null && !isConfirmPhrase) {
-                IntentEngine.merge(priorConfirmation.intent, current)
+                IntentEngine.mergeCorrection(priorConfirmation.intent, current, instruction)
             } else {
                 current
             }
@@ -368,15 +427,16 @@ class GameAgent(
                 return@withLock
             }
 
-            // 有确认门遗留时，用户输入即视为修正/确认，直接进入策划层。
+            // 有确认门遗留时，用户输入视为修正；重新生成摘要，直到用户明确确认才进入策划层。
             val effectiveRequest = if (priorConfirmation != null && !isConfirmPhrase) {
                 priorConfirmation.userRequest + "\n补充/修正：" + instruction
             } else {
                 instruction
             }
             val confirmation = IntentEngine.buildConfirmation(effectiveRequest, schema)
+            val assistantReply = confirmationMessage(confirmation, if (priorConfirmation != null) "已根据你的补充重新整理需求" else "已识别需求")
             val next = _session.value.copy(
-                messages = _session.value.messages + ChatMessage("assistant", "已识别需求，请在下方确认，或直接补充修正。"),
+                messages = _session.value.messages + ChatMessage("assistant", assistantReply),
                 pendingConfirmation = confirmation,
                 isGenerating = false,
                 streamingText = null,
@@ -386,9 +446,22 @@ class GameAgent(
                 qualityVerdict = null,
                 budget = RetryBudget()
             )
+            currentCoroutineContext().ensureActive()
             _session.value = next
             persistSessionMessages(next)
         }
+    }
+
+    /** 确认门消息：摘要 + 每个系统的一句话解释 + 操作提示。 */
+    private fun confirmationMessage(confirmation: IntentConfirmation, prefix: String): String = buildString {
+        append(prefix)
+        append("：\n")
+        append(confirmation.summary)
+        if (confirmation.systemExplanations.isNotEmpty()) {
+            append("\n\n系统说明：\n")
+            confirmation.systemExplanations.forEach { append("· $it\n") }
+        }
+        append("\n请在下方确认，或继续补充修正。")
     }
 
     private suspend fun requestIntentFromLiteLlm(userText: String): IntentSchema? {
@@ -420,6 +493,8 @@ class GameAgent(
                     ChatMessage("user", instruction)
                 )
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             failTurn(_session.value, "对话失败：${e.message}")
             return
@@ -450,11 +525,16 @@ class GameAgent(
 
         var plan = forcePlan ?: PlanningEngine.build(intent)
         if (p0Only) plan = PlanningEngine.p0Only(plan)
+        val planningStage = if (plan.gameSystems.isEmpty()) {
+            "游戏策划中：正在规划 ${plan.primarySystem} 的系统方案"
+        } else {
+            "游戏策划中：正在规划 ${plan.gameSystems.joinToString("、")} 的系统方案"
+        }
         _session.value = _session.value.copy(
             isGenerating = true,
             error = null,
             streamingText = null,
-            agentStage = AgentStage.PLANNING,
+            agentStage = planningStage,
             designPlan = plan,
             filePlan = listOf("index.html"),
             decisionLog = _session.value.decisionLog + "策划定稿：${plan.templateClass}，P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
@@ -471,8 +551,16 @@ class GameAgent(
 
         while (round < 10) {
             round++
+            currentCoroutineContext().ensureActive()
+
+            val module = moduleForRound(plan, round)
+            val genStage = if (existingHtml.isNullOrBlank()) {
+                "代码生成中：正在生成「$module」系统模块"
+            } else {
+                "代码生成中：正在修改「$module」系统模块"
+            }
             _session.value = _session.value.copy(
-                agentStage = AgentStage.CODE_GENERATION,
+                agentStage = genStage,
                 budget = budget,
                 streamingText = null
             )
@@ -487,16 +575,18 @@ class GameAgent(
                         feedback = feedback,
                         p0Only = fallbackUsed
                     ),
-                    stageLabel = AgentStage.CODE_GENERATION
+                    stageLabel = genStage
                 )
-            } catch (e: kotlinx.coroutines.CancellationException) {
+            } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 failTurn(_session.value, "生成失败：${e.message}")
                 return
             }
 
+            currentCoroutineContext().ensureActive()
             val extracted = HtmlExtractor.extract(reply)
+            currentCoroutineContext().ensureActive()
             if (extracted.html == null) {
                 val category = ErrorCategory.SYNTAX
                 val normalized = ErrorSignature.normalize(extracted.error ?: "no-html")
@@ -511,17 +601,31 @@ class GameAgent(
                 budget = action.budget
                 fallbackUsed = action.fallback
                 if (action.fallback) plan = PlanningEngine.p0Only(plan)
-                _session.value = _session.value.copy(budget = budget, knownErrors = known, lastError = feedback, agentStage = AgentStage.VALIDATION)
+                _session.value = _session.value.copy(
+                    budget = budget,
+                    knownErrors = known,
+                    lastError = feedback,
+                    agentStage = "校验中：正在检查 Agent 输出是否为完整 HTML"
+                )
                 continue
             }
 
             val candidate = extracted.html
-            _session.value = _session.value.copy(agentStage = AgentStage.VALIDATION, streamingText = null)
+            // 一旦抽出候选 HTML 就发布到 session：用户中断后可立即尝试游玩该中间版本。
+            currentCoroutineContext().ensureActive()
+            val validationModule = moduleForRound(plan, round + 1)
+            _session.value = _session.value.copy(
+                currentHtml = candidate,
+                agentStage = "校验中：正在校验「$validationModule」系统模块（语法 / HTML 配对 / DOM 引用）",
+                streamingText = null
+            )
             val report = GameValidator.validate(candidate)
+            currentCoroutineContext().ensureActive()
             lastReport = report
 
             val verdict = QualityGate.evaluate(report, plan, candidate)
             lastVerdict = verdict
+            currentCoroutineContext().ensureActive()
             _session.value = _session.value.copy(qualityVerdict = verdict)
 
             if (report.hasErrors || !verdict.pass) {
@@ -556,14 +660,23 @@ class GameAgent(
                     knownErrors = known,
                     knownIssues = report.warnings.map { "${it.category}:${it.message}" },
                     lastError = feedback,
-                    agentStage = AgentStage.CODE_GENERATION
+                    agentStage = if (category == ErrorCategory.DESIGN_SCOPE) {
+                        "策划中：正在回炉「$module」系统的范围并重排 P0 清单"
+                    } else {
+                        "校验中：正在为「$module」系统生成修复方案"
+                    }
                 )
                 continue
             }
 
             // 静态校验全过后才允许冒烟测试。
-            _session.value = _session.value.copy(agentStage = AgentStage.SMOKE)
+            currentCoroutineContext().ensureActive()
+            val smokeModule = moduleForRound(plan, round + 2)
+            _session.value = _session.value.copy(
+                agentStage = "冒烟测试中：正在测试「$smokeModule」系统"
+            )
             val smoke = runSmoke(candidate)
+            currentCoroutineContext().ensureActive()
             if (!smoke.passed) {
                 val category = ErrorCategory.STATIC_RUNTIME
                 val normalized = ErrorSignature.normalize(smoke.errors.joinToString(";").ifBlank { "smoke-failed" })
@@ -578,7 +691,12 @@ class GameAgent(
                 budget = action.budget
                 fallbackUsed = action.fallback
                 if (action.fallback) plan = PlanningEngine.p0Only(plan)
-                _session.value = _session.value.copy(budget = budget, knownErrors = known, lastError = feedback)
+                _session.value = _session.value.copy(
+                    budget = budget,
+                    knownErrors = known,
+                    lastError = feedback,
+                    agentStage = "冒烟测试中：正在整理「$smokeModule」系统的错误并准备修复"
+                )
                 continue
             }
 
@@ -586,6 +704,7 @@ class GameAgent(
             break
         }
 
+        currentCoroutineContext().ensureActive()
         if (acceptedHtml == null) {
             failTurn(_session.value, "Agent Loop 达到最大轮次仍未产出可运行游戏")
             return
@@ -632,8 +751,17 @@ class GameAgent(
                 "冒烟测试通过"
             )
         )
+        currentCoroutineContext().ensureActive()
         _session.value = next
         persistSession(next)
+    }
+
+    /** 子阶段显示的当前系统模块：按轮次在系统列表中轮换，避免只显示固定主系统。 */
+    private fun moduleForRound(plan: DesignPlan, round: Int): String {
+        val systems = plan.gameSystems
+        if (systems.isEmpty()) return plan.primarySystem.ifBlank { "核心玩法" }
+        val index = ((round - 1) % systems.size + systems.size) % systems.size
+        return systems[index]
     }
 
     private fun consumeOrFallback(budget: RetryBudget, category: ErrorCategory): BudgetAction? {
@@ -660,11 +788,14 @@ class GameAgent(
 
     private suspend fun runSmoke(html: String): SmokeTestResult = try {
         smokeRunner.run(html)
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: Exception) {
         SmokeTestResult(passed = false, errors = listOf(e.message ?: "smoke-runner-error"))
     }
 
     private suspend fun failTurn(s: GameSession, message: String) {
+        currentCoroutineContext().ensureActive()
         val failed = s.copy(
             isGenerating = false,
             streamingText = null,
@@ -787,19 +918,33 @@ class GameAgent(
     ): String {
         val sb = StringBuilder()
         var lastProgressMark = 0
-        llm.streamChat(
-            messages,
-            onDelta = { delta ->
-                sb.append(delta)
-                // SSE 打字机状态：只回显 Agent 阶段 + 接收进度，绝不复述源代码。
-                if (stageLabel != null && sb.length - lastProgressMark >= 200) {
-                    lastProgressMark = sb.length
-                    _session.value = _session.value.copy(agentStage = "$stageLabel · 已接收 ${sb.length} 字符")
+        try {
+            llm.streamChat(
+                messages,
+                onDelta = { delta ->
+                    sb.append(delta)
+                    // SSE 打字机状态：只回显 Agent 阶段 + 接收进度，绝不复述源代码。
+                    if (stageLabel != null && sb.length - lastProgressMark >= 200) {
+                        lastProgressMark = sb.length
+                        _session.value = _session.value.copy(agentStage = "$stageLabel · 已接收 ${sb.length} 字符")
+                    }
+                },
+                onThinking = { /* 思考过程属于内部信号，不回显到前端 */ },
+                onDone = {}
+            )
+        } catch (e: CancellationException) {
+            // 代码生成流被停止键中断时，抢救未收完的 HTML，让玩家仍可“立即游玩”中间版本。
+            if (stageLabel != null) {
+                HtmlExtractor.extractPartial(sb.toString())?.let { partial ->
+                    _session.value = _session.value.copy(
+                        currentHtml = partial,
+                        lastWarning = "生成已中断，当前为未完成代码；立即游玩可能出现运行错误。",
+                        agentStage = AgentStage.INTERRUPTED
+                    )
                 }
-            },
-            onThinking = { /* 思考过程属于内部信号，不回显到前端 */ },
-            onDone = {}
-        )
+            }
+            throw e
+        }
         return sb.toString()
     }
 

@@ -2,7 +2,7 @@ package com.gamewishingwell.llm
 
 import com.gamewishingwell.data.ChatMessage
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -36,7 +36,8 @@ class AnthropicClient(
         onThinking: (String) -> Unit,
         onDone: () -> Unit
     ) {
-        withContext(Dispatchers.IO) {
+        // runInterruptible：停止键取消协程时中断阻塞中的 OkHttp SSE 读取。
+        runInterruptible(Dispatchers.IO) {
             val system = messages.filter { it.role == "system" }.joinToString("\n\n") { it.content }
             val chat = mergeConsecutive(messages.filterNot { it.role == "system" })
             // Anthropic 要求首条消息为 user 且角色交替

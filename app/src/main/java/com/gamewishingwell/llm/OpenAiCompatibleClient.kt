@@ -2,7 +2,7 @@ package com.gamewishingwell.llm
 
 import com.gamewishingwell.data.ChatMessage
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.runInterruptible
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -39,10 +39,12 @@ class OpenAiCompatibleClient(
         onThinking: (String) -> Unit,
         onDone: () -> Unit
     ) {
-        withContext(Dispatchers.IO) {
+        // runInterruptible：停止键取消协程时中断阻塞中的 OkHttp SSE 读取，保证“随时中断”。
+        runInterruptible(Dispatchers.IO) {
             try {
                 executeStream(buildRequest(messages, includeMaxTokens = true, includeThinking = true), onDelta, onThinking, onDone)
             } catch (e: LlmError) {
+                if (Thread.currentThread().isInterrupted) throw e
                 val msg = e.message ?: ""
                 when {
                     // 个别老模型不支持 max_tokens 字段，收到相关 4xx 时去掉该字段重试
@@ -75,7 +77,7 @@ class OpenAiCompatibleClient(
             .build()
     }
 
-    private suspend fun executeStream(
+    private fun executeStream(
         request: Request,
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit,

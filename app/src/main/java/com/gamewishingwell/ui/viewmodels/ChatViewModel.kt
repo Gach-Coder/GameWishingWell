@@ -41,6 +41,10 @@ class ChatViewModel(
         }
     }
 
+    fun stopGeneration() {
+        agent.stopGeneration()
+    }
+
     fun fixError(error: String) {
         viewModelScope.launch { agent.fixWithError(error) }
     }

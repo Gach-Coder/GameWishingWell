@@ -18,6 +18,23 @@ object HtmlExtractor {
     private val htmlRegex = Regex("(?:<!DOCTYPE\\s+html[^>]*>\\s*)?<html[\\s\\S]*</html>", RegexOption.IGNORE_CASE)
     private val externalUrlRegex = Regex("""\b(?:https?://|//[a-z][a-z0-9.-]*[/'"])""", RegexOption.IGNORE_CASE)
 
+    /**
+     * 生成被用户中断时，从尚未收完的流式文本中抢救出一个“可尝试游玩”的中间版本。
+     * 没有完整闭合标签时会补上最小 HTML 收尾；该版本可能运行错误，属于正常现象。
+     */
+    fun extractPartial(raw: String): String? {
+        val complete = runCatching { extract(raw) }.getOrNull()?.html
+        if (complete != null) return complete
+
+        val start = raw.indexOf("<html", ignoreCase = true)
+        if (start < 0) return null
+        var partial = raw.substring(start)
+        if (!partial.contains("</html>", ignoreCase = true)) {
+            partial = partial.trimEnd() + "\n</body></html>"
+        }
+        return partial
+    }
+
     fun extract(raw: String): ExtractResult {
         val warnings = mutableListOf<String>()
 

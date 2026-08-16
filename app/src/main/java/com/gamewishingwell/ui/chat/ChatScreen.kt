@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
@@ -162,12 +163,14 @@ fun ChatScreen(
             InputRow(
                 value = input,
                 enabled = !session.isGenerating,
+                isGenerating = session.isGenerating,
                 placeholder = inputPlaceholder,
                 onValueChange = { input = it },
                 onSend = {
                     vm.send(input.trim())
                     input = ""
-                }
+                },
+                onStop = { vm.stopGeneration() }
             )
         }
     }
@@ -226,11 +229,6 @@ private fun TypingBubble(stage: String) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Text(
-                "Agent Loop：意图识别 → 策划 → 生成 → 校验 → 冒烟测试",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-            )
         }
     }
 }
@@ -258,10 +256,25 @@ private fun IntentConfirmationCard(
                 confirmation.summary,
                 style = MaterialTheme.typography.bodySmall
             )
+            if (confirmation.systemExplanations.isNotEmpty()) {
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    "系统说明（每个系统会实现什么）：",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+                )
+                confirmation.systemExplanations.forEach { explanation ->
+                    Text(
+                        "· $explanation",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
             if (confirmation.designAssumptions.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
-                    "设计假设（如与预期不符请直接补充修正）：",
+                    "默认值 / 对标游戏假设（如与预期不符请直接补充修正）：",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
                 )
@@ -300,7 +313,7 @@ private fun IntentConfirmationCard(
             }
             Spacer(Modifier.size(4.dp))
             Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) {
-                Text("按此方案生成")
+                Text("确认，按此方案生成")
             }
         }
     }
@@ -379,9 +392,11 @@ private fun ErrorCard(
 private fun InputRow(
     value: String,
     enabled: Boolean,
+    isGenerating: Boolean,
     placeholder: String,
     onValueChange: (String) -> Unit,
-    onSend: () -> Unit
+    onSend: () -> Unit,
+    onStop: () -> Unit
 ) {
     Surface(tonalElevation = 2.dp) {
         Row(
@@ -393,17 +408,27 @@ private fun InputRow(
             OutlinedTextField(
                 value = value,
                 onValueChange = onValueChange,
+                enabled = enabled,
                 modifier = Modifier.weight(1f),
                 placeholder = { Text(placeholder) },
                 maxLines = 3,
                 shape = RoundedCornerShape(24.dp)
             )
             Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = onSend,
-                enabled = enabled && value.isNotBlank()
-            ) {
-                Text("发送")
+            if (isGenerating) {
+                // 发送后按钮切换为停止键，可随时中断 Agent Loop。
+                Button(onClick = onStop) {
+                    Icon(Icons.Filled.Close, contentDescription = "停止")
+                    Spacer(Modifier.width(4.dp))
+                    Text("停止")
+                }
+            } else {
+                Button(
+                    onClick = onSend,
+                    enabled = enabled && value.isNotBlank()
+                ) {
+                    Text("发送")
+                }
             }
         }
     }

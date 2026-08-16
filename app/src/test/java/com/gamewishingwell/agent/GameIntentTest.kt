@@ -61,4 +61,60 @@ class GameIntentTest {
         assertTrue(confirmation.summary.contains("竖版"))
         assertTrue(confirmation.designAssumptions.isNotEmpty())
     }
+
+    @Test
+    fun `确认门逐项解释最终要实现的系统`() {
+        val schema = IntentEngine.infer("做一个塔防游戏", null)
+        val confirmation = IntentEngine.buildConfirmation("做一个塔防游戏", schema)
+        assertTrue(confirmation.summary.contains("画面维度"))
+        assertTrue(confirmation.summary.contains("画面方向"))
+        assertTrue(confirmation.summary.contains("塔防"))
+        assertTrue(confirmation.systemExplanations.any { it.startsWith("塔防：") })
+        // 塔防模板补全的系统也要解释
+        assertTrue(confirmation.systemExplanations.any { it.startsWith("战斗：") })
+    }
+
+    @Test
+    fun `玩家修正 2D 能覆盖已确认的 3D`() {
+        val confirmed = IntentSchema(
+            intent = IntentSchema.INTENT_NEW_GAME,
+            visualDimension = IntentSchema.DIMENSION_3D,
+            screenOrientation = IntentSchema.ORIENTATION_LANDSCAPE,
+            gameSystems = listOf("竞速")
+        )
+        val corrected = IntentEngine.mergeCorrection(
+            confirmed,
+            IntentEngine.infer("改成2D竖版", null),
+            "改成2D竖版"
+        )
+        assertEquals(IntentSchema.DIMENSION_2D, corrected.visualDimension)
+        assertEquals(IntentSchema.ORIENTATION_PORTRAIT, corrected.screenOrientation)
+    }
+
+    @Test
+    fun `玩家修正换成新对标游戏时不继承旧模板系统`() {
+        val confirmed = IntentEngine.infer("做一个塔防游戏", null)
+        val corrected = IntentEngine.mergeCorrection(
+            confirmed,
+            IntentEngine.infer("换成2048", null),
+            "换成2048"
+        )
+        assertEquals("merge_2048", corrected.templateId)
+        assertTrue("塔防" !in IntentEngine.plannedSystems(corrected))
+        assertTrue("合成" in IntentEngine.plannedSystems(corrected))
+    }
+
+    @Test
+    fun `玩家修正可去掉模板补全系统`() {
+        val confirmed = IntentEngine.infer("做一个塔防游戏", null)
+        val corrected = IntentEngine.mergeCorrection(
+            confirmed,
+            IntentEngine.infer("不要AI策略", null),
+            "不要AI策略"
+        )
+        assertTrue("AI策略" !in corrected.gameSystems)
+        assertTrue("AI策略" !in IntentEngine.plannedSystems(corrected))
+        assertTrue("塔防" in corrected.gameSystems)
+        assertNull(corrected.templateId)
+    }
 }
