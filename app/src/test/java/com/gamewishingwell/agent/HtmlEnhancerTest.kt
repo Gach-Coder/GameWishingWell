@@ -50,6 +50,15 @@ class HtmlEnhancerTest {
     }
 
     @Test
+    fun `注入游戏内设置面板与设置按钮`() {
+        val out = HtmlEnhancer.inject(htmlWithHead)
+        assertTrue(out.contains("__ww_game_settings_btn"))
+        assertTrue(out.contains("__ww_game_settings_overlay"))
+        assertTrue(out.contains("重新游戏"))
+        assertTrue(out.contains("音量"))
+    }
+
+    @Test
     fun `注入不破坏原有脚本`() {
         val out = HtmlEnhancer.inject(htmlWithHead)
         // 原脚本内容完整保留，捕获器只注入一份

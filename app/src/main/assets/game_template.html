@@ -11,15 +11,11 @@
   #g{display:block;width:100vw;height:100vh;background:#14142b;}
   #hud{position:fixed;top:14px;left:0;right:0;text-align:center;color:#fff;
     font:600 16px/1.6 system-ui,sans-serif;pointer-events:none;text-shadow:0 1px 2px rgba(0,0,0,.7);}
-  #btn{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);padding:10px 30px;
-    border:none;border-radius:22px;background:#7b5cff;color:#fff;font-size:15px;cursor:pointer;
-    box-shadow:0 4px 12px rgba(0,0,0,.35);}
 </style>
 </head>
 <body>
 <canvas id="g"></canvas>
 <div id="hud">得分：<span id="score">0</span></div>
-<button id="btn" onclick="restart()">重新开始</button>
 <script>
 'use strict';
 var canvas = document.getElementById('g'), ctx = canvas.getContext('2d');
