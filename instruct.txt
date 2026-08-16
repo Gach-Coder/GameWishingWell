@@ -1,58 +1,274 @@
 ============================================================
- 许愿井 GameWishingwell — 安卓 AI 游戏 Agent 平台 · 工程说明
- 更新日期：2026-08-01
+ 许愿井 GameWishingWell — 安卓 AI 游戏 Agent 平台 · 工程说明
+ 更新日期：2026-08-16
 ============================================================
 
 一、项目简介
 ------------------------------------------------------------
-一个安卓端"游戏创作 Agent"平台，三个子页面：我的游戏(首页)，创作，设置」页配置
-1.“我的游戏(首页)”展示用户已经制作好的游戏，点击即可立即游玩。
-2.“创作”页面可以让用户用自然语言描述游戏（如"做一个打地鼠小游戏"），AI 即时生成制作单文件 HTML5 游戏，SSE 流式输出（打字机效果）。
-	界面逻辑类似豆包/元宝这类对话Agent，Agent Loop尽量保证验收标准（代码无语法错误可运行）。
-	切换页面或对话时允许后台运行，制作好后可在 WebView 里立刻运行游玩。
-	若点击运行出错则可让 AI 直接修复，也可继续对话迭代修改（"加连击计分"），修改基于上一版完整代码进行；
-	成品游戏可保存到本地游戏库（标题/描述/游玩次数），随时重开、继续编辑、删除。
-3.“设置”页面可以选择 LLM 厂商模型，配置 API Key（DeepSeek / Kimi / OpenAI / Claude / 自定义）；
+一个安卓端“游戏创作 Agent”平台，底部三个 Tab：我的游戏、创作、设置。
 
-核心思路：游戏不是编译出来的，而是 AI 生成的文本 = 可运行产物（HTML 文件），运行期由 WebView（Chromium 内核）解释执行。
-无编译环节，生成即玩；鸿蒙 ArkWeb 同为 Chromium 内核，双端可复用。
+1. “我的游戏（首页）”展示用户已经制作好的游戏，点击即可立即游玩；
+   每张游戏卡片显示：游戏名、用户描述、更新时间，支持：重命名、继续对话编辑、删除，
+   有未保存草稿时显示“继续上次创作”入口。
+2. “创作”页面可以用自然语言描述游戏（如“做一个打地鼠小游戏”），
+   AI 即时生成 Android WebView 平台运行的单人游戏(HTML+CSS+JavaScript)，LLM SSE 流式输出（打字机效果）。
+   - 交互形态类似豆包/元宝的对话 Agent：左侧 AI、右侧用户，生成中显示实时流。
+   - Agent Loop 内置：意图识别、prompt工程、抽码、基本校验、失败自动重试等功能，
+	tool call有读写文件和结构(权限严格限制在该游戏文件夹内)，尽量保证生成代码可直接运行。
+   - 切换页面/对话时生成任务在 ViewModel 协程与全局 GameAgent 中继续运行，制作完成后可在 WebView 中立刻游玩。
+   - 运行时 JS 报错会弹出覆盖层，可“让 AI 修复”；也可继续对话迭代（如“加连击计分”），修改基于上一个版本的游戏文件进行。
+   - 成品可保存到本地游戏库，每个游戏对应一个文件夹。
+3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
+   DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 自定义，
+   支持修改 Base URL、模型名、系统提示词，并可“测试连接”。
+   （注：Deepseek模型为deepseek-v4-flash和deepseek-v4-pro,已弃用deepseek-chat）
 
-二、技术栈（版本锁定于 gradle/libs.versions.toml）
+核心思路：游戏不是编译出来的，而是 AI 生成的文本 = 可运行产物（HTML 文件），
+运行期由 Android WebView（Chromium 内核）解释执行。无编译环节，生成即玩；
+鸿蒙 ArkWeb 同为 Chromium 内核，双端可复用。
+
+二、Agent核心说明
+前端 LLM SSE 不必要显示关于源代码的文本，只阶段显示 Agent 状态（游戏识别中/游戏策划中/代码生成中/校验中等）
+Agent处理message流程如下：
+	→ 意图层：(new_game/modify_game/chat)
+		正则 + Lite LLM 抽取游戏特征，输出 Intent Schema JSON（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值
+		解析实体包括：
+			画面维度：2D，2.5D，3D
+			画面方向：横板，竖版
+			游戏系统：人物实体，道具，战斗，技能，属性等级，关卡场景，AI策略，商店经济等。
+				(意图层事先定义较完整的游戏系统列表)
+			参考对标游戏：市场内的某著名游戏或无，可辅助补全游戏特性。（映射到内部模板库template_id + 相似度，映射不上返回 template:null）
+            （保留扩展位置）
+		确认门：意图抽取完成后先以人话摘要回显识别结果（画面维度 / 方向 / 游戏系统 / 对标游戏特性默认值假设），
+			待用户确认或修正后再进入下一步，确保已经获取用户全部需求
+  策划层；被映射的默认值逐条以"设计假设"回显，禁止静默纠正
+	→ 策划层：补全全部关键特性，输出完整策划 Schema JSON
+		按 template_class（画面维度×画面方向×主类型）选取特征矩阵（系统×默认参数），只做"选系统+覆盖参数"，不自由发明
+		定稿 P0/P1/P2 特性分层 + 验收标准清单（供自检对照，防止确认偏差）+复杂度/资源预算（预估行数/脚本数）
+		对于复杂的系统，代码层先隔离实现、优先校验
+		策划重做上限 2 轮，回炉时喂入错误签名 + P0清单，避免重复产出同样范围
+	→ Prompt：system 提示词 + 用户指令/策划 Schema 上下文最小化：
+		只放 rolling summary + 本次要动的文件内容，其余靠readfile按需取）
+	→ Agent Loop：
+		→ 先出文件计划和依赖顺序（plan）→ implement → validate，中途不换文件切分方案
+		→ tool call readfile/writefile 读/写已有的源码文件(HTML+CSS+JS)
+			写入用版本化文件 + 指针切换（或OPFS），替代临时文件+rename；同会话加锁 / 文件 hash校验防并发覆盖
+			修改已有文件用行级 patch，全量重写仅限首次生成
+			生成代码契约：无 eval、无动态require、浏览器全局白名单、声明前置；
+			校验用现成解析器（acorn 语法检查 + htmlparser2 HTML 配对 + eslint no-undef 规则），不自写 HTML 配对/作用域检查
+		→ 基本校验(
+			封装 validate 脚本，输出结构化 JSON {checks:[{category,file,line,message,severity}]}：
+				语法：acorn 解析（JS/WASM 版，替代 node --check）【修正/P0-2】
+				HTML 标签配对
+				JS 引用的 DOM id 存在性（区分运行时动态创建的 id 白名单）
+				静态运行时：引用未定义变量 / 函数
+				资源缺失：引用的图片 / 音频不存在
+				占位实现：TODO 标记 / 定义了但从未被调用的系统)
+		→ 冒烟测试（同 WebView 内隔离 iframe 加载生成的 game 实际跑几帧：
+			确定性 tick + 错误捕获 + 超时防定时器失控，替代 jsdom/Playwright；仅在静态校验全过后跑）
+		→ 失败自动重试（按错误分类+预算，预算记账持久化进 GameSession，跨会话不重置：
+			记账按"每次用户请求（回合）"计，错误签名库跨会话仅用于识别"同一错误"、不消耗预算：
+			语法错≤3次 / 静态运行时错≤3次 / 用户回传运行时错≤3次 / 设计范围错回策划层重做范围（≤2轮）
+			"同一错误"用规范化签名哈希判定（file:line + message正则化，行号漂移不影响匹配）
+			超预算降级发 P0-only 版本：确定性裁剪 P1/P2，保留 P0 机制，资产换占位符）
+		→ 自检：对照验收标准清单过一遍再宣布完成两段式：
+			(a)验收标准对照（必读校验结果，已发现的错不得翻案）
+			(b)代码质量检查输出结构化 verdict {pass, fails:[{item,severity}], note}
+		→ 更新 GameSession 并持久化（代码 + rolling summary：
+			文件清单、设计Schema、known-issues、上次错误、 决策 log（为什么这么改）+ 
+			schema_version + 每通过校验的版本打快照（可回滚）+ 增量持久化（只存变更文件））
+	→ HTML+CSS+JS game
+	→ 运行时报错（格式化回传：file:line + stack + console 片段）再回到Agent Loop 修复（同一错误重复2次直接降级，不重复修）
+	
+协议枚举与厂商默认预设：
+
+  厂商           baseUrl							默认模型								协议					最大token  关闭思考
+  -----------------------------------------------------------------------------------------------------------------------
+  DeepSeek		https://api.deepseek.com/v1		deepseek-v4-flash					OPENAI_COMPATIBLE	16384      否
+  Kimi			https://api.moonshot.cn/v1		moonshot-v1-8k     					OPENAI_COMPATIBLE   16384      否
+  OpenAI		https://api.openai.com/v1		gpt-4o-mini        					OPENAI_COMPATIBLE   16384      否
+  Claude		https://api.anthropic.com		claude-sonnet-4-6					ANTHROPIC           16384      否
+  自定义         （留空自填）                    （留空自填）       						OPENAI_COMPATIBLE   8192       否
+
+三、技术栈（版本统一锁定于 gradle/libs.versions.toml）
 ------------------------------------------------------------
-- Gradle 8.11.1 / AGP 8.9.1 / Kotlin 2.0.21（+ compose / serialization 插件）
-- Compose BOM 2024.12.01（material3），navigation-compose 2.8.5
+- Gradle Wrapper 8.11.1 / AGP 8.9.1 / Kotlin 2.0.21
+  （kotlin-android、org.jetbrains.kotlin.plugin.compose、kotlin-serialization 插件）
+- Jetpack Compose BOM 2024.12.01（Material3 + material-icons-core）
+- navigation-compose 2.8.5，activity-compose 1.9.3
+- androidx core-ktx 1.15.0、lifecycle 2.8.7（runtime-ktx / viewmodel-compose）
 - OkHttp 4.12.0（LLM SSE 流式请求）+ kotlinx-serialization-json 1.7.3
-- kotlinx-coroutines 1.9.0、androidx.webkit 1.12.1
+- kotlinx-coroutines-android 1.9.0、androidx.webkit 1.12.1
+- 测试：JUnit 4.13.2、OkHttp MockWebServer 4.12.0
+- applicationId / namespace：com.gamewishingwell
 - minSdk 26 / targetSdk 36 / compileSdk 36 / JDK 17
-- 仓库：Aliyun 镜像优先（国内网络），google() / mavenCentral() 兜底
+- versionCode 1、versionName 0.1.0；release 当前关闭混淆
+- 仓库：Aliyun 镜像优先（gradle-plugin、google、public），google() / mavenCentral() 兜底
 
-三、项目开发环境
-1. 本地测试软件(仿真运行apk环境)： D:\APP\AndroidStudio\bin
-2. 项目路径： D:\DATA\GitProjWorkSpace\GameWishingWell 
+四、项目开发环境
+------------------------------------------------------------
+1. 本地 IDE / 仿真运行 apk 环境：D:\APP\AndroidStudio\bin
+2. 项目路径：D:\DATA\GitProjWorkSpace\GameWishingWell
+3. Android SDK 路径记录于 local.properties（机器相关、已 gitignore），
+   当前值为 C:/Users/Gach/AppData/Local/Android/Sdk；换机器需修改。
+4. 构建需要 JDK 17（Android Studio 自带 JBR 即可）。
 
-三、目录结构
+五、目录结构
+------------------------------------------------------------
+以下为源码与配置文件结构；app/build、.gradle、.idea、.kotlin 为本地生成目录，不入库。
+
+GameWishingWell/
+├─ .gitignore
+├─ build.gradle.kts                  # 根构建脚本：声明各插件 alias apply false
+├─ settings.gradle.kts               # 仓库镜像、rootProject.name、include(":app")
+├─ gradle.properties                 # JVM 内存、AndroidX、并行构建与缓存
+├─ gradlew / gradlew.bat             # Gradle Wrapper 8.11.1
+├─ local.properties                  # 本机 sdk.dir（不入库）
+├─ instruct.txt                      # 本说明文件
+├─ gradle/
+│  ├─ libs.versions.toml             # 全工程版本目录（version catalog）
+│  └─ wrapper/                       # gradle-wrapper.jar / properties
+└─ app/
+   ├─ build.gradle.kts               # Android 应用模块构建脚本
+   ├─ proguard-rules.pro             # 混淆规则（当前 release 关闭混淆）
+   └─ src/
+      ├─ main/
+      │  ├─ AndroidManifest.xml
+      │  ├─ assets/
+      │  │  └─ game_template.html    # 首次生成时给 LLM 的示例游戏模板
+      │  ├─ java/com/gamewishingwell/
+      │  │  ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
+      │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
+      │  │  ├─ agent/
+      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机
+      │  │  │  ├─ GamePrompt.kt          # 系统提示词与模板读取
+      │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML + 校验
+      │  │  │  └─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入
+      │  │  ├─ data/
+      │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage
+      │  │  │  ├─ GameRepository.kt      # 游戏库与草稿文件存储
+      │  │  │  ├─ SecurePrefs.kt         # Keystore AES-GCM 加密偏好存储
+      │  │  │  └─ SettingsRepository.kt  # LLM 配置 StateFlow 仓库
+      │  │  ├─ llm/
+      │  │  │  ├─ LlmClient.kt               # 流式 LLM 客户端统一接口
+      │  │  │  ├─ OpenAiCompatibleClient.kt  # OpenAI 兼容 SSE 客户端
+      │  │  │  ├─ AnthropicClient.kt         # Anthropic Messages SSE 客户端
+      │  │  │  └─ ProviderPreset.kt          # 厂商预设与协议枚举
+      │  │  └─ ui/
+      │  │     ├─ WishwellApp.kt            # NavHost / 底部导航 / 路由表
+      │  │     ├─ Theme.kt                  # 亮色/暗色 Material3 主题
+      │  │     ├─ Container.kt              # 从 Application 获取容器
+      │  │     ├─ home/HomeScreen.kt        # 我的游戏页
+      │  │     ├─ chat/ChatScreen.kt        # 创作/编辑对话页
+      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页
+      │  │     ├─ settings/SettingsScreen.kt # 设置页
+      │  │     └─ viewmodels/
+      │  │        ├─ HomeViewModel.kt
+      │  │        ├─ ChatViewModel.kt
+      │  │        ├─ GameViewModel.kt
+      │  │        └─ SettingsViewModel.kt
+      │  └─ res/
+      │     ├─ values/strings.xml        # app_name = 许愿井 Wishwell
+      │     ├─ values/themes.xml         # Material Light NoActionBar 主题
+      │     ├─ drawable/                 # launcher 背景/前景
+      │     └─ mipmap-anydpi-v26/        # 自适应图标
+      └─ test/java/com/gamewishingwell/  # 本地 JVM 单元测试
+         ├─ agent/HtmlEnhancerTest.kt
+         ├─ agent/HtmlExtractorTest.kt
+         ├─ data/JsonTest.kt
+         └─ llm/OpenAiClientTest.kt
+
+六、模块与关键文件说明
 ------------------------------------------------------------
 
+5.1 根工程配置
+- settings.gradle.kts：
+  pluginManagement 使用 Aliyun gradle-plugin / google 镜像，再兜底 google()、mavenCentral()、
+  gradlePluginPortal()；dependencyResolutionManagement 使用 Aliyun google / public 镜像，
+  FAIL_ON_PROJECT_REPOS；仅包含 :app 模块。
+- build.gradle.kts：声明 android-application、kotlin-android、kotlin-compose、
+  kotlin-serialization 四个插件，apply false，由 app 模块实际应用。
+- gradle/libs.versions.toml：集中管理本文第二节约定的所有版本。
+- gradle.properties：-Xmx3g、UTF-8、AndroidX、parallel、caching。
+- app/build.gradle.kts：
+  compileSdk/targetSdk 36、minSdk 26、JDK 17；启用 Compose；
+  unitTests.isReturnDefaultValues = true（测试中 Android Log 等默认值可用）；
+  release 关闭混淆；debugImplementation ui-tooling；testImplementation JUnit + MockWebServer。
+- app/src/main/AndroidManifest.xml：
+  INTERNET 权限、usesCleartextTraffic=true；Application 为 WishwellApplication；
+  MainActivity exported=true、launcher、configChanges 与 adjustResize。
 
-四、模块与关键文件说明
+5.2 入口与依赖注入
+- MainActivity.kt：ComponentActivity，setContent { WishwellTheme { WishwellApp() } }。
+- WishwellApplication.kt：创建 AppContainer（SettingsRepository → GameRepository → GameAgent），
+  通过 Application 容器实现极简手动 DI。
+- ui/Container.kt：rememberContainer() 从 LocalContext 取全局 AppContainer。
+
+
+VIEWPORT_PRELUDE（视口修复 + 游戏内设置面板）：
+- 用 window.__wwViewportFixApplied 防重复执行；
+- 视口修复：取 window.innerHeight || documentElement.clientHeight，把
+  <html>/<body> 的 height/minHeight 固定为像素高度；创建 <style id="__ww_vh_fix__">，
+  遍历 document.styleSheets 中 type=1 的规则，把含 vh 的声明换算成 px 并以
+  !important 追加；再遍历所有元素内联样式做同样的 vh→px 替换；
+- 设置面板：固定右上角“⚙”按钮（top:112px/right:12px，z-index 99990）→
+  全屏半透明 overlay（z-index 99999）→“游戏设置”面板：
+  音量 range（0–100）、“重新游戏”（调用全局 restart()，失败转 console.error
+  “[游戏错误] 重新游戏失败: …”）、“继续游戏”（关闭面板）；
+- 暂停机制：包装 window.requestAnimationFrame/cancelAnimationFrame，
+  __wwPaused=true 时持续重排下一帧而不回调游戏逻辑；打开设置面板即暂停，关闭恢复；
+- 音量机制：默认 __wwVolume=0.8；包装 window.AudioContext/webkitAudioContext
+  构造函数，为每个新 AudioContext 创建主 GainNode（__wwMasterGain），并 patch
+  AudioNode.prototype.connect，把连接到 ctx.destination 的节点统一改接到主
+  GainNode；__wwSetVolume 遍历已登记 Context 设置 gain.value；
+- 自动清理：隐藏游戏自带的“重新开始/重开/重玩/再来一局/restart”按钮
+  （display:none 并打 __wwLegacyRestartHidden 标记，不隐藏平台设置按钮）；
+  MutationObserver 监听 DOM 变化以重新执行按钮清理和面板安装；
+- 触发时机：DOMContentLoaded（或 readyState 非 loading 时立即执行）+ setTimeout 0
+  兜底 + resize/orientationchange 重新计算。
+
+
+
+七、构建与运行
 ------------------------------------------------------------
+环境要求：JDK 17、Android SDK（路径见 local.properties 或 Android Studio SDK Manager）、
+可用模拟器或真机（minSdk 26）。
 
+常用命令（在项目根目录 D:\DATA\GitProjWorkSpace\GameWishingWell 下执行）：
 
-五、核心流程
-------------------------------------------------------------
-1. 首次生成：
-   系统提示词 + 模板示例 + 用户指令 → LLM 流式输出 → 抽码（失败自动重试 1 次）
-   → 校验警告 → 写入草稿 → 会话落盘 → UI 出现"立即游玩"。
-2. 迭代修改：
-   <game_code> 包裹上一版完整 HTML + 新指令 → 模型输出完整新版 → 整文件覆盖。
-3. 保存：
-   草稿 → 建 games/<id>/ 目录 + games.json 索引，清空草稿；编辑已存游戏 →
-   更新 index.html + session.json + 标题（不新建条目）。
-4. 游玩：
-   game 来源读 games/<id>/index.html（游玩次数+1）；draft 来源读 drafts/latest.html。
-5. 错误修复：
-   WebView JS 报错 → 覆盖层 → "让 AI 修复" → 错误文本进会话发起新一轮生成。
+    # 1. 编译 Debug APK
+    gradlew.bat assembleDebug
 
-六、构建与运行
-------------------------------------------------------------
+    # 2. 运行单元测试
+    gradlew.bat testDebugUnitTest
 
+    # 3. 连接设备/模拟器后安装启动（默认 launch）
+    gradlew.bat installDebug
+
+    # 4. 直接 adb 安装
+    adb install -r app\build\outputs\apk\debug\app-debug.apk
+
+    # 5. Release APK（当前 release 关闭混淆）
+    gradlew.bat assembleRelease
+
+Debug APK 输出：app/build/outputs/apk/debug/app-debug.apk。
+单元测试报告：app/build/reports/tests/testDebugUnitTest/index.html。
+
+Android Studio 运行方式：
+1. 用 D:\APP\AndroidStudio\bin 启动 Android Studio，打开本项目；
+2. 等待 Gradle Sync 完成（若 SDK 路径不对，修改 local.properties 的 sdk.dir）；
+3. 选择模拟器或真机，运行 app 配置。
+
+首次使用：
+1. 进入“设置”，选择服务商，填写 API Key（必要时改 Base URL / 模型）；
+2. 点击“测试连接”确认可用；
+3. 进入“创作”，用一句话描述游戏并发送；
+4. 生成完成后“立即游玩”，或“保存”到“我的游戏”。
+
+常见问题：
+- 构建同步报 SDK/JDK 错误：检查 local.properties 与 JDK 17。
+- 提示“请先在设置中配置 API Key、地址和模型”：isConfigured() 要求三项均非空。
+- 模型输出为空或抽不到 HTML：检查模型/网关是否支持流式 chat/completions；
+  DeepSeek 关闭思考并把 max_tokens 提到 16384。
+- 游戏白屏：确认生成 HTML 中 canvas 使用 vh/100% 也可渲染；HtmlEnhancer 已做视口修复，
+  但模型仍应遵守“自包含、无外部资源”的提示词约束。

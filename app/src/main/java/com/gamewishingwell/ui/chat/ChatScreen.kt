@@ -6,10 +6,10 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -74,6 +74,13 @@ fun ChatScreen(
     val session by vm.session.collectAsState()
     val context = LocalContext.current
 
+    // 游戏制作成功后，输入框提示语切换为“继续改进”语义
+    val inputPlaceholder = if (session.currentHtml != null) {
+        "你想如何改进你的游戏..."
+    } else {
+        "描述你想玩的游戏，例如：做一个接水果的小游戏"
+    }
+
     var input by remember { mutableStateOf("") }
     var showSaveDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
@@ -83,9 +90,10 @@ fun ChatScreen(
         (if (session.isGenerating) 1 else 0) +
         (if (session.error != null) 1 else 0)
 
-    // 新消息 / 生成开始结束 / 出错时自动滚到底部（下标最大为 count-1，不能滚到 count）
+    // 使用 reverseLayout 模拟微信消息流：index 0 固定在列表底部，
+    // 新消息/生成状态变化时滚到 0，让最新气泡始终贴着输入区。
     LaunchedEffect(listItemCount) {
-        if (listItemCount > 0) listState.animateScrollToItem(listItemCount - 1)
+        if (listItemCount > 0) listState.animateScrollToItem(0)
     }
 
     Scaffold(
@@ -97,31 +105,20 @@ fun ChatScreen(
                 )
             )
         },
-        bottomBar = {
-            InputRow(
-                value = input,
-                enabled = !session.isGenerating,
-                onValueChange = { input = it },
-                onSend = {
-                    vm.send(input.trim())
-                    input = ""
-                }
-            )
-        }
+        // 外层 Scaffold 已处理系统栏与底部导航，内层内容区不需要再次叠加系统栏 inset。
+        contentWindowInsets = WindowInsets(0)
     ) { padding ->
+        // imePadding 作用在“消息区 + 操作区 + 输入区”整体上：
+        // 键盘展开时三者一起向上移动，输入框始终保持在键盘上方。
         Column(Modifier.padding(padding).fillMaxSize().imePadding()) {
             LazyColumn(
                 state = listState,
                 modifier = Modifier.weight(1f),
                 contentPadding = PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Bottom),
+                reverseLayout = true
             ) {
-                items(count = session.messages.size, key = { it }) { index ->
-                    MessageBubble(session.messages[index])
-                }
-                if (session.isGenerating) {
-                    item(key = "typing") { TypingBubble(streamingText = session.streamingText) }
-                }
+                // reverseLayout 下先声明的 item 在底部；错误/生成中状态离输入框最近。
                 val error = session.error
                 if (error != null) {
                     item(key = "error") {
@@ -132,6 +129,16 @@ fun ChatScreen(
                         )
                     }
                 }
+                if (session.isGenerating) {
+                    item(key = "typing") { TypingBubble(streamingText = session.streamingText) }
+                }
+                val lastIndex = session.messages.lastIndex
+                items(
+                    count = session.messages.size,
+                    key = { reversedIndex -> lastIndex - reversedIndex }
+                ) { reversedIndex ->
+                    MessageBubble(session.messages[lastIndex - reversedIndex])
+                }
             }
             if (session.currentHtml != null && !session.isGenerating && session.error == null) {
                 ActionBar(
@@ -141,6 +148,16 @@ fun ChatScreen(
                     onRegenerate = { vm.regenerate() }
                 )
             }
+            InputRow(
+                value = input,
+                enabled = !session.isGenerating,
+                placeholder = inputPlaceholder,
+                onValueChange = { input = it },
+                onSend = {
+                    vm.send(input.trim())
+                    input = ""
+                }
+            )
         }
     }
 
@@ -285,6 +302,7 @@ private fun ErrorCard(
 private fun InputRow(
     value: String,
     enabled: Boolean,
+    placeholder: String,
     onValueChange: (String) -> Unit,
     onSend: () -> Unit
 ) {
@@ -292,15 +310,14 @@ private fun InputRow(
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(10.dp)
-                .navigationBarsPadding(),
+                .padding(10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             OutlinedTextField(
                 value = value,
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("描述你想玩的游戏，例如：做一个接水果的小游戏") },
+                placeholder = { Text(placeholder) },
                 maxLines = 3,
                 shape = RoundedCornerShape(24.dp)
             )
