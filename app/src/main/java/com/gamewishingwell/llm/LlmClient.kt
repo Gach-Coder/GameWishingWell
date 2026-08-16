@@ -7,7 +7,8 @@ class LlmError(message: String) : Exception(message)
 /**
  * 统一的流式 LLM 客户端接口。
  * 流式过程中通过 [onDelta] 逐个字符推送最终内容，[onThinking] 推送模型的思考过程
- * （推理模型如 deepseek-v4-flash 会先输出大量 reasoning_content，UI 可将其作为进度展示），
+ * （推理模型如 deepseek-v4-flash 会先输出 reasoning_content；按 instruct.txt 约定，
+ * 前端不展示源代码与思考原文，只把流用于内部进度判断），
  * 结束调用 [onDone]；网络/API 错误以异常抛出。
  */
 interface LlmClient {

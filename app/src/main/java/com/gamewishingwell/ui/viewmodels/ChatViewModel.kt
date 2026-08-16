@@ -45,6 +45,15 @@ class ChatViewModel(
         viewModelScope.launch { agent.fixWithError(error) }
     }
 
+    fun confirmIntent() {
+        viewModelScope.launch { agent.confirmIntent() }
+    }
+
+    fun correctIntent(correction: String) {
+        if (correction.isBlank()) return
+        viewModelScope.launch { agent.correctIntent(correction) }
+    }
+
     fun saveAs(title: String, onDone: (GameMeta?) -> Unit) {
         viewModelScope.launch {
             onDone(agent.saveCurrentGame(title))

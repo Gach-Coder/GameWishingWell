@@ -32,6 +32,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -158,7 +159,8 @@ fun HomeScreen(
                             meta = meta,
                             onClick = { onOpenGame(meta.id) },
                             onEdit = { onEditGame(meta.id) },
-                            onDelete = { vm.deleteGame(meta.id) }
+                            onDelete = { vm.deleteGame(meta.id) },
+                            onRename = { vm.renameGame(meta.id, it) }
                         )
                     }
                 }
@@ -206,10 +208,12 @@ private fun GameCard(
     meta: GameMeta,
     onClick: () -> Unit,
     onEdit: () -> Unit,
-    onDelete: () -> Unit
+    onDelete: () -> Unit,
+    onRename: (String) -> Unit
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var renameOpen by remember { mutableStateOf(false) }
 
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -249,6 +253,11 @@ private fun GameCard(
                         onClick = { menuOpen = false; onEdit() }
                     )
                     DropdownMenuItem(
+                        text = { Text("重命名") },
+                        leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+                        onClick = { menuOpen = false; renameOpen = true }
+                    )
+                    DropdownMenuItem(
                         text = { Text("删除") },
                         leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
                         onClick = { menuOpen = false; confirmDelete = true }
@@ -256,6 +265,34 @@ private fun GameCard(
                 }
             }
         }
+    }
+
+    if (renameOpen) {
+        var newTitle by remember { mutableStateOf(meta.title) }
+        AlertDialog(
+            onDismissRequest = { renameOpen = false },
+            title = { Text("重命名游戏") },
+            text = {
+                OutlinedTextField(
+                    value = newTitle,
+                    onValueChange = { newTitle = it },
+                    label = { Text("游戏名称") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = newTitle.isNotBlank(),
+                    onClick = {
+                        renameOpen = false
+                        onRename(newTitle.trim())
+                    }
+                ) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameOpen = false }) { Text("取消") }
+            }
+        )
     }
 
     if (confirmDelete) {

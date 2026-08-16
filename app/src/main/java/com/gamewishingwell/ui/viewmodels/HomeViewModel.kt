@@ -37,6 +37,13 @@ class HomeViewModel(
         }
     }
 
+    fun renameGame(id: Long, newTitle: String) {
+        viewModelScope.launch {
+            repository.renameGame(id, newTitle)
+            refresh()
+        }
+    }
+
     /**
      * 清空会话并等待草稿文件删除完成后回调，避免导航到创作页时
      * ChatViewModel 抢先读到旧草稿（删除与读取存在竞态）。

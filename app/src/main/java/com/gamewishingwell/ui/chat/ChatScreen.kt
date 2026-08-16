@@ -46,12 +46,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.gamewishingwell.agent.GameSession
+import com.gamewishingwell.agent.IntentConfirmation
 import com.gamewishingwell.data.ChatMessage
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.ChatViewModel
@@ -75,10 +75,10 @@ fun ChatScreen(
     val context = LocalContext.current
 
     // 游戏制作成功后，输入框提示语切换为“继续改进”语义
-    val inputPlaceholder = if (session.currentHtml != null) {
-        "你想如何改进你的游戏..."
-    } else {
-        "描述你想玩的游戏，例如：做一个接水果的小游戏"
+    val inputPlaceholder = when {
+        session.pendingConfirmation != null -> "也可以在这里补充或修正需求…"
+        session.currentHtml != null -> "你想如何改进你的游戏..."
+        else -> "描述你想玩的游戏，例如：做一个接水果的小游戏"
     }
 
     var input by remember { mutableStateOf("") }
@@ -88,6 +88,7 @@ fun ChatScreen(
     // 列表总条目数 = 消息 + 生成中占位 + 错误卡片占位
     val listItemCount = session.messages.size +
         (if (session.isGenerating) 1 else 0) +
+        (if (session.pendingConfirmation != null) 1 else 0) +
         (if (session.error != null) 1 else 0)
 
     // 使用 reverseLayout 模拟微信消息流：index 0 固定在列表底部，
@@ -130,7 +131,17 @@ fun ChatScreen(
                     }
                 }
                 if (session.isGenerating) {
-                    item(key = "typing") { TypingBubble(streamingText = session.streamingText) }
+                    item(key = "typing") { TypingBubble(stage = session.agentStage) }
+                }
+                val pending = session.pendingConfirmation
+                if (pending != null && !session.isGenerating) {
+                    item(key = "confirm") {
+                        IntentConfirmationCard(
+                            confirmation = pending,
+                            onConfirm = { vm.confirmIntent() },
+                            onCorrect = { vm.correctIntent(it) }
+                        )
+                    }
                 }
                 val lastIndex = session.messages.lastIndex
                 items(
@@ -140,7 +151,7 @@ fun ChatScreen(
                     MessageBubble(session.messages[lastIndex - reversedIndex])
                 }
             }
-            if (session.currentHtml != null && !session.isGenerating && session.error == null) {
+            if (session.currentHtml != null && !session.isGenerating && session.error == null && session.pendingConfirmation == null) {
                 ActionBar(
                     lastWarning = session.lastWarning,
                     onPlay = onPlay,
@@ -201,7 +212,7 @@ private fun MessageBubble(msg: ChatMessage) {
 }
 
 @Composable
-private fun TypingBubble(streamingText: String?) {
+private fun TypingBubble(stage: String) {
     Row(
         modifier = Modifier.padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -209,21 +220,87 @@ private fun TypingBubble(streamingText: String?) {
         CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
         Spacer(Modifier.width(8.dp))
         Column(Modifier.weight(1f)) {
+            // 前端 LLM SSE 不显示源代码文本，只阶段显示 Agent 状态。
             Text(
-                "正在生成游戏，请稍候…",
+                stage.ifBlank { "正在处理，请稍候…" },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            if (!streamingText.isNullOrBlank()) {
-                Spacer(Modifier.size(2.dp))
-                // 打字机效果：展示模型最近输出的内容（原始代码流）
+            Text(
+                "Agent Loop：意图识别 → 策划 → 生成 → 校验 → 冒烟测试",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+            )
+        }
+    }
+}
+
+@Composable
+private fun IntentConfirmationCard(
+    confirmation: IntentConfirmation,
+    onConfirm: () -> Unit,
+    onCorrect: (String) -> Unit
+) {
+    var correction by remember { mutableStateOf("") }
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text(
+                "确认游戏需求",
+                style = MaterialTheme.typography.titleSmall
+            )
+            Spacer(Modifier.size(4.dp))
+            Text(
+                confirmation.summary,
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (confirmation.designAssumptions.isNotEmpty()) {
+                Spacer(Modifier.size(6.dp))
                 Text(
-                    if (streamingText.length > 160) "…" + streamingText.takeLast(160) else streamingText,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
+                    "设计假设（如与预期不符请直接补充修正）：",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
                 )
+                confirmation.designAssumptions.forEach { assumption ->
+                    Text(
+                        "· $assumption",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.size(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = correction,
+                    onValueChange = { correction = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("补充或修正需求…") },
+                    maxLines = 2,
+                    shape = RoundedCornerShape(14.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                TextButton(
+                    enabled = correction.isNotBlank(),
+                    onClick = {
+                        val text = correction.trim()
+                        correction = ""
+                        onCorrect(text)
+                    }
+                ) {
+                    Text("提交修正")
+                }
+            }
+            Spacer(Modifier.size(4.dp))
+            Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) {
+                Text("按此方案生成")
             }
         }
     }

@@ -24,11 +24,17 @@ class SettingsRepository(context: Context) {
     private fun load(): LlmSettings {
         val providerId = secure.getString("provider_id") ?: ProviderPresets.DEFAULT.id
         val preset = ProviderPresets.byId(providerId) ?: ProviderPresets.DEFAULT
+        // 旧版本曾把 DeepSeek 默认模型写成已弃用的 deepseek-chat；
+        // 以 instruct.txt 协议预设表为准，读到旧值时自动迁移到 deepseek-v4-flash。
+        var model = secure.getString("model") ?: preset.defaultModel
+        if (providerId == "deepseek" && model == "deepseek-chat") {
+            model = preset.defaultModel
+        }
         return LlmSettings(
             providerId = providerId,
             apiKey = secure.getString("api_key") ?: "",
             baseUrl = secure.getString("base_url") ?: preset.baseUrl,
-            model = secure.getString("model") ?: preset.defaultModel,
+            model = model,
             systemPrompt = secure.getString("system_prompt") ?: ""
         )
     }

@@ -12,16 +12,17 @@ data class ProviderPreset(
     val maxTokens: Int = 8192,
     /**
      * 是否通过 thinking={"type":"disabled"} 关闭推理模型的思考过程。
-     * DeepSeek V4 系列默认开启思考且思考会耗尽 max_tokens 预算（实测 16384 预算被思考占满、内容为 0），
-     * 生成 HTML 游戏时关闭思考可让全部输出预算用于正文。
+     * 以 instruct.txt 的厂商默认预设表为准：目前所有厂商预设均为“否”，
+     * 即不发送关闭思考字段，尊重服务端默认行为。
      */
     val disableThinking: Boolean = false
 )
 
 object ProviderPresets {
     val all = listOf(
-        // deepseek-v4-flash 默认开启思考且会耗尽输出预算导致内容为空，必须关闭思考、并把预算给足
-        ProviderPreset("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat", Protocol.OPENAI_COMPATIBLE, 16384, disableThinking = true),
+        // 协议枚举与厂商默认预设严格对齐 instruct.txt 第二章：
+        // DeepSeek 默认 deepseek-v4-flash（deepseek-v4-pro 可选），已弃用 deepseek-chat；关闭思考=否。
+        ProviderPreset("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-v4-flash", Protocol.OPENAI_COMPATIBLE, 16384, disableThinking = false),
         ProviderPreset("kimi", "Kimi (Moonshot)", "https://api.moonshot.cn/v1", "moonshot-v1-8k", Protocol.OPENAI_COMPATIBLE, 16384),
         ProviderPreset("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini", Protocol.OPENAI_COMPATIBLE, 16384),
         ProviderPreset("anthropic", "Anthropic Claude", "https://api.anthropic.com", "claude-sonnet-4-6", Protocol.ANTHROPIC, 16384),

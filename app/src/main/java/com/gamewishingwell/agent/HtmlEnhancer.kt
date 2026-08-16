@@ -16,13 +16,29 @@ object HtmlEnhancer {
     private val ERROR_PRELUDE = """
     <script>
     (function(){
-      function report(msg){ try { console.error('[游戏错误] ' + msg); } catch(e){} }
+      // 运行时错误格式化回传：file:line + stack + console 片段。
+      var __wwConsoleTail = [];
+      if (window.console && window.console.error) {
+        var __wwRealConsoleError = window.console.error.bind(window.console);
+        window.console.error = function(){
+          try { __wwConsoleTail.push(Array.prototype.map.call(arguments, String).join(' ').slice(0, 160)); } catch(e) {}
+          if (__wwConsoleTail.length > 5) __wwConsoleTail.shift();
+          try { __wwRealConsoleError.apply(null, arguments); } catch(e) {}
+        };
+      }
+      function report(msg){
+        var stack = '';
+        try { if (arguments[1] && arguments[1].stack) stack = arguments[1].stack; } catch(e) {}
+        var tail = __wwConsoleTail.join(' | ').slice(0, 240);
+        var full = '[游戏错误] ' + msg + (stack ? ' || stack: ' + stack.slice(0, 500) : '') + (tail ? ' || console: ' + tail : '');
+        try { console.error(full); } catch(e) {}
+      }
       window.addEventListener('error', function(e){
-        if (e && e.message) report(e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
+        if (e && e.message) report(e.message + ' @ ' + (e.filename || 'index.html') + ':' + (e.lineno || 0), e.error);
       });
       window.addEventListener('unhandledrejection', function(e){
         var r = e && e.reason;
-        report('Promise 未处理: ' + (r && r.message ? r.message : String(r)));
+        report('Promise 未处理: ' + (r && r.message ? r.message : String(r)), r);
       });
     })();
     </script>

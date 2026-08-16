@@ -12,12 +12,13 @@
    有未保存草稿时显示“继续上次创作”入口。
 2. “创作”页面可以用自然语言描述游戏（如“做一个打地鼠小游戏”），
    AI 即时生成 Android WebView 平台运行的单人游戏(HTML+CSS+JavaScript)，LLM SSE 流式输出（打字机效果）。
-   - 交互形态类似豆包/元宝的对话 Agent：左侧 AI、右侧用户，生成中显示实时流。
-   - Agent Loop 内置：意图识别、prompt工程、抽码、基本校验、失败自动重试等功能，
+	- 交互形态类似豆包/元宝的对话 Agent：左侧 AI、右侧用户，生成中显示实时流。
+	- Agent Loop 内置：意图识别、prompt工程、代码生成和校验、失败自动重试等功能，
 	tool call有读写文件和结构(权限严格限制在该游戏文件夹内)，尽量保证生成代码可直接运行。
-   - 切换页面/对话时生成任务在 ViewModel 协程与全局 GameAgent 中继续运行，制作完成后可在 WebView 中立刻游玩。
-   - 运行时 JS 报错会弹出覆盖层，可“让 AI 修复”；也可继续对话迭代（如“加连击计分”），修改基于上一个版本的游戏文件进行。
-   - 成品可保存到本地游戏库，每个游戏对应一个文件夹。
+	- 用户点击发送输入的文本后，发送键改为停止键，可随时中断Agent Loop也可接着追加输入文本
+	- 切换页面/对话时生成任务在 ViewModel 协程与全局 GameAgent 中继续运行，制作完成后可在 WebView 中立刻游玩。
+	- 运行时 JS 报错会弹出覆盖层，可“让 AI 修复”；也可继续对话迭代（如“加连击计分”），修改基于上一个版本的游戏文件进行。
+	- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
    DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 自定义，
    支持修改 Base URL、模型名、系统提示词，并可“测试连接”。
@@ -42,7 +43,7 @@ Agent处理message流程如下：
 		确认门：意图抽取完成后先以人话摘要回显识别结果（画面维度 / 方向 / 游戏系统 / 对标游戏特性默认值假设），
 			待用户确认或修正后再进入下一步，确保已经获取用户全部需求
   策划层；被映射的默认值逐条以"设计假设"回显，禁止静默纠正
-	→ 策划层：补全全部关键特性，输出完整策划 Schema JSON
+	→ 策划层：根据用户的反馈补充和纠正全部关键特性，输出完整策划 Schema JSON
 		按 template_class（画面维度×画面方向×主类型）选取特征矩阵（系统×默认参数），只做"选系统+覆盖参数"，不自由发明
 		定稿 P0/P1/P2 特性分层 + 验收标准清单（供自检对照，防止确认偏差）+复杂度/资源预算（预估行数/脚本数）
 		对于复杂的系统，代码层先隔离实现、优先校验
@@ -140,9 +141,16 @@ GameWishingWell/
       │  │  ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
       │  │  ├─ agent/
-      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机
-      │  │  │  ├─ GamePrompt.kt          # 系统提示词与模板读取
-      │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML + 校验
+      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / Agent Loop
+      │  │  │  ├─ GameIntent.kt          # 意图层：Intent Schema、白名单、模板库、确认门
+      │  │  │  ├─ GamePlan.kt            # 策划层：P0/P1/P2、验收清单、复杂度预算
+      │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
+      │  │  │  ├─ GameValidator.kt       # JS 语法(acorn 同等) + HTML 配对 + no-undef 等结构化校验
+      │  │  │  ├─ GameSmokeTest.kt       # WebView 隔离 iframe 确定性 tick 冒烟测试
+      │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入 / 行级 patch
+      │  │  │  ├─ RetryPolicy.kt         # 分类重试预算与错误签名哈希
+      │  │  │  ├─ QualityGate.kt         # 两段式自检 verdict
+      │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
       │  │  │  └─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入
       │  │  ├─ data/
       │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage
@@ -269,6 +277,6 @@ Android Studio 运行方式：
 - 构建同步报 SDK/JDK 错误：检查 local.properties 与 JDK 17。
 - 提示“请先在设置中配置 API Key、地址和模型”：isConfigured() 要求三项均非空。
 - 模型输出为空或抽不到 HTML：检查模型/网关是否支持流式 chat/completions；
-  DeepSeek 关闭思考并把 max_tokens 提到 16384。
+  DeepSeek 默认模型为 deepseek-v4-flash（deepseek-chat 已弃用），max_tokens 16384，按预设表不主动关闭思考。
 - 游戏白屏：确认生成 HTML 中 canvas 使用 vh/100% 也可渲染；HtmlEnhancer 已做视口修复，
   但模型仍应遵守“自包含、无外部资源”的提示词约束。
