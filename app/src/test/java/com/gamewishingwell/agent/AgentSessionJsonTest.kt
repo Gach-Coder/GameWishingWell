@@ -5,9 +5,19 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AgentSessionJsonTest {
+
+    @Test
+    fun `旧版 IntentSchema 缺少 excludedSystems 仍可解码`() {
+        val json = Json { ignoreUnknownKeys = true }
+        val legacy = """{"intent":"new_game","visualDimension":"2D","screenOrientation":"竖版","gameSystems":["战斗"],"referenceGame":"打地鼠","templateId":"whack_a_mole","templateSimilarity":0.9,"confidence":0.8}"""
+        val decoded = json.decodeFromString<IntentSchema>(legacy)
+        assertEquals(emptyList<String>(), decoded.excludedSystems)
+        assertTrue(decoded.gameSystems.contains("战斗"))
+    }
 
     @Test
     fun `GameSession 完整状态可持久化往返`() {

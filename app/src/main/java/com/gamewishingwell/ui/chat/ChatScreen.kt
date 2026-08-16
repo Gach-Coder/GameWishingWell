@@ -77,7 +77,7 @@ fun ChatScreen(
 
     // 游戏制作成功后，输入框提示语切换为“继续改进”语义
     val inputPlaceholder = when {
-        session.pendingConfirmation != null -> "也可以在这里补充或修正需求…"
+        session.pendingConfirmation != null -> "如与预期不符，直接在这里输入修改内容…"
         session.currentHtml != null -> "你想如何改进你的游戏..."
         else -> "描述你想玩的游戏，例如：做一个接水果的小游戏"
     }
@@ -139,8 +139,7 @@ fun ChatScreen(
                     item(key = "confirm") {
                         IntentConfirmationCard(
                             confirmation = pending,
-                            onConfirm = { vm.confirmIntent() },
-                            onCorrect = { vm.correctIntent(it) }
+                            onConfirm = { vm.confirmIntent() }
                         )
                     }
                 }
@@ -236,10 +235,8 @@ private fun TypingBubble(stage: String) {
 @Composable
 private fun IntentConfirmationCard(
     confirmation: IntentConfirmation,
-    onConfirm: () -> Unit,
-    onCorrect: (String) -> Unit
+    onConfirm: () -> Unit
 ) {
-    var correction by remember { mutableStateOf("") }
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer,
         contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
@@ -259,7 +256,7 @@ private fun IntentConfirmationCard(
             if (confirmation.systemExplanations.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
-                    "系统说明（每个系统会实现什么）：",
+                    "系统会怎样实现（业务验收边界）：",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
                 )
@@ -274,7 +271,7 @@ private fun IntentConfirmationCard(
             if (confirmation.designAssumptions.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
-                    "默认值 / 对标游戏假设（如与预期不符请直接补充修正）：",
+                    "默认值 / 对标游戏假设：",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
                 )
@@ -286,35 +283,24 @@ private fun IntentConfirmationCard(
                     )
                 }
             }
-            Spacer(Modifier.size(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = correction,
-                    onValueChange = { correction = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("补充或修正需求…") },
-                    maxLines = 2,
-                    shape = RoundedCornerShape(14.dp)
+            if (confirmation.excludedSystems.isNotEmpty()) {
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    "已明确排除系统：${confirmation.excludedSystems.joinToString("、")}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
                 )
-                Spacer(Modifier.width(8.dp))
-                TextButton(
-                    enabled = correction.isNotBlank(),
-                    onClick = {
-                        val text = correction.trim()
-                        correction = ""
-                        onCorrect(text)
-                    }
-                ) {
-                    Text("提交修正")
-                }
             }
-            Spacer(Modifier.size(4.dp))
+            Spacer(Modifier.size(10.dp))
             Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) {
                 Text("确认，按此方案生成")
             }
+            Spacer(Modifier.size(4.dp))
+            Text(
+                "如与预期不符，请直接在下方输入框输入修改内容；确认前不会开始生成。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+            )
         }
     }
 }

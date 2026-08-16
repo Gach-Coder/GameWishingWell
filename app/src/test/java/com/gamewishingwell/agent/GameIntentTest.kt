@@ -75,6 +75,28 @@ class GameIntentTest {
     }
 
     @Test
+    fun `确认门解释包含实现方法与业务验收边界`() {
+        val schema = IntentEngine.infer("做一个2D竖版塔防游戏", null)
+        val confirmation = IntentEngine.buildConfirmation("做一个2D竖版塔防游戏", schema)
+        val tower = confirmation.systemExplanations.first { it.startsWith("塔防：") }
+        assertTrue(tower.contains("可建防御塔"))
+        assertTrue(tower.contains("敌人按波次推进"))
+        assertTrue(tower.contains("验收边界"))
+        assertTrue(tower.contains("基地生命值归零时结束"))
+    }
+
+    @Test
+    fun `首次输入明确排除的系统会进入排除清单并回显`() {
+        val intent = IntentEngine.infer("做一个塔防游戏，不要AI策略", null)
+        assertTrue("AI策略" in intent.excludedSystems)
+        assertTrue("AI策略" !in IntentEngine.plannedSystems(intent))
+        val confirmation = IntentEngine.buildConfirmation("做一个塔防游戏，不要AI策略", intent)
+        assertTrue(confirmation.summary.contains("已明确排除系统"))
+        assertTrue(confirmation.excludedSystems.contains("AI策略"))
+        assertTrue(confirmation.designAssumptions.any { it.contains("不得实现") })
+    }
+
+    @Test
     fun `玩家修正 2D 能覆盖已确认的 3D`() {
         val confirmed = IntentSchema(
             intent = IntentSchema.INTENT_NEW_GAME,

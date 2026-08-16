@@ -28,6 +28,8 @@ data class IntentSchema(
     val templateId: String? = null,
     val templateSimilarity: Double? = null,
     val confidence: Double = 0.0,
+    /** 玩家明确说“不要/去掉”的系统，策划层必须排除，模板补全也不得加回。 */
+    val excludedSystems: List<String> = emptyList(),
     /**
      * true 表示 templateId 已经由确认门修正合并显式决定；
      * validate 不再根据 referenceGame 反向重新匹配模板，避免把玩家刚去掉的模板补全系统加回来。
@@ -57,7 +59,9 @@ data class IntentConfirmation(
     /** 由模板/策划默认值补出来的设计假设，必须逐条回显。 */
     val designAssumptions: List<String> = emptyList(),
     /** 确认门回显的每个系统一句话解释，供玩家逐项核对。 */
-    val systemExplanations: List<String> = emptyList()
+    val systemExplanations: List<String> = emptyList(),
+    /** 玩家明确排除的系统，确认门同样要回显。 */
+    val excludedSystems: List<String> = emptyList()
 )
 
 /** 内部模板库条目：著名对标游戏 → template_id + 特征建议。 */
@@ -134,9 +138,87 @@ object GameSystemCatalog {
         "反应躲避" to "点按/滑动响应、失误判定与计分。",
     )
 
+    /**
+     * 每个系统在 HTML5 Canvas 单文件游戏里的落地实现方法。
+     * 确认门用它向玩家解释“游戏将会怎样实现这个系统”，策划层也用它形成实现清单。
+     */
+    private val implementationMethods: Map<String, List<String>> = mapOf(
+        "人物实体" to listOf("Canvas 绘制 1 个玩家角色", "触控方向/点按控制移动与朝向", "角色状态与边界限制"),
+        "道具" to listOf("2-3 种可拾取道具", "拾取判定与增益/反馈效果"),
+        "战斗" to listOf("1 类敌人或目标", "攻击/受击判定", "生命值与胜负条件"),
+        "技能" to listOf("1-2 个主动技能", "冷却计时与释放", "命中反馈"),
+        "属性等级" to listOf("等级/分数成长数值", "升级后数值或能力变化"),
+        "关卡场景" to listOf("3 个递进关卡或场景", "关卡切换与进度保存"),
+        "AI策略" to listOf("简单状态机 AI", "可读的决策规则", "AI 行为与难度参数隔离"),
+        "商店经济" to listOf("金币等货币产出", "可购买升级", "价格与余额校验"),
+        "收集" to listOf("掉落物生成", "收集碰撞判定", "收集计数与完成反馈"),
+        "解谜" to listOf("1 套核心谜题规则", "胜利/失败判定"),
+        "物理" to listOf("简化重力/碰撞参数", "确定性运动计算"),
+        "音乐节奏" to listOf("节拍/轨道生成", "命中判定", "节拍反馈与循环"),
+        "塔防" to listOf("可建防御塔", "敌人按波次推进", "基地生命值与胜负判定"),
+        "合成" to listOf("同元素合成规则", "合成升级与得分"),
+        "放置挂机" to listOf("自动产出计时", "离线/时间收益结算"),
+        "经营模拟" to listOf("资源循环", "建造/升级", "经营目标结算"),
+        "竞速" to listOf("速度与操控", "跑道/路线与完成条件", "名次或计时判定"),
+        "平台跳跃" to listOf("跳跃与平台碰撞", "失败重置"),
+        "弹幕射击" to listOf("玩家射击", "敌方弹幕生成", "命中判定"),
+        "反应躲避" to listOf("点按/滑动响应", "失误判定", "计分")
+    )
+
+    /** 业务验收边界：验收时只需确认这条玩家可感知的边界成立。 */
+    private val acceptanceBoundaries: Map<String, String> = mapOf(
+        "人物实体" to "角色能按触控移动、朝向正确，且不会穿出游戏区域",
+        "道具" to "道具可被拾取并产生可感知的增益或反馈",
+        "战斗" to "能攻击、能受击、能分出胜负",
+        "技能" to "技能可主动释放、有冷却且命中后有反馈",
+        "属性等级" to "成长数值变化能直接作用于游戏体验",
+        "关卡场景" to "关卡可递进切换且状态正确重置",
+        "AI策略" to "AI 行为符合预期且不卡死、不误判",
+        "商店经济" to "货币产出-购买升级形成闭环，余额不会为负",
+        "收集" to "收集物可计数，集齐后给出完成反馈",
+        "解谜" to "谜题规则明确，能正确判定胜利与失败",
+        "物理" to "重力/碰撞表现稳定，运动结果可复现",
+        "音乐节奏" to "节拍判定及时，命中/失误反馈清晰",
+        "塔防" to "能建塔、敌人按波次进攻，基地生命值归零时结束",
+        "合成" to "合成规则明确，升级结果与得分正确",
+        "放置挂机" to "离线/在线收益结算正确，数值可见",
+        "经营模拟" to "资源循环可运转，经营目标可达成",
+        "竞速" to "能操控竞速，完成条件与名次判定正确",
+        "平台跳跃" to "跳跃/平台碰撞可靠，失败后能重置",
+        "弹幕射击" to "射击与命中判定正确，敌弹幕有明确威胁",
+        "反应躲避" to "点按/滑动响应及时，失误判定与计分正确"
+    )
+
     /** 每个系统的一句话解释，确认门逐项回显给玩家。 */
     fun describe(system: String): String =
         descriptions[system] ?: "按该系统的基础规则实现，具体细节由策划层补全。"
+
+    /** 该系统在指定画面维度/方向下的落地实现方法；确认门与策划层共用。 */
+    fun implementationMethods(system: String, dimension: String, orientation: String): List<String> {
+        val base = implementationMethods[system] ?: return listOf("按基础规则实现")
+        val result = base.toMutableList()
+        when (dimension) {
+            IntentSchema.DIMENSION_2_5D -> result += "用 Canvas 2D 斜 45° 投影表现 2.5D"
+            IntentSchema.DIMENSION_3D -> result += "用 Canvas 2D 透视投影模拟 3D，不引入 WebGL/模型资产"
+            else -> result += "用 2D 精灵/几何图形绘制"
+        }
+        result += if (orientation == IntentSchema.ORIENTATION_LANDSCAPE) {
+            "横板全屏布局，左右手横向操作"
+        } else {
+            "竖版布局，适配手机单手操作"
+        }
+        return result.distinct()
+    }
+
+    /** 业务验收边界：代码验收时把“能做”和“做到什么程度”分开。 */
+    fun acceptanceBoundary(system: String): String =
+        acceptanceBoundaries[system] ?: "核心循环可玩，失败后可 restart() 完整重开"
+
+    /** 确认门逐项解释：实现方法 + 业务验收边界。 */
+    fun explainImplementation(system: String, dimension: String, orientation: String): String {
+        val methods = implementationMethods(system, dimension, orientation).joinToString("、")
+        return "$system：将通过 $methods 实现；验收边界：${acceptanceBoundary(system)}"
+    }
 }
 
 object TemplateLibrary {
@@ -189,6 +271,7 @@ object IntentSchemaValidator {
      * - visualDimension 必须是 2D / 2.5D / 3D，否则映射 2D；
      * - screenOrientation 必须是 横板 / 竖版，否则映射 竖版；
      * - gameSystems 逐项白名单过滤，模板未命中的系统直接丢弃；
+     * - excludedSystems 逐项白名单过滤，且不得与 gameSystems 并存；
      * - templateId 不在模板库时置 null，不保留模型幻觉出来的 id。
      */
     fun validate(schema: IntentSchema): IntentSchema {
@@ -210,7 +293,12 @@ object IntentSchemaValidator {
             )
         ) schema.screenOrientation else IntentSchema.ORIENTATION_PORTRAIT
 
-        val systems = schema.gameSystems.filter { GameSystemCatalog.isValid(it) }.distinct()
+        val excludedSystems = schema.excludedSystems
+            .filter { GameSystemCatalog.isValid(it) }
+            .distinct()
+        val systems = schema.gameSystems
+            .filter { GameSystemCatalog.isValid(it) && it !in excludedSystems }
+            .distinct()
         val template = schema.templateId?.let { TemplateLibrary.findById(it) }
         val matched = if (schema.lockTemplateResolution) {
             null
@@ -229,6 +317,7 @@ object IntentSchemaValidator {
             templateId = templateId,
             templateSimilarity = similarity?.coerceIn(0.0, 1.0),
             confidence = schema.confidence.coerceIn(0.0, 1.0),
+            excludedSystems = excludedSystems,
             lockTemplateResolution = schema.lockTemplateResolution
         )
     }
@@ -254,12 +343,16 @@ object IntentSchemaValidator {
             (arr as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
         } ?: emptyList()
         val reference = obj.string("referenceGame")
+        val excludedSystems = obj["excludedSystems"]?.let { arr ->
+            (arr as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+        } ?: emptyList()
         return validate(
             IntentSchema(
                 intent = intent,
                 visualDimension = obj.string("visualDimension") ?: IntentSchema.DIMENSION_2D,
                 screenOrientation = obj.string("screenOrientation") ?: IntentSchema.ORIENTATION_PORTRAIT,
                 gameSystems = systems,
+                excludedSystems = excludedSystems,
                 referenceGame = reference,
                 templateId = obj.string("templateId"),
                 templateSimilarity = obj.double("templateSimilarity"),
@@ -285,7 +378,7 @@ object IntentEngine {
         "修改|改一下|改成|加上|加个|增加|添加|去掉|删除|调整|优化|修复|继续|迭代|" +
             "更难点|更难|简单点|简单些|背景|颜色|音效|分数|关卡|加连击|加.*系统"
     )
-    private val chatPattern = Regex("^(你好|您好|hi|hello|在吗|你是谁|你能做什么|怎么用|使用说明|谢谢)\\b.*")
+    private val chatPattern = Regex("^(你好|您好|hi|hello|在吗|你是谁|你能做什么|怎么用|使用说明|谢谢)")
 
     fun infer(userText: String, existingHtml: String?): IntentSchema {
         val text = userText.trim()
@@ -298,7 +391,8 @@ object IntentEngine {
 
         val dimension = explicitDimension(text) ?: IntentSchema.DIMENSION_2D
         val orientation = explicitOrientation(text) ?: IntentSchema.ORIENTATION_PORTRAIT
-        val systems = GameSystemCatalog.extract(text)
+        val excludedSystems = negatedSystems(text).toList()
+        val systems = GameSystemCatalog.extract(text).filterNot { it in excludedSystems }
         val match = TemplateLibrary.match(text)
         val confidence = (
             0.55 +
@@ -314,6 +408,7 @@ object IntentEngine {
                 visualDimension = dimension,
                 screenOrientation = orientation,
                 gameSystems = systems,
+                excludedSystems = excludedSystems,
                 referenceGame = match?.first?.title,
                 templateId = match?.first?.id,
                 templateSimilarity = match?.second,
@@ -322,13 +417,14 @@ object IntentEngine {
         )
     }
 
-    /** 确认门最终要实现的系统集合：用户明确系统 + 模板补全系统；全空时使用默认轻量框架。 */
+    /** 确认门最终要实现的系统集合：用户明确系统 + 模板补全系统；已排除系统一律不得加回。 */
     fun plannedSystems(schema: IntentSchema): List<String> {
         val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
+        val excluded = schema.excludedSystems.toSet()
         val merged = (schema.gameSystems + (ref?.suggestedSystems ?: emptyList()))
-            .filter { GameSystemCatalog.isValid(it) }
+            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
             .distinct()
-        return merged.ifEmpty { DEFAULT_SYSTEMS }
+        return merged.ifEmpty { DEFAULT_SYSTEMS.filterNot { it in excluded } }
     }
 
     /**
@@ -339,7 +435,10 @@ object IntentEngine {
         val dimension = if (explicitDimension(correctionText) != null) correction.visualDimension else confirmed.visualDimension
         val orientation = if (explicitOrientation(correctionText) != null) correction.screenOrientation else confirmed.screenOrientation
 
-        val removed = negatedSystems(correctionText)
+        val removed = negatedSystems(correctionText) + correction.excludedSystems.toSet()
+        // 玩家明确“还是要/要加/恢复”已排除系统时，允许把该系统从排除清单里拿回来。
+        val reinstated = reAddSystems(correctionText)
+        val excludedSystems = (confirmed.excludedSystems.toSet() + removed - reinstated).toList()
         val correctionMatch: Pair<GameTemplateRef, Double>? = TemplateLibrary.match(correctionText)
             ?: correction.templateId?.let { id ->
                 TemplateLibrary.findById(id)?.let { it to (correction.templateSimilarity ?: 0.5) }
@@ -354,6 +453,7 @@ object IntentEngine {
         }
         val systems = (baseline + correction.gameSystems)
             .filterNot { removed.contains(it) }
+            .filterNot { excludedSystems.contains(it) }
             .distinct()
 
         val dropsTemplate = dropsReference ||
@@ -392,6 +492,7 @@ object IntentEngine {
                 visualDimension = dimension,
                 screenOrientation = orientation,
                 gameSystems = systems,
+                excludedSystems = excludedSystems,
                 referenceGame = referenceGame,
                 templateId = templateId,
                 templateSimilarity = templateSimilarity,
@@ -422,6 +523,14 @@ object IntentEngine {
             .flatMap { GameSystemCatalog.extract(it.value) }
             .toSet()
 
+    private fun reAddSystems(text: String): Set<String> =
+        Regex(
+            "(?:还是要|要保留|保留|恢复|加回|重新加|要加上|再加上|需要加上|改成要)[^。.!！?？;；,，、\n]{0,20}",
+            RegexOption.IGNORE_CASE
+        ).findAll(text)
+            .flatMap { GameSystemCatalog.extract(it.value) }
+            .toSet()
+
     private fun negatesReference(text: String): Boolean =
         Regex("不要参考|不参考|去掉对标|不要对标|不用参考|别参考|移除对标|取消对标|不要做成", RegexOption.IGNORE_CASE).containsMatchIn(text)
 
@@ -437,6 +546,7 @@ object IntentEngine {
                     it == IntentSchema.ORIENTATION_PORTRAIT && regexResult.screenOrientation != IntentSchema.ORIENTATION_PORTRAIT
                 } ?: regexResult.screenOrientation,
                 gameSystems = (lite.gameSystems + regexResult.gameSystems).distinct(),
+                excludedSystems = (lite.excludedSystems + regexResult.excludedSystems).distinct(),
                 referenceGame = lite.referenceGame ?: regexResult.referenceGame,
                 templateId = lite.templateId ?: regexResult.templateId,
                 templateSimilarity = lite.templateSimilarity ?: regexResult.templateSimilarity,
@@ -474,7 +584,10 @@ object IntentEngine {
             }
             sb.append("。")
         }
-        sb.append("请核对下面的系统解释与默认假设，确认后进入策划与代码生成。")
+        if (schema.excludedSystems.isNotEmpty()) {
+            sb.append("已明确排除系统：${schema.excludedSystems.joinToString("、")}（本轮不会实现）。")
+        }
+        sb.append("请核对下面的系统解释、默认假设与排除项，确认后进入策划与代码生成。")
 
         val assumptions = buildAssumptions(schema)
         return IntentConfirmation(
@@ -482,7 +595,10 @@ object IntentEngine {
             intent = schema,
             summary = sb.toString(),
             designAssumptions = assumptions,
-            systemExplanations = planned.map { "${it}：${GameSystemCatalog.describe(it)}" }
+            systemExplanations = planned.map {
+                GameSystemCatalog.explainImplementation(it, schema.visualDimension, schema.screenOrientation)
+            },
+            excludedSystems = schema.excludedSystems
         )
     }
 
@@ -498,7 +614,9 @@ object IntentEngine {
             if (schema.screenOrientation == ref.suggestedOrientation) {
                 result.add("参考「${ref.title}」模板，画面方向按 ${ref.suggestedOrientation} 实现")
             }
-            val added = ref.suggestedSystems.filterNot { schema.gameSystems.contains(it) }
+            val added = ref.suggestedSystems.filterNot {
+                schema.gameSystems.contains(it) || schema.excludedSystems.contains(it)
+            }
             if (added.isNotEmpty()) {
                 result.add("参考「${ref.title}」模板，将补全系统：${added.joinToString("、")}")
             }
@@ -513,6 +631,9 @@ object IntentEngine {
         if (rawSystems.isEmpty() && ref == null) {
             result.add("未指定游戏系统，将按“反应躲避 + 收集”的默认轻量框架补全")
         }
+        if (schema.excludedSystems.isNotEmpty()) {
+            result.add("已按你的要求排除系统：${schema.excludedSystems.joinToString("、")}，策划与代码生成均不得实现")
+        }
         return result
     }
 
@@ -526,6 +647,7 @@ object IntentEngine {
           "visualDimension": "2D | 2.5D | 3D",
           "screenOrientation": "横板 | 竖版",
           "gameSystems": ["人物实体","道具","战斗","技能","属性等级","关卡场景","AI策略","商店经济","收集","解谜","物理","音乐节奏","塔防","合成","放置挂机","经营模拟","竞速","平台跳跃","弹幕射击","反应躲避"],
+          "excludedSystems": ["玩家明确不要的系统"],
           "referenceGame": "著名游戏名或 null",
           "confidence": 0.0
         }

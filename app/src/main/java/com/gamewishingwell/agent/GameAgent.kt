@@ -214,8 +214,9 @@ class GameAgent(
         val trimmed = text.trim()
         if (trimmed.isBlank()) return
 
+        // 确认门期间输入框发来的任何文字都是“补充/修正”，不会当作确认语句；
+        // 进入策划层的唯一入口是界面上的确认按钮（confirmIntent）。
         val priorConfirmation = current.pendingConfirmation
-        val isConfirmPhrase = priorConfirmation != null && isConfirmationPhrase(trimmed)
         val last = current.messages.lastOrNull()
         val duplicate = last != null && last.isUser && last.content == trimmed
 
@@ -232,12 +233,12 @@ class GameAgent(
         )
         _session.value = base
         val job = trackGenerationJob(agentScope.launch {
-            runUserTurn(trimmed, priorConfirmation, isConfirmPhrase)
+            runUserTurn(trimmed, priorConfirmation)
         })
         job.join()
     }
 
-    /** 确认门：“按此方案生成”。 */
+    /** 确认门唯一入口：“按此方案生成”按钮。 */
     suspend fun confirmIntent() {
         val pending = _session.value.pendingConfirmation ?: return
         if (_session.value.isGenerating) return
@@ -257,46 +258,6 @@ class GameAgent(
             }
         })
         job.join()
-    }
-
-    /**
-     * 确认门：用户提交修正/补充后只重组摘要并再次回显，仍停留在确认门；
-     * 直到玩家明确点击“按此方案生成”或发送确认语句，才进入策划与生成。
-     */
-    suspend fun correctIntent(correction: String) {
-        val pending = _session.value.pendingConfirmation ?: return
-        if (_session.value.isGenerating) return
-        val trimmed = correction.trim()
-        if (trimmed.isBlank()) return
-
-        val inferred = IntentEngine.infer(trimmed, _session.value.currentHtml)
-        val merged = IntentEngine.mergeCorrection(pending.intent, inferred, trimmed)
-        val userRequest = pending.userRequest + "\n补充/修正：" + trimmed
-        val confirmation = IntentEngine.buildConfirmation(userRequest, merged)
-        val assistantReply = buildString {
-            append("已根据你的修正重新整理需求：\n")
-            append(confirmation.summary)
-            if (confirmation.systemExplanations.isNotEmpty()) {
-                append("\n\n系统说明：\n")
-                confirmation.systemExplanations.forEach { append("· $it\n") }
-            }
-            append("\n请在下方确认，或继续补充修正。")
-        }
-        val next = _session.value.copy(
-            messages = _session.value.messages +
-                ChatMessage("user", "补充/修正：$trimmed") +
-                ChatMessage("assistant", assistantReply),
-            pendingConfirmation = confirmation,
-            isGenerating = false,
-            streamingText = null,
-            agentStage = AgentStage.CONFIRM,
-            error = null,
-            designPlan = null,
-            qualityVerdict = null,
-            budget = RetryBudget()
-        )
-        _session.value = next
-        persistSessionMessages(next)
     }
 
     /** 把游戏运行时的 JS 错误交给 AI 修复（运行时错误格式：file:line + stack + console 片段）。 */
@@ -391,17 +352,12 @@ class GameAgent(
 
     // ---------- Agent Loop 内部 ----------
 
-    private suspend fun runUserTurn(instruction: String, priorConfirmation: IntentConfirmation?, isConfirmPhrase: Boolean) {
+    private suspend fun runUserTurn(instruction: String, priorConfirmation: IntentConfirmation?) {
         turnMutex.withLock {
             currentCoroutineContext().ensureActive()
             val s = _session.value
             if (!isConfigured()) {
                 failTurn(s, "请先在「设置」中配置 API Key、地址和模型")
-                return@withLock
-            }
-
-            if (isConfirmPhrase && priorConfirmation != null) {
-                generateFromIntent(priorConfirmation.userRequest, priorConfirmation.intent, s.currentHtml, null)
                 return@withLock
             }
 
@@ -415,8 +371,8 @@ class GameAgent(
                 null
             }
             val current = IntentEngine.merge(local, lite)
-            // 确认门上的补充/修正：合并回原 Intent Schema，并再次回显等待确认。
-            val schema = if (priorConfirmation != null && !isConfirmPhrase) {
+            // 确认门上的补充/修正：合并回已确认 Intent Schema，并再次回显等待确认。
+            val schema = if (priorConfirmation != null) {
                 IntentEngine.mergeCorrection(priorConfirmation.intent, current, instruction)
             } else {
                 current
@@ -427,14 +383,17 @@ class GameAgent(
                 return@withLock
             }
 
-            // 有确认门遗留时，用户输入视为修正；重新生成摘要，直到用户明确确认才进入策划层。
-            val effectiveRequest = if (priorConfirmation != null && !isConfirmPhrase) {
+            // 有确认门遗留时，任何文字输入都视为修正；重新生成摘要，直到点击确认按钮才进入策划层。
+            val effectiveRequest = if (priorConfirmation != null) {
                 priorConfirmation.userRequest + "\n补充/修正：" + instruction
             } else {
                 instruction
             }
             val confirmation = IntentEngine.buildConfirmation(effectiveRequest, schema)
-            val assistantReply = confirmationMessage(confirmation, if (priorConfirmation != null) "已根据你的补充重新整理需求" else "已识别需求")
+            val assistantReply = confirmationMessage(
+                confirmation,
+                if (priorConfirmation != null) "已根据你的补充重新整理需求" else "已识别需求"
+            )
             val next = _session.value.copy(
                 messages = _session.value.messages + ChatMessage("assistant", assistantReply),
                 pendingConfirmation = confirmation,
@@ -452,16 +411,19 @@ class GameAgent(
         }
     }
 
-    /** 确认门消息：摘要 + 每个系统的一句话解释 + 操作提示。 */
+    /** 确认门消息：摘要 + 每个系统的实现方法与验收边界 + 操作提示。 */
     private fun confirmationMessage(confirmation: IntentConfirmation, prefix: String): String = buildString {
         append(prefix)
         append("：\n")
         append(confirmation.summary)
         if (confirmation.systemExplanations.isNotEmpty()) {
-            append("\n\n系统说明：\n")
+            append("\n\n系统会怎样实现（业务验收边界）：\n")
             confirmation.systemExplanations.forEach { append("· $it\n") }
         }
-        append("\n请在下方确认，或继续补充修正。")
+        if (confirmation.excludedSystems.isNotEmpty()) {
+            append("\n已排除系统：${confirmation.excludedSystems.joinToString("、")}")
+        }
+        append("\n请点击下方唯一的确认按钮进入策划与代码生成；如需修改，直接在底部输入框输入新的要求。")
     }
 
     private suspend fun requestIntentFromLiteLlm(userText: String): IntentSchema? {
@@ -528,7 +490,7 @@ class GameAgent(
         val planningStage = if (plan.gameSystems.isEmpty()) {
             "游戏策划中：正在规划 ${plan.primarySystem} 的系统方案"
         } else {
-            "游戏策划中：正在规划 ${plan.gameSystems.joinToString("、")} 的系统方案"
+            "游戏策划中：正在规划 ${plan.gameSystems.joinToString("、")} 的实现方法（已排除 ${plan.excludedSystems.size} 个系统）"
         }
         _session.value = _session.value.copy(
             isGenerating = true,
@@ -537,7 +499,7 @@ class GameAgent(
             agentStage = planningStage,
             designPlan = plan,
             filePlan = listOf("index.html"),
-            decisionLog = _session.value.decisionLog + "策划定稿：${plan.templateClass}，P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
+            decisionLog = _session.value.decisionLog + "策划定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
         )
 
         var workingHtml = existingHtml
@@ -843,6 +805,8 @@ class GameAgent(
     private fun buildRollingSummary(plan: DesignPlan, report: ValidationReport, html: String, verdict: QualityVerdict): String = buildString {
         append("文件计划与清单：${_session.value.filePlan.joinToString(" → ")}（index.html ${html.length} 字符）\n")
         append("设计Schema：${plan.templateClass} / ${plan.gameSystems.joinToString("、")} / P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}\n")
+        append("实现清单：${plan.implementations.joinToString("；") { "${it.system}(${it.methods.joinToString("|")})" }}\n")
+        append("排除清单：系统[${plan.excludedSystems.joinToString("、")}]；方案[${plan.excludedApproaches.joinToString("、")}]\n")
         append("known-issues：${if (report.warnings.isEmpty()) "无" else report.warnings.joinToString("；") { it.message }}\n")
         append("上次错误：无\n")
         append("决策：静态校验通过（error=${report.errors.size} warning=${report.warnings.size}），冒烟通过，verdict=${verdict.pass}")
@@ -850,9 +814,6 @@ class GameAgent(
 
     private fun defaultTitle(s: GameSession): String =
         s.designPlan?.title ?: s.messages.firstOrNull { it.isUser }?.content?.take(20) ?: "未命名游戏"
-
-    private fun isConfirmationPhrase(text: String): Boolean =
-        Regex("""^(确认|可以|好的|好|行|没问题|ok|yes|按此|就这样|开始制作|生成吧)[!！。.~～\s]*$""", RegexOption.IGNORE_CASE).matches(text.trim())
 
     // ---------- LLM ----------
 
