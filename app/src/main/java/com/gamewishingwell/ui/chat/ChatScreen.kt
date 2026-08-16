@@ -60,14 +60,16 @@ import com.gamewishingwell.ui.viewmodels.ChatViewModel
 @Composable
 fun ChatScreen(
     gameId: Long?,
+    resumeDraft: Boolean = false,
     onPlay: () -> Unit,
     onOpenSettings: () -> Unit,
     onSaved: () -> Unit
 ) {
     val container = rememberContainer()
+    val mode = gameId?.let { "game-$it" } ?: if (resumeDraft) "draft" else "new"
     val vm: ChatViewModel = viewModel(
-        key = "chat-${gameId ?: "new"}",
-        factory = viewModelFactory { initializer { ChatViewModel(container.gameAgent, gameId) } }
+        key = "chat-$mode",
+        factory = viewModelFactory { initializer { ChatViewModel(container.gameAgent, gameId, resumeDraft) } }
     )
     val session by vm.session.collectAsState()
     val context = LocalContext.current
@@ -89,7 +91,7 @@ fun ChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(if (gameId != null) "编辑游戏" else "创作") },
+                title = { Text(if (gameId != null) "编辑游戏" else if (resumeDraft) "继续创作" else "创作") },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface
                 )

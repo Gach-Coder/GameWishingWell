@@ -75,8 +75,13 @@ class GameAgent(
         }
     }
 
-    suspend fun newSession() {
-        repository.clearDraft()
+    /**
+     * 开始一个空会话。
+     * [clearDraft] 为 true 时同时删除草稿文件；从底部"创作"进入新对话时传 false，
+     * 这样不会破坏"我的游戏"页的"继续上次创作"入口，直到用户真正发出新需求并覆盖草稿。
+     */
+    suspend fun newSession(clearDraft: Boolean = true) {
+        if (clearDraft) repository.clearDraft()
         editingGameId = null
         _session.value = GameSession()
     }

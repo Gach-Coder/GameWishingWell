@@ -10,7 +10,8 @@ import kotlinx.coroutines.launch
 
 class ChatViewModel(
     private val agent: GameAgent,
-    val gameId: Long?
+    val gameId: Long?,
+    private val resumeDraft: Boolean = false
 ) : ViewModel() {
 
     val session: StateFlow<GameSession> = agent.session
@@ -18,8 +19,12 @@ class ChatViewModel(
 
     init {
         viewModelScope.launch {
-            if (gameId != null) agent.loadGameSession(gameId)
-            else agent.loadDraftSession()
+            when {
+                gameId != null -> agent.loadGameSession(gameId)
+                resumeDraft -> agent.loadDraftSession()
+                // 底部"创作"入口：永远从空会话开始，但暂不删除草稿文件
+                else -> agent.newSession(clearDraft = false)
+            }
         }
     }
 

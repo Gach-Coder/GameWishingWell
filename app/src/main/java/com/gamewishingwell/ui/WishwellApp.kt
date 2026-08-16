@@ -46,7 +46,10 @@ fun WishwellApp() {
                     )
                     NavigationBarItem(
                         selected = currentRoute?.startsWith("chat") == true,
-                        onClick = { navController.navigate("chat") { popUpTo("home") { inclusive = false }; launchSingleTop = true } },
+                        onClick = {
+                            // 每次点击"创作"都重建 chat 目的地，保证进入的是空会话而不是旧对话
+                            navController.navigate("chat") { popUpTo("home") { inclusive = false } }
+                        },
                         icon = { Icon(Icons.Filled.Add, contentDescription = null) },
                         label = { Text("创作") }
                     )
@@ -70,16 +73,21 @@ fun WishwellApp() {
                     onOpenGame = { id -> navController.navigate("game?source=game&gameId=$id") },
                     onEditGame = { id -> navController.navigate("chat?gameId=$id") },
                     onNewChat = { navController.navigate("chat") },
-                    onContinueDraft = { navController.navigate("chat") }
+                    onContinueDraft = { navController.navigate("chat?draft=true") }
                 )
             }
             composable(
-                route = "chat?gameId={gameId}",
-                arguments = listOf(navArgument("gameId") { type = NavType.LongType; defaultValue = -1L })
+                route = "chat?gameId={gameId}&draft={draft}",
+                arguments = listOf(
+                    navArgument("gameId") { type = NavType.LongType; defaultValue = -1L },
+                    navArgument("draft") { type = NavType.BoolType; defaultValue = false }
+                )
             ) { entry ->
                 val gameId = entry.arguments?.getLong("gameId")?.takeIf { it > 0 }
+                val resumeDraft = entry.arguments?.getBoolean("draft") ?: false
                 ChatScreen(
                     gameId = gameId,
+                    resumeDraft = resumeDraft,
                     onPlay = {
                         // 编辑已保存游戏时从游戏目录加载最新版本，草稿模式加载草稿
                         if (gameId != null) {
