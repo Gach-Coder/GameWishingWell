@@ -42,6 +42,8 @@ data class GameSession(
     val streamingText: String? = null,
     val agentStage: String = AgentStage.IDLE,
     val pendingConfirmation: IntentConfirmation? = null,
+    /** 会话级 Game Schema JSON：一个对话框只制作一个游戏，识别层与下游共享。 */
+    val gameSchema: GameSchema? = null,
     val lastWarning: String? = null,
     val isGenerating: Boolean = false,
     val error: String? = null,
@@ -65,7 +67,8 @@ data class GameSession(
 
 object AgentStage {
     const val IDLE = "空闲"
-    const val INTENT = "游戏识别中"
+    const val INTENT = "意图识别中"
+    const val RECOGNITION = "游戏识别中"
     const val CONFIRM = "待确认"
     const val PLANNING = "游戏策划中"
     const val CODE_GENERATION = "代码生成中"
@@ -80,7 +83,7 @@ object AgentStage {
 }
 
 /**
- * 游戏创作 Agent：意图层 → 策划草案 → 确认门 → 决策层 → Prompt → Agent Loop（生成/基础校验/修复）→ 持久化。
+ * 游戏创作 Agent：意图层(develop/chat) → 识别层(Game Schema JSON) → 策划草案(LLM 细化系统实现) → 确认门 → 决策层 → Prompt → Agent Loop（生成/基础校验/修复）→ 持久化。
  *
  * 简化后的 Agent Loop 只做语法与基本逻辑校验：通过后立即交付玩家试玩，
  * 运行错误和玩家反馈再回到 Agent Loop 修复，避免自动测试流程过长。
@@ -248,25 +251,34 @@ class GameAgent(
         val pending = _session.value.pendingConfirmation ?: return
         if (_session.value.isGenerating) return
 
-        // 决策层：根据玩家最后确认的完整信息输出最终 DesignPlan，
-        // 已确认系统/实现方法写入 implementations，排除系统和方案写入 excluded_*。
-        // 局部修改旧游戏时继承上一版系统范围，避免把“加连击计分”误判成新游戏方案。
-        val finalIntent = PlanningEngine.inheritExistingDesign(pending.intent, _session.value.designPlan)
-        val finalPlan = PlanningEngine.finalize(finalIntent, _session.value.designPlan?.title)
+        // 决策层：以确认门共享的同一份 Game Schema JSON 为输入，把已确认的
+        // 策划草案定稿为最终 DesignPlan；排除系统/方案继续硬性生效。
+        val session = _session.value
+        val schema = pending.gameSchema
+            ?: pending.intent?.toGameSchema()
+            ?: session.gameSchema
+            ?: legacyAnchoredSchema(session)
+            ?: GameSchema()
+        val finalPlan = PlanningEngine.finalize(
+            schema = schema,
+            confirmedDraft = pending.draftPlan,
+            existingTitle = session.designPlan?.title
+        )
 
-        val base = _session.value.copy(
+        val base = session.copy(
             isGenerating = true,
             error = null,
             streamingText = null,
             agentStage = AgentStage.PLANNING,
             pendingConfirmation = null,
+            gameSchema = schema,
             designPlan = finalPlan,
             qualityVerdict = null
         )
         _session.value = base
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
-                generateFromIntent(pending.userRequest, finalIntent, _session.value.currentHtml, finalPlan)
+                generateFromIntent(pending.userRequest, schema, _session.value.currentHtml, finalPlan)
             }
         })
         job.join()
@@ -289,6 +301,19 @@ class GameAgent(
         // 运行错误不做次数预算或自动降级：每次都以完整玩法为上下文继续修复，用户可无限等待。
         val instruction = "游戏运行时报错，请修复并输出完整新版代码（保持原有玩法与 P0 特性）：\n$jsError"
         val messages = s.messages + ChatMessage("user", instruction)
+        val schema = s.gameSchema
+            ?: s.designPlan?.let { plan ->
+                GameSchema(
+                    visualDimension = plan.visualDimension,
+                    screenOrientation = plan.screenOrientation,
+                    gameSystems = plan.gameSystems,
+                    requestedSystems = plan.gameSystems,
+                    excludedSystems = plan.excludedSystems,
+                    confidence = 1.0,
+                    lockTemplateResolution = true
+                )
+            }
+            ?: GameSchema(confidence = 1.0)
         val base = s.copy(
             messages = messages,
             isGenerating = true,
@@ -296,25 +321,18 @@ class GameAgent(
             streamingText = null,
             agentStage = AgentStage.FIXING,
             pendingConfirmation = null,
+            gameSchema = schema,
             knownErrors = known,
             lastError = jsError.take(500),
             lastErrorSignature = ErrorSignature.hash(normalized),
             qualityVerdict = null
         )
         _session.value = base
-
-        val intent = IntentSchema(
-            intent = IntentSchema.INTENT_MODIFY_GAME,
-            visualDimension = s.designPlan?.visualDimension ?: IntentSchema.DIMENSION_2D,
-            screenOrientation = s.designPlan?.screenOrientation ?: IntentSchema.ORIENTATION_PORTRAIT,
-            gameSystems = s.designPlan?.gameSystems ?: emptyList(),
-            confidence = 1.0
-        )
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
                 generateFromIntent(
                     instruction = instruction,
-                    intent = intent,
+                    intent = schema,
                     existingHtml = html,
                     forcePlan = s.designPlan
                 )
@@ -367,41 +385,61 @@ class GameAgent(
                 return@withLock
             }
 
-            // 意图层：正则 + Lite LLM，再过 JSON Schema + 枚举白名单。
-            val local = IntentEngine.infer(instruction, s.currentHtml)
-            val lite = try {
-                requestIntentFromLiteLlm(instruction)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                null
-            }
-            val current = IntentEngine.merge(local, lite)
-            // 确认门上的补充/修正：合并回已确认 Intent Schema，并再次回显等待确认。
-            val schema = if (priorConfirmation != null) {
-                IntentEngine.mergeCorrection(priorConfirmation.intent, current, instruction)
-            } else {
-                current
-            }
-
-            if (schema.intent == IntentSchema.INTENT_CHAT) {
-                generateChatReply(s, instruction)
+            val llm = createClient()
+            if (llm == null) {
+                failTurn(s, "请先在「设置」中配置 API Key、地址和模型")
                 return@withLock
             }
 
-            // 新流程：意图层之后先出策划草案，确认门回显草案玩法；点击确认按钮后，
-            // 决策层才根据玩家确认的完整信息输出最终 DesignPlan 并进入代码生成。
-            val planningIntent = PlanningEngine.inheritExistingDesign(schema, s.designPlan, instruction)
-            val draftPlan = PlanningEngine.draft(planningIntent, s.designPlan?.title)
+            // 1) 意图层：只区分 develop / chat。chat 为 readonly，不写文件也不改 Game Schema。
+            _session.value = s.copy(agentStage = AgentStage.INTENT)
+            val intent = classifyIntent(instruction, llm)
+            currentCoroutineContext().ensureActive()
+            if (intent.isChat) {
+                generateChatReply(s, instruction, llm)
+                return@withLock
+            }
+
+            // 2) 识别层：只在 develop 分支运行。检测会话级 Game Schema JSON：
+            //    null  → 本对话还没有游戏 → 默认为首次制作；
+            //    非 null → 已锚定一个游戏 → 在本轮消息上补全/覆盖同一份 JSON。
+            _session.value = _session.value.copy(agentStage = AgentStage.RECOGNITION)
+            val previousSchema = s.gameSchema ?: legacyAnchoredSchema(s)
+            val localPatch = RecognitionEngine.extractLocal(instruction)
+            val litePatch = if (localPatch.confidence < 0.8) {
+                requestRecognitionFromLiteLlm(instruction, llm)
+            } else {
+                null
+            }
+            val recognition = RecognitionEngine.recognize(instruction, previousSchema, litePatch)
             currentCoroutineContext().ensureActive()
 
-            // 有确认门遗留时，任何文字输入都视为修正；重新生成摘要，直到点击确认按钮才进入决策层。
+            // 意图层可能误判；识别层抽不到任何游戏实体时回退为普通文本聊天。
+            if (recognition.emptyEntities) {
+                generateChatReply(s, instruction, llm)
+                return@withLock
+            }
+            val schema = recognition.gameSchema
+            // 识别结果先写回会话，后续策划/确认/生成都共享同一份 JSON。
+            _session.value = _session.value.copy(gameSchema = schema)
+
+            // 3) 策划层：根据识别层共享的 Game Schema 整理系统列表，并由 LLM
+            //    逐项阐述每个系统在这款游戏中的具体实现方式（业务验收边界）。
+            val draftPlan = draftPlanWithLlm(schema, s, instruction, llm)
+            currentCoroutineContext().ensureActive()
+
+            // 确认门期间的任何文字输入都视为补充/修正；直到点击确认按钮才进入决策层。
             val effectiveRequest = if (priorConfirmation != null) {
                 priorConfirmation.userRequest + "\n补充/修正：" + instruction
             } else {
                 instruction
             }
-            val confirmation = IntentEngine.buildConfirmation(effectiveRequest, planningIntent, draftPlan)
+            val confirmation = RecognitionEngine.buildConfirmation(
+                userRequest = effectiveRequest,
+                schema = schema,
+                draftPlan = draftPlan,
+                isNewGame = recognition.isNewGame
+            )
             val assistantReply = confirmationMessage(
                 confirmation,
                 if (priorConfirmation != null) "已根据你的补充重新整理需求" else "已识别需求"
@@ -409,6 +447,7 @@ class GameAgent(
             val next = _session.value.copy(
                 messages = _session.value.messages + ChatMessage("assistant", assistantReply),
                 pendingConfirmation = confirmation,
+                gameSchema = schema,
                 isGenerating = false,
                 streamingText = null,
                 agentStage = AgentStage.CONFIRM,
@@ -419,6 +458,85 @@ class GameAgent(
             currentCoroutineContext().ensureActive()
             _session.value = next
             persistSessionMessages(next)
+        }
+    }
+
+    /** 意图层：正则优先，低置信度时用 Lite LLM 复核 develop / chat。 */
+    private suspend fun classifyIntent(userText: String, llm: LlmClient): IntentDecision {
+        val local = IntentLayer.inferLocally(userText)
+        if (local.confidence >= 0.8) return local
+        val reply = try {
+            collectTextReply(
+                llm,
+                listOf(
+                    ChatMessage("system", "你是意图分类器，只输出合法 JSON。"),
+                    ChatMessage("user", IntentLayer.liteLlmPrompt(userText))
+                )
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        return IntentLayer.parseLiteLlmReply(reply ?: "") ?: local
+    }
+
+    /** 识别层 Lite LLM：只补全 Game Schema 补丁 JSON，不含意图字段。 */
+    private suspend fun requestRecognitionFromLiteLlm(
+        userText: String,
+        llm: LlmClient
+    ): GameSchemaPatch? {
+        val reply = try {
+            collectTextReply(
+                llm,
+                listOf(
+                    ChatMessage("system", "你是游戏特征识别器，只输出合法 JSON。"),
+                    ChatMessage("user", RecognitionEngine.liteLlmPrompt(userText))
+                )
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        return GameSchemaValidator.parseLiteLlmReply(reply ?: "")
+    }
+
+    /** 策划层草案：由 LLM 逐项细化系统实现；LLM 异常时回退模板库/系统矩阵。 */
+    private suspend fun draftPlanWithLlm(
+        schema: GameSchema,
+        session: GameSession,
+        currentUserRequest: String,
+        llm: LlmClient
+    ): DesignPlan {
+        _session.value = _session.value.copy(agentStage = AgentStage.PLANNING)
+        return PlanningEngine.draftWithLlm(
+            schema = schema,
+            llm = llm,
+            existingTitle = session.designPlan?.title,
+            currentUserRequest = currentUserRequest
+        )
+    }
+
+    /** 兼容旧会话：没有 gameSchema 但已有设计稿或代码时，视为已经锚定了一个游戏。 */
+    private fun legacyAnchoredSchema(session: GameSession): GameSchema? {
+        session.gameSchema?.let { return it }
+        val plan = session.designPlan
+        if (plan != null) {
+            return GameSchema(
+                visualDimension = plan.visualDimension,
+                screenOrientation = plan.screenOrientation,
+                gameSystems = plan.gameSystems,
+                requestedSystems = plan.gameSystems,
+                excludedSystems = plan.excludedSystems,
+                confidence = 1.0,
+                lockTemplateResolution = true
+            )
+        }
+        return if (!session.currentHtml.isNullOrBlank() || editingGameId != null) {
+            GameSchema(confidence = 1.0, lockTemplateResolution = true)
+        } else {
+            null
         }
     }
 
@@ -437,29 +555,10 @@ class GameAgent(
         append("\n请点击下方唯一的确认按钮，确认后我会按此方案生成代码；如需修改，直接在底部输入框输入新的要求。")
     }
 
-    private suspend fun requestIntentFromLiteLlm(userText: String): IntentSchema? {
-        val local = IntentEngine.infer(userText, _session.value.currentHtml)
-        if (local.confidence >= 0.8) return local
-        val llm = createClient() ?: return null
-        val reply = collectReply(
-            llm,
-            listOf(
-                ChatMessage("system", "你是意图抽取器，只输出合法 JSON。"),
-                ChatMessage("user", IntentEngine.liteLlmPrompt(userText))
-            )
-        )
-        return IntentSchemaValidator.parseLiteLlmReply(reply)
-    }
-
-    private suspend fun generateChatReply(s: GameSession, instruction: String) {
-        val llm = createClient()
-        if (llm == null) {
-            failTurn(s, "请先在「设置」中配置 API Key、地址和模型")
-            return
-        }
+    private suspend fun generateChatReply(s: GameSession, instruction: String, llm: LlmClient) {
         _session.value = s.copy(isGenerating = true, agentStage = AgentStage.CHAT, streamingText = null)
         val reply = try {
-            collectReply(
+            collectTextReply(
                 llm,
                 listOf(
                     ChatMessage("system", GamePrompt.chatSystemPrompt()),
@@ -485,7 +584,7 @@ class GameAgent(
 
     private suspend fun generateFromIntent(
         instruction: String,
-        intent: IntentSchema,
+        intent: GameSchema,
         existingHtml: String?,
         forcePlan: DesignPlan?
     ) {
@@ -508,6 +607,7 @@ class GameAgent(
             error = null,
             streamingText = null,
             agentStage = planningStage,
+            gameSchema = intent,
             designPlan = plan,
             filePlan = listOf("index.html"),
             decisionLog = _session.value.decisionLog + "决策层定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
@@ -738,7 +838,9 @@ class GameAgent(
     private fun buildRollingSummary(plan: DesignPlan, report: ValidationReport, html: String): String = buildString {
         append("文件计划与清单：${_session.value.filePlan.joinToString(" → ")}（index.html ${html.length} 字符）\n")
         append("设计Schema：${plan.templateClass} / ${plan.gameSystems.joinToString("、")} / P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}\n")
-        append("实现清单：${plan.implementations.joinToString("；") { "${it.system}(${it.methods.joinToString("|")})" }}\n")
+        append("实现清单：${plan.implementations.joinToString("；") { impl ->
+            "${impl.system}(${impl.methods.joinToString("|")};玩家说明:${impl.playerFacing.ifBlank { "略" }};验收:${impl.acceptanceBoundary})"
+        }}\n")
         append("排除清单：系统[${plan.excludedSystems.joinToString("、")}]；方案[${plan.excludedApproaches.joinToString("、")}]\n")
         append("known-issues：${if (report.warnings.isEmpty()) "无" else report.warnings.joinToString("；") { it.message }}\n")
         append("上次改进对应缺陷：无\n")
@@ -799,6 +901,29 @@ class GameAgent(
         }
         msgs += ChatMessage("user", body)
         return msgs
+    }
+
+    /** 文本类 LLM 调用（意图/识别/策划）：只收集文本，不做 HTML 抢救。 */
+    private suspend fun collectTextReply(
+        llm: LlmClient,
+        messages: List<ChatMessage>,
+        stageLabel: String? = null
+    ): String {
+        val sb = StringBuilder()
+        var lastProgressMark = 0
+        llm.streamChat(
+            messages,
+            onDelta = { delta ->
+                sb.append(delta)
+                if (stageLabel != null && sb.length - lastProgressMark >= 200) {
+                    lastProgressMark = sb.length
+                    _session.value = _session.value.copy(agentStage = "$stageLabel · 已接收 ${sb.length} 字符")
+                }
+            },
+            onThinking = {},
+            onDone = {}
+        )
+        return sb.toString()
     }
 
     private suspend fun collectReply(

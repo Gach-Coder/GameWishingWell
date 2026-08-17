@@ -1,11 +1,17 @@
 package com.gamewishingwell.agent
 
+import com.gamewishingwell.data.ChatMessage
+import com.gamewishingwell.llm.LlmClient
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 
 /**
  * 策划层输出：完整策划 Schema JSON。
- * 只做“选系统 + 覆盖参数”，不自由发明：系统来自意图层白名单，
- * 参数来自 template_class（画面维度 × 画面方向 × 主类型）特征矩阵。
+ * 只做“选系统 + 覆盖参数”，不自由发明：系统来自识别层共享的 Game Schema 白名单，
+ * 参数来自 template_class（画面维度 × 画面方向 × 主类型）特征矩阵；
+ * 每个系统的具体实现方式由策划层 LLM 结合该游戏阐述，模板库仅作种子与回退。
  * 定稿同时写明“要实现什么 / 怎么实现 / 明确不做什么”。
  */
 @Serializable
@@ -20,7 +26,9 @@ data class SystemImplementation(
     val system: String,
     val methods: List<String>,
     val layer: Int,
-    val acceptanceBoundary: String
+    val acceptanceBoundary: String,
+    /** 策划层 LLM 生成的玩家视角系统阐述；为空时确认门回退到 methods 解释。 */
+    val playerFacing: String = ""
 )
 
 @Serializable
@@ -83,17 +91,61 @@ object PlanningEngine {
         "反应躲避" to SystemSpec("反应躲避", listOf("点按/滑动响应", "失误判定", "计分"), 0)
     )
 
-    /**
-     * 策划层：确认门前先产出各系统玩法草案，供确认门逐项回显。
-     * 该草案不进入代码生成；玩家确认后由 [finalize] 定稿。
-     */
-    fun draft(intent: IntentSchema, existingTitle: String? = null): DesignPlan = build(intent, existingTitle)
+    private val coreP0Features = listOf(
+        "移动端触控输入", "核心循环可玩", "得分/胜负/重开",
+        "requestAnimationFrame 主循环", "全局 restart() 完整重置"
+    )
+
+    // ---------- 旧 IntentSchema 兼容入口：新流程不应再从这里进入 ----------
+
+    fun draft(intent: IntentSchema, existingTitle: String? = null): DesignPlan =
+        build(intent.toGameSchema(), existingTitle)
+
+    fun finalize(intent: IntentSchema, existingTitle: String? = null): DesignPlan =
+        build(intent.toGameSchema(), existingTitle)
+
+    // ---------- 新流程：策划层输入/输出共享同一份 Game Schema ----------
+
+    fun draft(schema: GameSchema, existingTitle: String? = null): DesignPlan =
+        build(schema, existingTitle)
+
+    fun finalize(
+        schema: GameSchema,
+        confirmedDraft: DesignPlan? = null,
+        existingTitle: String? = null
+    ): DesignPlan {
+        val base = confirmedDraft ?: build(schema, existingTitle)
+        val title = existingTitle ?: base.title
+        return base.copy(
+            title = title,
+            designAssumptions = base.designAssumptions.ifEmpty { RecognitionEngine.buildAssumptions(schema) }
+        )
+    }
 
     /**
-     * 决策层：根据用户最后确认的完整信息（需要实现的系统及方法、需要排除的系统和方案）
-     * 输出完整策划 Schema JSON。
+     * 策划层核心：根据 Game Schema JSON 整理系统列表，并用 LLM 细化每个系统
+     * “在这款游戏里的具体实现方式”。LLM 失败时回退到模板库/通用系统矩阵，
+     * 保证确认门仍可获得可用的策划草案。
      */
-    fun finalize(intent: IntentSchema, existingTitle: String? = null): DesignPlan = build(intent, existingTitle)
+    suspend fun draftWithLlm(
+        schema: GameSchema,
+        llm: LlmClient,
+        existingTitle: String? = null,
+        currentUserRequest: String? = null
+    ): DesignPlan {
+        val base = build(schema, existingTitle)
+        if (base.gameSystems.isEmpty()) return base
+
+        val reply = try {
+            collectPlanningReply(llm, schema, currentUserRequest)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        val elaborations = reply?.let { parseLlmSystemDesigns(it) }.orEmpty()
+        return applyLlmSystemDesigns(base, schema, elaborations)
+    }
 
     /**
      * 修改已有游戏时，意图层可能只识别出局部修改词（如“加连击计分”）。
@@ -115,7 +167,6 @@ object PlanningEngine {
             .filter { GameSystemCatalog.isValid(it) && it !in excluded }
             .distinct()
 
-        // 局部修改时没有重新声明维度/方向，则继承上一版，避免“加点难度”把 3D 改回 2D。
         val dimension = if (userText != null && !IntentEngine.explicitlySpecifiesDimension(userText)) {
             previous.visualDimension
         } else {
@@ -134,36 +185,83 @@ object PlanningEngine {
         )
     }
 
+    /**
+     * Game Schema 版本的系统范围继承：用于旧会话迁移或识别层尚未补全的边界场景。
+     * 新流程正常由 [RecognitionEngine.recognize] 在同一份 Game Schema 上补全。
+     */
+    fun inheritExistingDesign(
+        schema: GameSchema,
+        previous: DesignPlan?,
+        userText: String? = null
+    ): GameSchema {
+        if (previous == null) return schema
+        if (schema.templateId != null || schema.referenceGame != null) return schema
+
+        val excluded = schema.excludedSystems.toSet()
+        val merged = (previous.gameSystems + schema.gameSystems)
+            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+            .distinct()
+        val dimension = if (userText != null && !IntentEngine.explicitlySpecifiesDimension(userText)) {
+            previous.visualDimension
+        } else {
+            schema.visualDimension
+        }
+        val orientation = if (userText != null && !IntentEngine.explicitlySpecifiesOrientation(userText)) {
+            previous.screenOrientation
+        } else {
+            schema.screenOrientation
+        }
+        return schema.copy(
+            gameSystems = merged.ifEmpty { previous.gameSystems },
+            visualDimension = dimension,
+            screenOrientation = orientation
+        )
+    }
+
     /** 模板 class = 画面维度 × 画面方向 × 主类型，只允许出现特征矩阵里的系统。 */
-    fun build(intent: IntentSchema, existingTitle: String? = null): DesignPlan {
-        val excluded = intent.excludedSystems.toSet()
+    fun build(intent: IntentSchema, existingTitle: String? = null): DesignPlan =
+        build(intent.toGameSchema(), existingTitle)
+
+    /** 新流程核心构建：Game Schema 中已经包含最终系统集合。 */
+    fun build(schema: GameSchema, existingTitle: String? = null): DesignPlan {
+        val excluded = schema.excludedSystems.toSet()
         val fallbackSystems = listOf("反应躲避", "收集").filterNot { it in excluded }
-        val explicitSystems = intent.gameSystems
+        val selected = schema.gameSystems
             .filter { GameSystemCatalog.isValid(it) && it !in excluded }
             .distinct()
             .ifEmpty { fallbackSystems }
-        val templateRef = intent.templateId?.let { TemplateLibrary.findById(it) }
-        val merged = (explicitSystems + (templateRef?.suggestedSystems ?: emptyList()))
+
+        val templateRef = schema.templateId?.let { TemplateLibrary.findById(it) }
+        val merged = (selected + (templateRef?.suggestedSystems ?: emptyList()))
             .filter { GameSystemCatalog.isValid(it) && it !in excluded }
             .distinct()
             .ifEmpty { fallbackSystems }
 
         val primary = derivePrimarySystem(merged, templateRef?.id)
-        val matrixClass = "${intent.visualDimension}×${intent.screenOrientation}×${primary}"
+        val matrixClass = "${schema.visualDimension}×${schema.screenOrientation}×${primary}"
+
+        val implementations = merged.map { system ->
+            val spec = systemMatrix[system]
+            SystemImplementation(
+                system = system,
+                methods = GameSystemCatalog.implementationMethods(
+                    system = system,
+                    dimension = schema.visualDimension,
+                    orientation = schema.screenOrientation,
+                    templateId = schema.templateId
+                ),
+                layer = TemplateSystemCatalog.resolve(schema.templateId, system)?.layer ?: spec?.layer ?: 2,
+                acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system, schema.templateId)
+            )
+        }
 
         val p0 = linkedSetOf<String>()
         val p1 = linkedSetOf<String>()
         val p2 = linkedSetOf<String>()
-
-        p0 += listOf("移动端触控输入", "核心循环可玩", "得分/胜负/重开", "requestAnimationFrame 主循环", "全局 restart() 完整重置")
-        merged.forEach { system ->
-            val spec = systemMatrix[system] ?: return@forEach
-            val templateSpec = TemplateSystemCatalog.resolve(intent.templateId, system)
-            // 有模板具体实现时，P 层特性直接使用模板玩法；没有才回退通用系统矩阵。
-            val featureBasis = templateSpec?.methods ?: spec.defaultParams
-            val layer = templateSpec?.layer ?: spec.layer
-            val params = featureBasis.map { "${system}：$it" }
-            when (layer) {
+        p0 += coreP0Features
+        implementations.forEach { impl ->
+            val params = impl.methods.take(4).map { "${impl.system}：$it" }
+            when (impl.layer) {
                 0 -> p0 += params
                 1 -> p1 += params
                 else -> p2 += params
@@ -172,29 +270,15 @@ object PlanningEngine {
         p1 += "音效反馈（WebAudio）"
         p2 += "界面动效与难度曲线"
 
-        val implementations = merged.map { system ->
-            val spec = systemMatrix[system]
-            SystemImplementation(
-                system = system,
-                methods = GameSystemCatalog.implementationMethods(
-                    system = system,
-                    dimension = intent.visualDimension,
-                    orientation = intent.screenOrientation,
-                    templateId = intent.templateId
-                ),
-                layer = TemplateSystemCatalog.resolve(intent.templateId, system)?.layer ?: spec?.layer ?: 2,
-                acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system, intent.templateId)
-            )
-        }
-        val acceptance = buildAcceptance(intent, merged, templateRef)
+        val acceptance = buildAcceptance(schema, implementations, templateRef)
         val lines = 220 + merged.size * 60
         val scripts = 1 + if (merged.size >= 4) 1 else 0
 
         return DesignPlan(
             templateClass = matrixClass,
-            title = existingTitle ?: defaultTitle(intent),
-            visualDimension = intent.visualDimension,
-            screenOrientation = intent.screenOrientation,
+            title = existingTitle ?: defaultTitle(schema),
+            visualDimension = schema.visualDimension,
+            screenOrientation = schema.screenOrientation,
             primarySystem = primary,
             gameSystems = merged,
             p0Features = p0.toList(),
@@ -202,10 +286,144 @@ object PlanningEngine {
             p2Features = p2.toList(),
             acceptanceChecklist = acceptance,
             complexityBudget = ComplexityBudget(estimatedLines = lines, estimatedScripts = scripts),
-            designAssumptions = IntentEngine.buildAssumptions(intent),
+            designAssumptions = RecognitionEngine.buildAssumptions(schema),
             implementations = implementations,
-            excludedSystems = buildExcludedSystems(intent, merged),
-            excludedApproaches = buildExcludedApproaches(intent, templateRef)
+            excludedSystems = buildExcludedSystems(schema, merged),
+            excludedApproaches = buildExcludedApproaches(schema, templateRef)
+        )
+    }
+
+    // ---------- 策划层 LLM 细化 ----------
+
+    @Serializable
+    data class LlmSystemDesign(
+        val system: String = "",
+        /** 玩家视角阐述：只聊玩法和规则，不聊引擎/算法/Canvas 等技术实现。 */
+        val implementation: String = "",
+        /** 生成层可执行的具体实现要点。 */
+        val methods: List<String> = emptyList(),
+        val acceptanceBoundary: String = "",
+        /** 0=P0 核心玩法，1=P1 重要特性，2=P2 打磨项；非法值回退系统矩阵。 */
+        val layer: Int = -1
+    )
+
+    @Serializable
+    private data class LlmPlanningReply(
+        val systems: List<LlmSystemDesign> = emptyList()
+    )
+
+    private val planningJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+    /** 供单元测试使用的纯解析入口。 */
+    fun parseLlmSystemDesigns(raw: String): List<LlmSystemDesign> {
+        if (raw.isBlank()) return emptyList()
+        val cleaned = raw.trim()
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
+        val objectStart = cleaned.indexOf('{')
+        val arrayStart = cleaned.indexOf('[')
+        val rawDesigns = when {
+            objectStart >= 0 && (arrayStart < 0 || objectStart < arrayStart) -> {
+                val objectEnd = cleaned.lastIndexOf('}')
+                if (objectEnd <= objectStart) return emptyList()
+                runCatching {
+                    planningJson.decodeFromString<LlmPlanningReply>(
+                        cleaned.substring(objectStart, objectEnd + 1)
+                    )
+                }.getOrNull()?.systems.orEmpty()
+            }
+            arrayStart >= 0 -> {
+                val arrayEnd = cleaned.lastIndexOf(']')
+                if (arrayEnd <= arrayStart) return emptyList()
+                runCatching {
+                    planningJson.decodeFromString<List<LlmSystemDesign>>(
+                        cleaned.substring(arrayStart, arrayEnd + 1)
+                    )
+                }.getOrNull().orEmpty()
+            }
+            else -> emptyList()
+        }
+        return rawDesigns
+            .filter { GameSystemCatalog.isValid(it.system) }
+            .distinctBy { it.system }
+    }
+
+    private suspend fun collectPlanningReply(
+        llm: LlmClient,
+        schema: GameSchema,
+        currentUserRequest: String?
+    ): String {
+        val sb = StringBuilder()
+        llm.streamChat(
+            listOf(
+                ChatMessage("system", GamePrompt.planningSystemPrompt()),
+                ChatMessage("user", GamePrompt.planningPrompt(schema, currentUserRequest))
+            ),
+            onDelta = { sb.append(it) },
+            onThinking = {},
+            onDone = {}
+        )
+        return sb.toString()
+    }
+
+    /** 把 LLM 系统阐述覆盖到静态草案上；LLM 缺失/非法系统保留静态实现。 */
+    private fun applyLlmSystemDesigns(
+        base: DesignPlan,
+        schema: GameSchema,
+        designs: List<LlmSystemDesign>
+    ): DesignPlan {
+        if (designs.isEmpty()) return base
+
+        val validBySystem = designs
+            .filter { GameSystemCatalog.isValid(it.system) && it.system in base.gameSystems }
+            .associateBy { it.system }
+
+        val implementations = base.implementations.map { old ->
+            val llm = validBySystem[old.system]
+            if (llm == null) {
+                old
+            } else {
+                val methods = llm.methods
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .distinct()
+                    .take(6)
+                    .ifEmpty { old.methods }
+                SystemImplementation(
+                    system = old.system,
+                    methods = methods,
+                    layer = llm.layer.takeIf { it in 0..2 } ?: old.layer,
+                    acceptanceBoundary = llm.acceptanceBoundary.trim().ifBlank { old.acceptanceBoundary },
+                    playerFacing = llm.implementation.trim()
+                )
+            }
+        }
+
+        val p0 = linkedSetOf<String>()
+        val p1 = linkedSetOf<String>()
+        val p2 = linkedSetOf<String>()
+        p0 += coreP0Features
+        implementations.forEach { impl ->
+            val params = impl.methods.take(4).map { "${impl.system}：$it" }
+            when (impl.layer) {
+                0 -> p0 += params
+                1 -> p1 += params
+                else -> p2 += params
+            }
+        }
+        p1 += "音效反馈（WebAudio）"
+        p2 += "界面动效与难度曲线"
+
+        val templateRef = schema.templateId?.let { TemplateLibrary.findById(it) }
+        return base.copy(
+            p0Features = p0.toList(),
+            p1Features = p1.toList(),
+            p2Features = p2.toList(),
+            implementations = implementations,
+            acceptanceChecklist = buildAcceptance(schema, implementations, templateRef)
         )
     }
 
@@ -218,8 +436,8 @@ object PlanningEngine {
     }
 
     private fun buildAcceptance(
-        intent: IntentSchema,
-        systems: List<String>,
+        schema: GameSchema,
+        implementations: List<SystemImplementation>,
         templateRef: GameTemplateRef?
     ): List<String> {
         val result = mutableListOf(
@@ -228,15 +446,12 @@ object PlanningEngine {
             "触控可用且不依赖键盘鼠标；全局 restart() 可重复调用",
             "基础校验通过即退出 Agent Loop，交由玩家实际试玩并回传运行问题"
         )
-        systems.forEach { system ->
-            val spec = systemMatrix[system] ?: return@forEach
-            val firstFeature = TemplateSystemCatalog.resolve(intent.templateId, system)?.methods?.firstOrNull()
-                ?: spec.defaultParams.firstOrNull()
-            result += firstFeature?.let { "已实现：${system}·$it" } ?: "已实现：$system"
-            result += "业务验收：${system}·${GameSystemCatalog.acceptanceBoundary(system, intent.templateId)}"
+        implementations.forEach { impl ->
+            impl.methods.firstOrNull()?.let { result += "已实现：${impl.system}·$it" }
+            result += "业务验收：${impl.system}·${impl.acceptanceBoundary}"
         }
         if (templateRef != null) result += "对标「${templateRef.title}」的核心体验成立"
-        result += "${intent.visualDimension} / ${intent.screenOrientation} 呈现正确"
+        result += "${schema.visualDimension} / ${schema.screenOrientation} 呈现正确"
         return result
     }
 
@@ -245,31 +460,31 @@ object PlanningEngine {
      * 1) 玩家明确排除的系统；
      * 2) 白名单里未进入本次范围的其他系统，生成层不得擅自添加。
      */
-    private fun buildExcludedSystems(intent: IntentSchema, selected: List<String>): List<String> {
+    private fun buildExcludedSystems(schema: GameSchema, selected: List<String>): List<String> {
         val result = linkedSetOf<String>()
-        result += intent.excludedSystems.filter { GameSystemCatalog.isValid(it) }
+        result += schema.excludedSystems.filter { GameSystemCatalog.isValid(it) }
         result += GameSystemCatalog.ALL.filterNot { it in selected }
         return result.toList()
     }
 
     /** 由已确认的画面维度/方向推导必须排除的实现方案，并追加平台硬约束。 */
-    private fun buildExcludedApproaches(intent: IntentSchema, templateRef: GameTemplateRef?): List<String> {
+    private fun buildExcludedApproaches(schema: GameSchema, templateRef: GameTemplateRef?): List<String> {
         val result = linkedSetOf<String>()
-        when (intent.visualDimension) {
-            IntentSchema.DIMENSION_2D -> {
+        when (schema.visualDimension) {
+            GameSchema.DIMENSION_2D -> {
                 result += "2.5D 斜 45° 渲染方案"
                 result += "3D 场景/模型渲染方案"
             }
-            IntentSchema.DIMENSION_2_5D -> {
+            GameSchema.DIMENSION_2_5D -> {
                 result += "纯平面 2D 渲染方案"
                 result += "3D 场景/模型渲染方案"
             }
-            IntentSchema.DIMENSION_3D -> {
+            GameSchema.DIMENSION_3D -> {
                 result += "纯平面 2D 渲染方案"
                 result += "2.5D 斜 45° 渲染方案"
             }
         }
-        result += if (intent.screenOrientation == IntentSchema.ORIENTATION_PORTRAIT) {
+        result += if (schema.screenOrientation == GameSchema.ORIENTATION_PORTRAIT) {
             "横板/横屏布局方案"
         } else {
             "竖版/竖屏布局方案"
@@ -295,7 +510,7 @@ object PlanningEngine {
         primary_system:${plan.primarySystem}
         systems:${plan.gameSystems.joinToString(",")}
         implementations:${plan.implementations.joinToString(";") { impl ->
-            "${impl.system}=${impl.methods.joinToString("|")}（验收：${impl.acceptanceBoundary}）"
+            "${impl.system}=${impl.methods.joinToString("|")}（玩家说明：${impl.playerFacing.ifBlank { "略" }}；验收：${impl.acceptanceBoundary}）"
         }}
         excluded_systems:${plan.excludedSystems.joinToString(",")}
         excluded_approaches:${plan.excludedApproaches.joinToString("；")}
@@ -307,9 +522,11 @@ object PlanningEngine {
         </design_schema>
     """.trimIndent()
 
-    private fun defaultTitle(intent: IntentSchema): String {
-        val ref = intent.templateId?.let { TemplateLibrary.findById(it) }
+    private fun defaultTitle(schema: GameSchema): String {
+        val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
         if (ref != null) return ref.title
-        return intent.gameSystems.firstOrNull()?.let { "$it 小游戏" } ?: "我的小游戏"
+        return schema.requestedSystems.firstOrNull()?.let { "$it 小游戏" }
+            ?: schema.gameSystems.firstOrNull()?.let { "$it 小游戏" }
+            ?: "我的小游戏"
     }
 }

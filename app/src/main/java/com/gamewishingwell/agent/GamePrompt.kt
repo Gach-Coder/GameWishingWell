@@ -50,6 +50,65 @@ object GamePrompt {
     fun readTemplate(context: Context): String =
         context.assets.open("game_template.html").bufferedReader().use { it.readText() }
 
+    /** 策划层 LLM 的 system 提示词：只负责把每个系统解释成“这款游戏里的具体实现”。 */
+    fun planningSystemPrompt(): String = """
+        你是游戏策划。用户确认了 Game Schema JSON 中的系统范围，你需要逐项说明：
+        “这个系统在这款具体游戏里到底怎么玩、有什么内容、做到什么程度才算验收通过”。
+
+        请只输出 JSON，不要输出 Markdown 或额外解释。
+
+        JSON 结构：
+        {
+          "systems": [
+            {
+              "system": "白名单中的系统名",
+              "implementation": "给玩家看的玩法说明：只描述游戏内容和规则，禁止出现 Canvas、WebAudio、requestAnimationFrame、引擎、算法、状态机、碰撞检测、DOM、HTML、CSS、代码结构等技术词",
+              "methods": ["生成代码时能直接执行的具体实现要点1", "要点2", "要点3"],
+              "acceptanceBoundary": "玩家可感知的业务验收标准",
+              "layer": 0
+            }
+          ]
+        }
+
+        规则：
+        1. 只能输出 systems 中列出的系统，不得新增系统；
+        2. implementation 必须结合 reference_game/template 和用户需求，说明该系统在这款游戏里的具体内容，例如黄金矿工的道具系统要说明有黄金/石头/炸弹、黄金和石头随体积越大价值越大、石头更廉价等；
+        3. methods 是给代码生成层的具体实现要点，可以有“钩子前端与道具做圆形碰撞判定”这类确定性规则；
+        4. layer：0=P0 核心玩法、1=P1 重要特性、2=P2 打磨项；
+        5. 排除系统不得出现。
+    """.trimIndent()
+
+    /** 策划层 LLM 输入：会话级 Game Schema JSON + 首轮需求 + 模板库种子实现。 */
+    fun planningPrompt(schema: GameSchema, currentUserRequest: String? = null): String {
+        val seedSystems = schema.gameSystems.joinToString("\n") { system ->
+            "  - $system：种子方法=${GameSystemCatalog.implementationMethods(
+                system, schema.visualDimension, schema.screenOrientation, schema.templateId
+            ).joinToString("|")}；种子验收=${GameSystemCatalog.acceptanceBoundary(system, schema.templateId)}"
+        }
+        return """
+        请为以下 Game Schema 中的每个系统，策划出它在这款游戏里的具体实现方式。
+
+        <game_schema>
+        schema_version:${schema.schemaVersion}
+        dimension:${schema.visualDimension}
+        orientation:${schema.screenOrientation}
+        systems:${schema.gameSystems.joinToString(",")}
+        requested_systems:${schema.requestedSystems.joinToString(",")}
+        reference_game:${schema.referenceGame ?: "null"}
+        template_id:${schema.templateId ?: "null"}
+        excluded_systems:${schema.excludedSystems.joinToString(",")}
+        first_user_request:${schema.firstUserRequest ?: "（无）"}
+        current_user_request:${currentUserRequest ?: schema.lastUserRequest ?: "（无）"}
+        </game_schema>
+
+        <template_seed>
+$seedSystems
+        </template_seed>
+
+        请结合用户需求，把每个系统的种子方法细化为这款游戏里的具体实现，并直接输出 JSON。
+        """.trimIndent()
+    }
+
     /** 策划 Schema 的上下文最小化注入。 */
     fun planContext(plan: DesignPlan): String = PlanningEngine.toPrompt(plan)
 

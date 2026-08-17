@@ -33,9 +33,17 @@
 *前端 LLM SSE 显示 Agent 状态（游戏识别中/游戏策划中/游戏生成中/游戏校验中/对话回复中等）
 Agent处理message流程如下：
 	**默认契约：一个对话框只制作一个游戏，不处理单对话框的多游戏需求bug Game Schema JSON 对话框级别全局唯一，后续修改即以此为基础
-	→ 识别层：(意图层改为识别层：原识别三类意图对流程无意义，关键在识别游戏)
-		正则 + Lite LLM 抽取游戏特征，输出此对话框的Game Schema JSON（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
-			若返回为空实体，则判断 message 为普通 chat
+	→ 意图层：(develope/chat)
+		分类用户意图，想制作或改进游戏(开发)，还是只是想聊天或询问游戏内容
+		develope:	read/write，可调用工具开发游戏文件
+		chat:		readonly，不改动任何外部文件，也不改变游戏特性变量，纯文本输出任务
+					直接 build prompt → LLM 然后输出文本
+	→ 识别层：（意图层分类结果为 dev）
+		检测 Game Schema JSON 会话级的游戏Json 是否为空：
+			Json为空 → 对话历史不包含游戏 → 默认为首次制作游戏
+			Json非空 → 对话已经锚定某游戏 → 则默认改进这个游戏
+		正则 + Lite LLM 抽取游戏特征，补全或 Game Schema JSON 信息（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
+			若返回为空实体，则判断 message 为普通 chat （意图层可能误判漏判）
 		解析实体包括：
 			画面维度：2D，2.5D，3D
 			画面方向：横板，竖版
@@ -43,8 +51,8 @@ Agent处理message流程如下：
 				(识别层事先定义较完整的游戏系统列表)
 			参考对标游戏：市场内的某著名游戏或无，可辅助补全游戏特性。（映射到内部模板库template_id + 相似度，映射不上返回 template:null）
             （保留扩展位置）
-	→ 策划层：根据用户意图整理所需的游戏系统列表，然后根据针对每个系统策划出对应在这个游戏中具体合理的实现方式（业务验收边界）
-		例如黄金矿工-道具系统：黄金/石头/炸弹，拾取判定为钩子触碰道具。（策划系统玩法的核心逻辑，有什么道具，怎么用）
+	→ 策划层：根据上游整理所需的游戏系统列表，然后根据针对每个系统策划出对应在这个游戏中具体合理的实现方式（业务验收边界）
+		例如<黄金矿工>游戏选择"道具系统"后，需诠释道具系统在游戏里具体的实现方式：有黄金/石头/炸弹，黄金石头随体积越大价值则越大，但石头更廉价...
 	→ 确认门：以人话摘要回显游戏策划结果（画面维度 / 方向 / 游戏系统 / 对标游戏特性默认值假设）并逐一向玩家解释尤其实现方式。
 		不用向用户说明或探讨具体的技术细节，例如游戏引擎，算法等底层技术或逻辑。只说明和探讨游戏内容和玩法系统逻辑。
 		用户可点击卡片中确认按钮或再次输入文本修改，若用户修正则重组摘要再次回显待确认，直到用户点击确认则进入下一步，确保已经获取用户全部需求；
@@ -131,9 +139,11 @@ GameWishingWell/
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
       │  │  ├─ agent/
       │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / Agent Loop
-      │  │  │  ├─ GameIntent.kt          # 意图层：Intent Schema、白名单、模板库、确认门
-      │  │  │  ├─ GameTemplateSystems.kt # 对标模板的具体系统实现/验收边界（确认门与策划层共用）
-      │  │  │  ├─ GamePlan.kt            # 策划层：P0/P1/P2、验收清单、复杂度预算
+      │  │  │  ├─ GameIntent.kt          # 意图层：只分 develop/chat 两个意图
+      │  │  │  ├─ GameIntentLegacy.kt    # 旧版三意图 Schema/引擎，仅供历史会话与旧测试兼容
+      │  │  │  ├─ GameRecognition.kt     # 识别层：会话级 Game Schema JSON、白名单校验、模板库、确认门
+      │  │  │  ├─ GameTemplateSystems.kt # 对标模板的具体系统实现/验收边界（LLM 策划的种子与回退）
+      │  │  │  ├─ GamePlan.kt            # 策划层：LLM 逐系统阐述具体实现、P0/P1/P2、验收清单
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
       │  │  │  ├─ GameValidator.kt       # JS 语法(acorn 同等) + HTML 配对 + no-undef 等结构化校验
       │  │  │  ├─ GameSmokeTest.kt       # WebView 隔离 iframe 确定性 tick 冒烟测试
@@ -171,6 +181,8 @@ GameWishingWell/
       │     ├─ drawable/                 # launcher 背景/前景
       │     └─ mipmap-anydpi-v26/        # 自适应图标
       └─ test/java/com/gamewishingwell/  # 本地 JVM 单元测试
+         ├─ agent/GameRecognitionTest.kt
+         ├─ agent/GamePlanningLlmTest.kt
          ├─ agent/HtmlEnhancerTest.kt
          ├─ agent/HtmlExtractorTest.kt
          ├─ data/JsonTest.kt

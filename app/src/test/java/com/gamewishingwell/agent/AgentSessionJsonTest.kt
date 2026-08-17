@@ -29,6 +29,7 @@ class AgentSessionJsonTest {
             currentHtml = "<html></html>",
             agentStage = AgentStage.CONFIRM,
             pendingConfirmation = IntentEngine.buildConfirmation("做一个打地鼠游戏", intent),
+            gameSchema = intent.toGameSchema(),
             rollingSummary = "summary",
             fileManifest = FileManifest(pointer = "index.html", files = listOf(WorkspaceFile("index.html", 1, "hash", 4))),
             designPlan = plan,
