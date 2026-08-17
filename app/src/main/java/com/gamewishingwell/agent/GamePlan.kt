@@ -83,6 +83,57 @@ object PlanningEngine {
         "反应躲避" to SystemSpec("反应躲避", listOf("点按/滑动响应", "失误判定", "计分"), 0)
     )
 
+    /**
+     * 策划层：确认门前先产出各系统玩法草案，供确认门逐项回显。
+     * 该草案不进入代码生成；玩家确认后由 [finalize] 定稿。
+     */
+    fun draft(intent: IntentSchema, existingTitle: String? = null): DesignPlan = build(intent, existingTitle)
+
+    /**
+     * 决策层：根据用户最后确认的完整信息（需要实现的系统及方法、需要排除的系统和方案）
+     * 输出完整策划 Schema JSON。
+     */
+    fun finalize(intent: IntentSchema, existingTitle: String? = null): DesignPlan = build(intent, existingTitle)
+
+    /**
+     * 修改已有游戏时，意图层可能只识别出局部修改词（如“加连击计分”）。
+     * 这里继承上一版策划方案中的系统，并叠加本轮明确新增/排除的系统；
+     * 玩家明确换了对标模板时不继承旧方案，避免新旧范围混在一起。
+     */
+    fun inheritExistingDesign(
+        intent: IntentSchema,
+        previous: DesignPlan?,
+        userText: String? = null
+    ): IntentSchema {
+        if (intent.intent != IntentSchema.INTENT_MODIFY_GAME || previous == null) return intent
+        if (intent.templateId != null || intent.referenceGame != null) return intent
+
+        val excluded = intent.excludedSystems.toSet()
+        val inherited = previous.gameSystems
+            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+        val merged = (inherited + intent.gameSystems)
+            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+            .distinct()
+
+        // 局部修改时没有重新声明维度/方向，则继承上一版，避免“加点难度”把 3D 改回 2D。
+        val dimension = if (userText != null && !IntentEngine.explicitlySpecifiesDimension(userText)) {
+            previous.visualDimension
+        } else {
+            intent.visualDimension
+        }
+        val orientation = if (userText != null && !IntentEngine.explicitlySpecifiesOrientation(userText)) {
+            previous.screenOrientation
+        } else {
+            intent.screenOrientation
+        }
+
+        return intent.copy(
+            gameSystems = merged,
+            visualDimension = dimension,
+            screenOrientation = orientation
+        )
+    }
+
     /** 模板 class = 画面维度 × 画面方向 × 主类型，只允许出现特征矩阵里的系统。 */
     fun build(intent: IntentSchema, existingTitle: String? = null): DesignPlan {
         val excluded = intent.excludedSystems.toSet()
@@ -107,8 +158,12 @@ object PlanningEngine {
         p0 += listOf("移动端触控输入", "核心循环可玩", "得分/胜负/重开", "requestAnimationFrame 主循环", "全局 restart() 完整重置")
         merged.forEach { system ->
             val spec = systemMatrix[system] ?: return@forEach
-            val params = spec.defaultParams.map { "${system}：$it" }
-            when (spec.layer) {
+            val templateSpec = TemplateSystemCatalog.resolve(intent.templateId, system)
+            // 有模板具体实现时，P 层特性直接使用模板玩法；没有才回退通用系统矩阵。
+            val featureBasis = templateSpec?.methods ?: spec.defaultParams
+            val layer = templateSpec?.layer ?: spec.layer
+            val params = featureBasis.map { "${system}：$it" }
+            when (layer) {
                 0 -> p0 += params
                 1 -> p1 += params
                 else -> p2 += params
@@ -124,10 +179,11 @@ object PlanningEngine {
                 methods = GameSystemCatalog.implementationMethods(
                     system = system,
                     dimension = intent.visualDimension,
-                    orientation = intent.screenOrientation
+                    orientation = intent.screenOrientation,
+                    templateId = intent.templateId
                 ),
-                layer = spec?.layer ?: 2,
-                acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system)
+                layer = TemplateSystemCatalog.resolve(intent.templateId, system)?.layer ?: spec?.layer ?: 2,
+                acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system, intent.templateId)
             )
         }
         val acceptance = buildAcceptance(intent, merged, templateRef)
@@ -167,15 +223,17 @@ object PlanningEngine {
         templateRef: GameTemplateRef?
     ): List<String> {
         val result = mutableListOf(
-            "静态校验 0 error（acorn 语法 / HTML 配对 / no-undef）",
-            "WebView 冒烟测试：确定性跑满 8 帧且无未捕获异常",
+            "基础校验 0 error（JS 语法 / HTML 配对 / no-undef / 资源与代码契约）",
             "无 eval、无动态 require、无外部资源、浏览器全局白名单内",
-            "触控可用且不依赖键盘鼠标；全局 restart() 可重复调用"
+            "触控可用且不依赖键盘鼠标；全局 restart() 可重复调用",
+            "基础校验通过即退出 Agent Loop，交由玩家实际试玩并回传运行问题"
         )
         systems.forEach { system ->
             val spec = systemMatrix[system] ?: return@forEach
-            result += spec.defaultParams.firstOrNull()?.let { "已实现：${system}·$it" } ?: "已实现：$system"
-            result += "业务验收：${system}·${GameSystemCatalog.acceptanceBoundary(system)}"
+            val firstFeature = TemplateSystemCatalog.resolve(intent.templateId, system)?.methods?.firstOrNull()
+                ?: spec.defaultParams.firstOrNull()
+            result += firstFeature?.let { "已实现：${system}·$it" } ?: "已实现：$system"
+            result += "业务验收：${system}·${GameSystemCatalog.acceptanceBoundary(system, intent.templateId)}"
         }
         if (templateRef != null) result += "对标「${templateRef.title}」的核心体验成立"
         result += "${intent.visualDimension} / ${intent.screenOrientation} 呈现正确"
@@ -229,7 +287,14 @@ object PlanningEngine {
 
     /** 超预算降级：确定性裁剪 P1/P2，只保留 P0 机制。 */
     fun p0Only(plan: DesignPlan): DesignPlan {
-        val p0Systems = plan.gameSystems.filter { systemMatrix[it]?.layer == 0 }.toSet()
+        val p0Systems = plan.implementations
+            .filter { it.layer == 0 }
+            .map { it.system }
+            .toSet()
+            .let { layered ->
+                // 兼容旧会话里没有 implementations 的 DesignPlan，回退通用系统矩阵。
+                layered.ifEmpty { plan.gameSystems.filter { systemMatrix[it]?.layer == 0 }.toSet() }
+            }
         return plan.copy(
             title = plan.title,
             gameSystems = plan.gameSystems.filter { it in p0Systems },
@@ -238,7 +303,7 @@ object PlanningEngine {
             implementations = plan.implementations.filter { it.system in p0Systems },
             excludedSystems = (plan.excludedSystems + plan.gameSystems.filterNot { it in p0Systems }).distinct(),
             acceptanceChecklist = plan.acceptanceChecklist.filter { item ->
-                item.startsWith("静态校验") || item.startsWith("WebView 冒烟") ||
+                item.startsWith("基础校验") ||
                     item.startsWith("无 eval") || item.startsWith("触控可用") ||
                     (item.startsWith("业务验收：") && p0Systems.any { system ->
                         item.startsWith("业务验收：${system}·")

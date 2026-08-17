@@ -60,6 +60,7 @@ data class GameSession(
     val snapshots: List<String> = emptyList(),
     val schemaVersion: Int = 2,
     val budget: RetryBudget = RetryBudget(),
+    /** 仅用于兼容旧会话；简化流程不再运行两段式质量自检，因此新状态中保持 null。 */
     val qualityVerdict: QualityVerdict? = null
 )
 
@@ -70,6 +71,7 @@ object AgentStage {
     const val PLANNING = "游戏策划中"
     const val CODE_GENERATION = "代码生成中"
     const val VALIDATION = "校验中"
+    @Deprecated("简化后的主流程不再执行冒烟测试，保留常量仅为兼容旧状态。")
     const val SMOKE = "冒烟测试中"
     const val DONE = "制作完成"
     const val FAILED = "制作失败"
@@ -79,7 +81,10 @@ object AgentStage {
 }
 
 /**
- * 游戏创作 Agent：意图层 → 确认门 → 策划层 → Prompt → Agent Loop（生成/校验/冒烟/重试）→ 持久化。
+ * 游戏创作 Agent：意图层 → 策划草案 → 确认门 → 决策层 → Prompt → Agent Loop（生成/基础校验/修复）→ 持久化。
+ *
+ * 简化后的 Agent Loop 只做语法与基本逻辑校验：通过后立即交付玩家试玩，
+ * 运行错误和玩家反馈再回到 Agent Loop 修复，避免自动测试流程过长。
  *
  * 生成任务运行在 [agentScope]（全局协程）中：切换页面/对话只会取消 ViewModel 的等待，
  * 不会取消生成本身；生成完成后任何页面都能立即通过 [session] 看到结果。
@@ -90,7 +95,7 @@ class GameAgent(
     private val settingsRepository: SettingsRepository,
     /** 测试注入点；为 null 时按 [LlmSettings] 创建真实厂商客户端。 */
     private val injectedClientFactory: ((LlmSettings) -> LlmClient?)? = null,
-    /** 测试注入点；为 null 时使用 Android WebView 冒烟测试器。 */
+    /** 兼容旧测试的冒烟测试器注入点；主流程已不执行冒烟测试。 */
     private val injectedSmokeRunner: SmokeTestRunner? = null
 ) {
 
@@ -120,8 +125,6 @@ class GameAgent(
             .build()
     }
 
-    private val smokeRunner by lazy { injectedSmokeRunner ?: AndroidSmokeTestRunner(appContext) }
-
     private fun trackGenerationJob(job: Job): Job {
         activeGenerationJob = job
         job.invokeOnCompletion {
@@ -133,7 +136,7 @@ class GameAgent(
     /**
      * 停止键：随时中断当前 Agent Loop。
      * 中断后保留最近一次已抽取出的 HTML 候选（如果有），玩家可立即尝试游玩；
-     * 该候选可能尚未通过校验/冒烟，运行错误属于正常现象。
+     * 该候选可能尚未通过基础校验，运行错误属于正常现象。
      */
     fun stopGeneration() {
         val current = _session.value
@@ -148,7 +151,7 @@ class GameAgent(
             error = null,
             qualityVerdict = null,
             lastWarning = if (current.currentHtml != null) {
-                "已手动中断：当前保留中断前的代码版本，可能尚未通过完整校验，尝试游玩可能出现运行错误。"
+                "已手动中断：当前保留中断前的代码版本，可能尚未通过基础校验，尝试游玩可能出现运行错误。"
             } else {
                 "已手动中断：尚未生成可运行的代码，可以继续补充需求后重新开始。"
             }
@@ -215,7 +218,7 @@ class GameAgent(
         if (trimmed.isBlank()) return
 
         // 确认门期间输入框发来的任何文字都是“补充/修正”，不会当作确认语句；
-        // 进入策划层的唯一入口是界面上的确认按钮（confirmIntent）。
+        // 进入决策层的唯一入口是界面上的确认按钮（confirmIntent）。
         val priorConfirmation = current.pendingConfirmation
         val last = current.messages.lastOrNull()
         val duplicate = last != null && last.isUser && last.content == trimmed
@@ -238,23 +241,31 @@ class GameAgent(
         job.join()
     }
 
-    /** 确认门唯一入口：“按此方案生成”按钮。 */
+    /** 确认门唯一入口：“按此方案生成”按钮；点击后进入决策层并开始生成代码。 */
     suspend fun confirmIntent() {
         val pending = _session.value.pendingConfirmation ?: return
         if (_session.value.isGenerating) return
+
+        // 决策层：根据玩家最后确认的完整信息输出最终 DesignPlan，
+        // 已确认系统/实现方法写入 implementations，排除系统和方案写入 excluded_*。
+        // 局部修改旧游戏时继承上一版系统范围，避免把“加连击计分”误判成新游戏方案。
+        val finalIntent = PlanningEngine.inheritExistingDesign(pending.intent, _session.value.designPlan)
+        val finalPlan = PlanningEngine.finalize(finalIntent, _session.value.designPlan?.title)
+
         val base = _session.value.copy(
             isGenerating = true,
             error = null,
             streamingText = null,
             agentStage = AgentStage.PLANNING,
             pendingConfirmation = null,
+            designPlan = finalPlan,
             budget = RetryBudget(),
             qualityVerdict = null
         )
         _session.value = base
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
-                generateFromIntent(pending.userRequest, pending.intent, _session.value.currentHtml, null)
+                generateFromIntent(pending.userRequest, finalIntent, _session.value.currentHtml, finalPlan)
             }
         })
         job.join()
@@ -383,13 +394,19 @@ class GameAgent(
                 return@withLock
             }
 
-            // 有确认门遗留时，任何文字输入都视为修正；重新生成摘要，直到点击确认按钮才进入策划层。
+            // 新流程：意图层之后先出策划草案，确认门回显草案玩法；点击确认按钮后，
+            // 决策层才根据玩家确认的完整信息输出最终 DesignPlan 并进入代码生成。
+            val planningIntent = PlanningEngine.inheritExistingDesign(schema, s.designPlan, instruction)
+            val draftPlan = PlanningEngine.draft(planningIntent, s.designPlan?.title)
+            currentCoroutineContext().ensureActive()
+
+            // 有确认门遗留时，任何文字输入都视为修正；重新生成摘要，直到点击确认按钮才进入决策层。
             val effectiveRequest = if (priorConfirmation != null) {
                 priorConfirmation.userRequest + "\n补充/修正：" + instruction
             } else {
                 instruction
             }
-            val confirmation = IntentEngine.buildConfirmation(effectiveRequest, schema)
+            val confirmation = IntentEngine.buildConfirmation(effectiveRequest, planningIntent, draftPlan)
             val assistantReply = confirmationMessage(
                 confirmation,
                 if (priorConfirmation != null) "已根据你的补充重新整理需求" else "已识别需求"
@@ -401,7 +418,7 @@ class GameAgent(
                 streamingText = null,
                 agentStage = AgentStage.CONFIRM,
                 error = null,
-                designPlan = null,
+                designPlan = draftPlan,
                 qualityVerdict = null,
                 budget = RetryBudget()
             )
@@ -411,19 +428,19 @@ class GameAgent(
         }
     }
 
-    /** 确认门消息：摘要 + 每个系统的实现方法与验收边界 + 操作提示。 */
+    /** 确认门消息：摘要 + 每个系统的具体玩法与验收边界 + 操作提示。 */
     private fun confirmationMessage(confirmation: IntentConfirmation, prefix: String): String = buildString {
         append(prefix)
         append("：\n")
         append(confirmation.summary)
         if (confirmation.systemExplanations.isNotEmpty()) {
-            append("\n\n系统会怎样实现（业务验收边界）：\n")
+            append("\n\n游戏系统玩法与验收边界：\n")
             confirmation.systemExplanations.forEach { append("· $it\n") }
         }
         if (confirmation.excludedSystems.isNotEmpty()) {
             append("\n已排除系统：${confirmation.excludedSystems.joinToString("、")}")
         }
-        append("\n请点击下方唯一的确认按钮进入策划与代码生成；如需修改，直接在底部输入框输入新的要求。")
+        append("\n请点击下方唯一的确认按钮，确认后我会按此方案生成代码；如需修改，直接在底部输入框输入新的要求。")
     }
 
     private suspend fun requestIntentFromLiteLlm(userText: String): IntentSchema? {
@@ -485,12 +502,14 @@ class GameAgent(
             return
         }
 
-        var plan = forcePlan ?: PlanningEngine.build(intent)
+        // 简化后的 Agent Loop：先出文件计划 → implement → 基础校验。
+        // 校验通过立即退出并交付玩家试玩；冒烟测试、两段式自检等自动流程已移除。
+        var plan = forcePlan ?: PlanningEngine.finalize(intent)
         if (p0Only) plan = PlanningEngine.p0Only(plan)
         val planningStage = if (plan.gameSystems.isEmpty()) {
-            "游戏策划中：正在规划 ${plan.primarySystem} 的系统方案"
+            "游戏策划中：正在根据确认结果定稿 ${plan.primarySystem} 的方案"
         } else {
-            "游戏策划中：正在规划 ${plan.gameSystems.joinToString("、")} 的实现方法（已排除 ${plan.excludedSystems.size} 个系统）"
+            "游戏策划中：正在根据确认结果定稿 ${plan.gameSystems.joinToString("、")}（已排除 ${plan.excludedSystems.size} 个系统）"
         }
         _session.value = _session.value.copy(
             isGenerating = true,
@@ -499,7 +518,7 @@ class GameAgent(
             agentStage = planningStage,
             designPlan = plan,
             filePlan = listOf("index.html"),
-            decisionLog = _session.value.decisionLog + "策划定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
+            decisionLog = _session.value.decisionLog + "决策层定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
         )
 
         var workingHtml = existingHtml
@@ -508,10 +527,9 @@ class GameAgent(
         var fallbackUsed = p0Only
         var round = 0
         var acceptedHtml: String? = null
-        var lastVerdict: QualityVerdict? = null
         var lastReport: ValidationReport? = null
 
-        while (round < 10) {
+        while (round < 6) {
             round++
             currentCoroutineContext().ensureActive()
 
@@ -557,7 +575,7 @@ class GameAgent(
                 feedback = "上一条回复无法抽取到完整 HTML（${extracted.error ?: "缺少 ```html 围栏或 <html> 标签"}）。请只输出一个完整 HTML 文件。"
                 val action = consumeOrFallback(budget, category)
                 if (action == null) {
-                    failTurn(_session.value, "代码抽取/语法错误超过重试预算，已无法自动恢复")
+                    failTurn(_session.value, "代码抽取错误超过重试预算，已无法自动恢复")
                     return
                 }
                 budget = action.budget
@@ -578,40 +596,26 @@ class GameAgent(
             val validationModule = moduleForRound(plan, round + 1)
             _session.value = _session.value.copy(
                 currentHtml = candidate,
-                agentStage = "校验中：正在校验「$validationModule」系统模块（语法 / HTML 配对 / DOM 引用）",
+                agentStage = "校验中：正在对「$validationModule」做语法与基本逻辑校验",
                 streamingText = null
             )
             val report = GameValidator.validate(candidate)
             currentCoroutineContext().ensureActive()
             lastReport = report
 
-            val verdict = QualityGate.evaluate(report, plan, candidate)
-            lastVerdict = verdict
-            currentCoroutineContext().ensureActive()
-            _session.value = _session.value.copy(qualityVerdict = verdict)
-
-            if (report.hasErrors || !verdict.pass) {
-                // 静态校验全过、仅质量自检不达标 → 视为设计范围错误，回策划层重做（≤2 轮）。
-                val category = if (report.errors.isEmpty()) ErrorCategory.DESIGN_SCOPE else classifyFailure(report)
+            if (report.hasErrors) {
+                val category = classifyFailure(report)
                 val normalized = ErrorSignature.normalize(
-                    report.errors.firstOrNull()?.message ?: verdict.fails.firstOrNull()?.item ?: "validation-failed"
+                    report.errors.joinToString(";") { it.message }
                 )
                 val signature = ErrorSignature.hash(normalized)
                 val known = RetryBookkeeping.record(_session.value.knownErrors, category, normalized)
                 saveGlobalErrorSignatures(known)
-                feedback = if (category == ErrorCategory.DESIGN_SCOPE) {
-                    buildString {
-                        append("策划回炉（错误签名 $signature）：\n")
-                        append(QualityGate.promptFeedback(verdict, report))
-                        append("\nP0 清单（回炉必须覆盖，不得扩大范围）：\n")
-                        plan.p0Features.forEach { append("- $it\n") }
-                    }
-                } else {
-                    QualityGate.promptFeedback(verdict, report)
-                }
+                feedback = validationFeedback(report, signature)
+
                 val action = consumeOrFallback(budget, category)
                 if (action == null) {
-                    failTurn(_session.value, "校验错误超过重试预算：${report.errors.firstOrNull()?.message ?: "质量自检未通过"}")
+                    failTurn(_session.value, "基础校验错误超过重试预算：${report.errors.firstOrNull()?.message ?: "校验未通过"}")
                     return
                 }
                 budget = action.budget
@@ -622,65 +626,31 @@ class GameAgent(
                     knownErrors = known,
                     knownIssues = report.warnings.map { "${it.category}:${it.message}" },
                     lastError = feedback,
-                    agentStage = if (category == ErrorCategory.DESIGN_SCOPE) {
-                        "策划中：正在回炉「$module」系统的范围并重排 P0 清单"
-                    } else {
-                        "校验中：正在为「$module」系统生成修复方案"
-                    }
+                    agentStage = "校验中：正在为「$module」系统生成修复方案"
                 )
                 continue
             }
 
-            // 静态校验全过后才允许冒烟测试。
-            currentCoroutineContext().ensureActive()
-            val smokeModule = moduleForRound(plan, round + 2)
-            _session.value = _session.value.copy(
-                agentStage = "冒烟测试中：正在测试「$smokeModule」系统"
-            )
-            val smoke = runSmoke(candidate)
-            currentCoroutineContext().ensureActive()
-            if (!smoke.passed) {
-                val category = ErrorCategory.STATIC_RUNTIME
-                val normalized = ErrorSignature.normalize(smoke.errors.joinToString(";").ifBlank { "smoke-failed" })
-                val known = RetryBookkeeping.record(_session.value.knownErrors, category, normalized)
-                saveGlobalErrorSignatures(known)
-                feedback = "冒烟测试失败（${smoke.errors.take(3).joinToString("；")}）。请修复后重新输出完整 HTML。"
-                val action = consumeOrFallback(budget, category)
-                if (action == null) {
-                    failTurn(_session.value, "冒烟测试失败且重试预算已耗尽：${smoke.errors.take(3).joinToString("；")}")
-                    return
-                }
-                budget = action.budget
-                fallbackUsed = action.fallback
-                if (action.fallback) plan = PlanningEngine.p0Only(plan)
-                _session.value = _session.value.copy(
-                    budget = budget,
-                    knownErrors = known,
-                    lastError = feedback,
-                    agentStage = "冒烟测试中：正在整理「$smokeModule」系统的错误并准备修复"
-                )
-                continue
-            }
-
+            // 基础校验通过即退出 Agent Loop，不再执行冒烟测试或质量自检；
+            // 实际运行问题由玩家试玩后回传（game screen 报错 → 让 AI 修复 / 输入改进需求）。
             acceptedHtml = candidate
             break
         }
 
         currentCoroutineContext().ensureActive()
         if (acceptedHtml == null) {
-            failTurn(_session.value, "Agent Loop 达到最大轮次仍未产出可运行游戏")
+            failTurn(_session.value, "Agent Loop 达到最大轮次仍未产出通过基础校验的游戏")
             return
         }
 
         val assistantText = if (existingHtml.isNullOrBlank()) {
-            "游戏已生成并通过校验，点击「立即游玩」。"
+            "游戏已通过基础校验。点击「立即游玩」试玩吧——如遇报错可让 AI 修复，也可以直接在这里继续提改进需求。"
         } else {
-            "游戏已按你的要求更新并通过校验。"
+            "游戏已按你的要求更新并通过基础校验。点击「立即游玩」确认效果；如遇报错或想继续调整，随时告诉我。"
         }
         val report = lastReport ?: GameValidator.validate(acceptedHtml)
-        val verdict = lastVerdict ?: QualityGate.evaluate(report, plan, acceptedHtml)
         val snapshot = "index.html:${GameFileWorkspace.sha256(acceptedHtml)}"
-        val summary = buildRollingSummary(plan, report, acceptedHtml, verdict)
+        val summary = buildRollingSummary(plan, report, acceptedHtml)
         val next = _session.value.copy(
             messages = _session.value.messages + ChatMessage("assistant", assistantText),
             currentHtml = acceptedHtml,
@@ -689,7 +659,8 @@ class GameAgent(
             error = null,
             agentStage = AgentStage.DONE,
             pendingConfirmation = null,
-            lastWarning = report.warnings.firstOrNull()?.message,
+            lastWarning = report.warnings.firstOrNull()?.message
+                ?: "建议先点击「立即游玩」实际试玩，运行问题可直接让 AI 修复。",
             rollingSummary = summary,
             fileManifest = FileManifest(
                 pointer = "index.html",
@@ -707,16 +678,30 @@ class GameAgent(
             knownIssues = report.warnings.map { "${it.category}:${it.message}" },
             lastError = null,
             budget = budget,
-            qualityVerdict = verdict,
+            qualityVerdict = null,
             decisionLog = _session.value.decisionLog + listOf(
-                "第 $round 轮生成通过：${report.errors.size} error / ${report.warnings.size} warning",
-                "冒烟测试通过"
+                "第 $round 轮基础校验通过：${report.errors.size} error / ${report.warnings.size} warning",
+                "基础校验通过，退出 Agent Loop；实际运行问题由玩家试玩后回传"
             )
         )
         currentCoroutineContext().ensureActive()
         _session.value = next
         persistSession(next)
     }
+
+    /** 只把校验器发现的事实回喂给 LLM，不再引入质量自检翻案或策划范围重做环节。 */
+    private fun validationFeedback(report: ValidationReport, signature: String): String = buildString {
+        append("基础校验未通过（错误签名 $signature），请修复以下问题后重新输出完整 HTML：\n")
+        report.errors.take(10).forEach { issue ->
+            append("- [${issue.category}] ${issue.file}:${issue.line} ${issue.message}\n")
+        }
+        if (report.warnings.isNotEmpty()) {
+            append("警告（可作为优化项一并处理）：\n")
+            report.warnings.take(5).forEach { issue ->
+                append("- [${issue.category}] ${issue.file}:${issue.line} ${issue.message}\n")
+            }
+        }
+    }.trimEnd()
 
     /** 子阶段显示的当前系统模块：按轮次在系统列表中轮换，避免只显示固定主系统。 */
     private fun moduleForRound(plan: DesignPlan, round: Int): String {
@@ -746,14 +731,6 @@ class GameAgent(
         } else {
             ErrorCategory.STATIC_RUNTIME
         }
-    }
-
-    private suspend fun runSmoke(html: String): SmokeTestResult = try {
-        smokeRunner.run(html)
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Exception) {
-        SmokeTestResult(passed = false, errors = listOf(e.message ?: "smoke-runner-error"))
     }
 
     private suspend fun failTurn(s: GameSession, message: String) {
@@ -802,14 +779,14 @@ class GameAgent(
         }
     }
 
-    private fun buildRollingSummary(plan: DesignPlan, report: ValidationReport, html: String, verdict: QualityVerdict): String = buildString {
+    private fun buildRollingSummary(plan: DesignPlan, report: ValidationReport, html: String): String = buildString {
         append("文件计划与清单：${_session.value.filePlan.joinToString(" → ")}（index.html ${html.length} 字符）\n")
         append("设计Schema：${plan.templateClass} / ${plan.gameSystems.joinToString("、")} / P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}\n")
         append("实现清单：${plan.implementations.joinToString("；") { "${it.system}(${it.methods.joinToString("|")})" }}\n")
         append("排除清单：系统[${plan.excludedSystems.joinToString("、")}]；方案[${plan.excludedApproaches.joinToString("、")}]\n")
         append("known-issues：${if (report.warnings.isEmpty()) "无" else report.warnings.joinToString("；") { it.message }}\n")
-        append("上次错误：无\n")
-        append("决策：静态校验通过（error=${report.errors.size} warning=${report.warnings.size}），冒烟通过，verdict=${verdict.pass}")
+        append("上次改进对应缺陷：无\n")
+        append("决策：基础校验通过（error=${report.errors.size} warning=${report.warnings.size}），已退出 Agent Loop 并交由玩家实际试玩")
     }
 
     private fun defaultTitle(s: GameSession): String =

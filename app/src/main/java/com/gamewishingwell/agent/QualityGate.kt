@@ -13,9 +13,11 @@ data class QualityVerdict(
 )
 
 /**
- * Agent Loop 末尾的两段式自检：
+ * 两段式自检工具：
  * (a) 先对照验收标准清单，并“必读校验结果”——已发现的错误不得翻案；
  * (b) 再输出结构化 verdict {pass, fails:[{item,severity}], note}。
+ *
+ * 简化后的 GameAgent 主流程不再调用该门禁；文件保留给单元测试与需要严格自检的场景。
  */
 object QualityGate {
 

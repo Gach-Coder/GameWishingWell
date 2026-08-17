@@ -60,6 +60,7 @@ object GamePrompt {
         先在心里列文件计划与依赖顺序（本项目单文件：index.html，依赖顺序为 HTML 骨架 → CSS → JS），再 implement，最后自行对照验收标准逐项检查。
         严格按 design_schema 的 implementations 实现系统；excluded_systems 与 excluded_approaches 是硬性排除范围，不得实现或引入被排除的系统与方案。
         复杂系统（AI、商店、技能、关卡等）先在 JS 中隔离成独立函数/模块并优先自检，不得与核心循环交叉污染。
+        基础校验通过后即交付玩家试玩，不要在游戏内添加自动测试代码、测试按钮或调试面板；运行错误由玩家回传后再修复。
         输出前确认：无 eval、无外部资源、restart() 存在、触控可玩、声明前置。
     """.trimIndent()
 }

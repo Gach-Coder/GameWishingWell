@@ -63,6 +63,21 @@ class GameIntentTest {
     }
 
     @Test
+    fun `确认门回显策划草案且不向玩家解释引擎技术细节`() {
+        val intent = IntentEngine.infer("做一个没有听过的2D竖版解谜游戏", null)
+        val draft = PlanningEngine.draft(intent)
+        val confirmation = IntentEngine.buildConfirmation("做一个没有听过的2D竖版解谜游戏", intent, draft)
+        assertEquals(draft.gameSystems, confirmation.draftPlan?.gameSystems)
+        val puzzle = confirmation.systemExplanations.first { it.startsWith("解谜：") }
+        assertTrue(puzzle.contains("谜题规则"))
+        assertTrue(puzzle.contains("验收边界"))
+        assertTrue(!puzzle.contains("Canvas"))
+        assertTrue(!puzzle.contains("requestAnimationFrame"))
+        assertTrue(!puzzle.contains("精灵"))
+        assertTrue(!puzzle.contains("布局"))
+    }
+
+    @Test
     fun `确认门逐项解释最终要实现的系统`() {
         val schema = IntentEngine.infer("做一个塔防游戏", null)
         val confirmation = IntentEngine.buildConfirmation("做一个塔防游戏", schema)
@@ -79,10 +94,47 @@ class GameIntentTest {
         val schema = IntentEngine.infer("做一个2D竖版塔防游戏", null)
         val confirmation = IntentEngine.buildConfirmation("做一个2D竖版塔防游戏", schema)
         val tower = confirmation.systemExplanations.first { it.startsWith("塔防：") }
-        assertTrue(tower.contains("可建防御塔"))
-        assertTrue(tower.contains("敌人按波次推进"))
+        assertTrue(tower.contains("防御塔"))
+        assertTrue(tower.contains("波次"))
         assertTrue(tower.contains("验收边界"))
-        assertTrue(tower.contains("基地生命值归零时结束"))
+        assertTrue(tower.contains("基地生命"))
+    }
+
+    @Test
+    fun `所有对标模板的补全系统都有具体实现细节`() {
+        TemplateLibrary.ALL.forEach { ref ->
+            ref.suggestedSystems.forEach { system ->
+                assertTrue(
+                    "模板 ${ref.id} 的系统 $system 缺少具体实现细节",
+                    TemplateSystemCatalog.resolve(ref.id, system) != null
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `对标游戏模板使用该游戏的具体玩法解释系统`() {
+        val schema = IntentEngine.infer("做一个黄金矿工游戏", null)
+        assertEquals("gold_miner", schema.templateId)
+        val confirmation = IntentEngine.buildConfirmation("做一个黄金矿工游戏", schema)
+        val item = confirmation.systemExplanations.first { it.startsWith("道具：") }
+        assertTrue(item.contains("黄金"))
+        assertTrue(item.contains("石头"))
+        assertTrue(item.contains("炸弹"))
+        assertTrue(item.contains("钩子前端"))
+        assertTrue(item.contains("触碰"))
+        assertTrue(item.contains("验收边界"))
+        assertTrue("道具" in IntentEngine.plannedSystems(schema))
+    }
+
+    @Test
+    fun `未命中模板时仍使用通用实现解释`() {
+        val schema = IntentEngine.infer("做一个没有听过的2D竖版解谜游戏", null)
+        assertNull(schema.templateId)
+        val confirmation = IntentEngine.buildConfirmation("做一个没有听过的2D竖版解谜游戏", schema)
+        val puzzle = confirmation.systemExplanations.first { it.startsWith("解谜：") }
+        assertTrue(puzzle.contains("谜题规则"))
+        assertTrue(puzzle.contains("验收边界"))
     }
 
     @Test
@@ -127,7 +179,23 @@ class GameIntentTest {
     }
 
     @Test
-    fun `玩家修正可去掉模板补全系统`() {
+    fun `黄金矿工修正去掉道具后其余系统仍用黄金矿工具体实现`() {
+        val confirmed = IntentEngine.infer("做一个黄金矿工游戏", null)
+        val corrected = IntentEngine.mergeCorrection(
+            confirmed,
+            IntentEngine.infer("不要道具", null),
+            "不要道具"
+        )
+        assertEquals("gold_miner", corrected.templateId)
+        assertTrue("道具" !in IntentEngine.plannedSystems(corrected))
+        val confirmation = IntentEngine.buildConfirmation("做一个黄金矿工游戏，不要道具", corrected)
+        val physics = confirmation.systemExplanations.first { it.startsWith("物理：") }
+        assertTrue(physics.contains("钩子"))
+        assertTrue(physics.contains("回收"))
+    }
+
+    @Test
+    fun `玩家修正可去掉模板补全系统且保留对标模板`() {
         val confirmed = IntentEngine.infer("做一个塔防游戏", null)
         val corrected = IntentEngine.mergeCorrection(
             confirmed,
@@ -137,6 +205,6 @@ class GameIntentTest {
         assertTrue("AI策略" !in corrected.gameSystems)
         assertTrue("AI策略" !in IntentEngine.plannedSystems(corrected))
         assertTrue("塔防" in corrected.gameSystems)
-        assertNull(corrected.templateId)
+        assertEquals("tower_defense", corrected.templateId)
     }
 }

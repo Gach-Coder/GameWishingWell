@@ -61,7 +61,9 @@ data class IntentConfirmation(
     /** 确认门回显的每个系统一句话解释，供玩家逐项核对。 */
     val systemExplanations: List<String> = emptyList(),
     /** 玩家明确排除的系统，确认门同样要回显。 */
-    val excludedSystems: List<String> = emptyList()
+    val excludedSystems: List<String> = emptyList(),
+    /** 策划层在确认门前产出的草案；确认通过后由决策层定稿为 DesignPlan。 */
+    val draftPlan: DesignPlan? = null
 )
 
 /** 内部模板库条目：著名对标游戏 → template_id + 特征建议。 */
@@ -193,32 +195,77 @@ object GameSystemCatalog {
     fun describe(system: String): String =
         descriptions[system] ?: "按该系统的基础规则实现，具体细节由策划层补全。"
 
-    /** 该系统在指定画面维度/方向下的落地实现方法；确认门与策划层共用。 */
-    fun implementationMethods(system: String, dimension: String, orientation: String): List<String> {
-        val base = implementationMethods[system] ?: return listOf("按基础规则实现")
+    /**
+     * 该系统在指定画面维度/方向下的落地实现方法；确认门与策划层共用。
+     * 当用户需求命中对标游戏模板时，优先使用 [TemplateSystemCatalog] 中该模板的
+     * 具体玩法实现，保证对玩家解释与最终 prompt 注入的是同一套真实功能。
+     */
+    fun implementationMethods(
+        system: String,
+        dimension: String,
+        orientation: String,
+        templateId: String? = null
+    ): List<String> {
+        val templateSpecific = TemplateSystemCatalog.resolve(templateId, system)?.methods
+        val base = templateSpecific ?: implementationMethods[system] ?: return listOf("按基础规则实现")
         val result = base.toMutableList()
-        when (dimension) {
-            IntentSchema.DIMENSION_2_5D -> result += "用 Canvas 2D 斜 45° 投影表现 2.5D"
-            IntentSchema.DIMENSION_3D -> result += "用 Canvas 2D 透视投影模拟 3D，不引入 WebGL/模型资产"
-            else -> result += "用 2D 精灵/几何图形绘制"
-        }
-        result += if (orientation == IntentSchema.ORIENTATION_LANDSCAPE) {
-            "横板全屏布局，左右手横向操作"
-        } else {
-            "竖版布局，适配手机单手操作"
+        if (templateSpecific == null) {
+            when (dimension) {
+                IntentSchema.DIMENSION_2_5D -> result += "用 Canvas 2D 斜 45° 投影表现 2.5D"
+                IntentSchema.DIMENSION_3D -> result += "用 Canvas 2D 透视投影模拟 3D，不引入 WebGL/模型资产"
+                else -> result += "用 2D 精灵/几何图形绘制"
+            }
+            result += if (orientation == IntentSchema.ORIENTATION_LANDSCAPE) {
+                "横板全屏布局，左右手横向操作"
+            } else {
+                "竖版布局，适配手机单手操作"
+            }
         }
         return result.distinct()
     }
 
     /** 业务验收边界：代码验收时把“能做”和“做到什么程度”分开。 */
-    fun acceptanceBoundary(system: String): String =
-        acceptanceBoundaries[system] ?: "核心循环可玩，失败后可 restart() 完整重开"
+    fun acceptanceBoundary(system: String, templateId: String? = null): String =
+        TemplateSystemCatalog.resolve(templateId, system)?.acceptanceBoundary
+            ?: acceptanceBoundaries[system]
+            ?: "核心循环可玩，失败后可 restart() 完整重开"
 
-    /** 确认门逐项解释：实现方法 + 业务验收边界。 */
-    fun explainImplementation(system: String, dimension: String, orientation: String): String {
-        val methods = implementationMethods(system, dimension, orientation).joinToString("、")
-        return "$system：将通过 $methods 实现；验收边界：${acceptanceBoundary(system)}"
+    /**
+     * 确认门向玩家解释时使用的玩法说明。
+     * 会过滤 Canvas / DOM / WebAudio / requestAnimationFrame 等纯技术实现细节，
+     * 只保留玩家可感知的游戏内容与玩法规则；对玩家只聊“玩什么、怎么玩”。
+     */
+    fun playerFacingMethods(
+        system: String,
+        dimension: String,
+        orientation: String,
+        templateId: String? = null,
+        plannedMethods: List<String>? = null
+    ): List<String> {
+        val methods = plannedMethods ?: implementationMethods(system, dimension, orientation, templateId)
+        val filtered = methods.filterNot { method ->
+            TECHNICAL_IMPLEMENTATION_PHRASES.any { method.contains(it, ignoreCase = true) }
+        }
+        return filtered.ifEmpty { listOf("按${system}的基础玩法实现") }
     }
+
+    /** 确认门逐项解释：只说明游戏玩法与业务验收边界，不讨论引擎/算法等底层技术。 */
+    fun explainImplementation(
+        system: String,
+        dimension: String,
+        orientation: String,
+        templateId: String? = null,
+        plannedMethods: List<String>? = null
+    ): String {
+        val methods = playerFacingMethods(system, dimension, orientation, templateId, plannedMethods).joinToString("、")
+        return "$system：具体玩法为 $methods；验收边界：${acceptanceBoundary(system, templateId)}"
+    }
+
+    private val TECHNICAL_IMPLEMENTATION_PHRASES = listOf(
+        "Canvas", "requestAnimationFrame", "WebAudio", "DOM", "HTML", "CSS",
+        "touchstart", "touchmove", "touchend", "全局 restart()", "浏览器全局",
+        "用 2D 精灵", "投影", "全屏布局", "竖版布局", "横板布局"
+    )
 }
 
 object TemplateLibrary {
@@ -233,7 +280,7 @@ object TemplateLibrary {
         GameTemplateRef("endless_runner", "跑酷", listOf("跑酷", "神庙逃亡", "地铁跑酷"), listOf("竞速", "平台跳跃", "收集"), "2D", "横板"),
         GameTemplateRef("tower_defense", "塔防", listOf("塔防", "保卫萝卜"), listOf("塔防", "战斗", "AI策略", "商店经济"), "2D", "竖版"),
         GameTemplateRef("match3", "消消乐", listOf("消消乐", "开心消消乐", "三消"), listOf("合成", "关卡场景"), "2D", "竖版"),
-        GameTemplateRef("gold_miner", "黄金矿工", listOf("黄金矿工", "挖矿"), listOf("物理", "商店经济", "收集"), "2D", "竖版"),
+        GameTemplateRef("gold_miner", "黄金矿工", listOf("黄金矿工", "挖矿"), listOf("物理", "道具", "商店经济"), "2D", "竖版"),
         GameTemplateRef("piano_tiles", "别踩白块", listOf("别踩白块", "钢琴块"), listOf("音乐节奏", "反应躲避"), "2D", "竖版"),
         GameTemplateRef("maze", "迷宫", listOf("迷宫", "maze"), listOf("解谜", "关卡场景"), "2D", "竖版"),
         GameTemplateRef("racing", "赛车", listOf("赛车", "竞速", "卡丁车"), listOf("竞速", "AI策略"), "2D", "横板"),
@@ -456,10 +503,8 @@ object IntentEngine {
             .filterNot { excludedSystems.contains(it) }
             .distinct()
 
-        val dropsTemplate = dropsReference ||
-            (confirmed.templateId != null && removed.any { system ->
-                TemplateLibrary.findById(confirmed.templateId)?.suggestedSystems?.contains(system) == true
-            })
+        // 只删掉模板中的某一个系统时不再整个丢掉模板：excludedSystems 已保证
+        // 被删系统不会被模板补全加回，其余系统继续使用该对标游戏的具体实现细节。
         val referenceGame: String?
         val templateId: String?
         val templateSimilarity: Double?
@@ -473,11 +518,6 @@ object IntentEngine {
                 referenceGame = correctionMatch.first.title
                 templateId = correctionMatch.first.id
                 templateSimilarity = correctionMatch.second
-            }
-            dropsTemplate -> {
-                referenceGame = confirmed.referenceGame
-                templateId = null
-                templateSimilarity = null
             }
             else -> {
                 referenceGame = confirmed.referenceGame
@@ -502,6 +542,12 @@ object IntentEngine {
         )
     }
 
+    /** 供策划层判断修改旧游戏时是否需要继承上一版的画面维度。 */
+    fun explicitlySpecifiesDimension(text: String): Boolean = explicitDimension(text) != null
+
+    /** 供策划层判断修改旧游戏时是否需要继承上一版的画面方向。 */
+    fun explicitlySpecifiesOrientation(text: String): Boolean = explicitOrientation(text) != null
+
     private fun explicitDimension(text: String): String? = when {
         Regex("2\\.5\\s*d|伪3d|斜45|2.5D", RegexOption.IGNORE_CASE).containsMatchIn(text) -> IntentSchema.DIMENSION_2_5D
         Regex("(?<!2\\.5)3d|三维|立体", RegexOption.IGNORE_CASE).containsMatchIn(text) -> IntentSchema.DIMENSION_3D
@@ -517,7 +563,7 @@ object IntentEngine {
 
     private fun negatedSystems(text: String): Set<String> =
         Regex(
-            "(?:不要|别要|去掉|删除|移除|取消|砍掉|去除|没有|别加|不加|无需|不需要|不用)[^。.!！?？;；,，、\n]{0,20}",
+            "(?:不要|别要|去掉|删除|移除|取消|砍掉|去除|别加|不加|无需|不需要|不用)[^。.!！?？;；,，、\n]{0,20}",
             RegexOption.IGNORE_CASE
         ).findAll(text)
             .flatMap { GameSystemCatalog.extract(it.value) }
@@ -555,9 +601,14 @@ object IntentEngine {
         )
     }
 
-    /** 生成确认门的人话摘要：画面维度 / 方向 / 游戏系统 / 对标游戏与默认值假设。 */
-    fun buildConfirmation(userRequest: String, schema: IntentSchema): IntentConfirmation {
-        val planned = plannedSystems(schema)
+    /**
+     * 生成确认门的人话摘要：画面维度 / 方向 / 游戏系统 / 对标游戏与默认值假设。
+     *
+     * 新流程先由策划层产出 [draftPlan]，确认门只回显策划草案里的玩法与验收边界；
+     * 玩家确认后，决策层再根据 [schema] 定稿完整 DesignPlan。
+     */
+    fun buildConfirmation(userRequest: String, schema: IntentSchema, draftPlan: DesignPlan? = null): IntentConfirmation {
+        val planned = draftPlan?.gameSystems?.ifEmpty { plannedSystems(schema) } ?: plannedSystems(schema)
         val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
         val rawSystems = (schema.gameSystems + (ref?.suggestedSystems ?: emptyList())).distinct()
 
@@ -587,18 +638,35 @@ object IntentEngine {
         if (schema.excludedSystems.isNotEmpty()) {
             sb.append("已明确排除系统：${schema.excludedSystems.joinToString("、")}（本轮不会实现）。")
         }
-        sb.append("请核对下面的系统解释、默认假设与排除项，确认后进入策划与代码生成。")
+        sb.append("请核对下面的玩法解释、默认假设与排除项，确认后我会按此方案生成代码。")
 
         val assumptions = buildAssumptions(schema)
+        val explanations = draftPlan?.let { plan ->
+            plan.implementations.map { impl ->
+                GameSystemCatalog.explainImplementation(
+                    system = impl.system,
+                    dimension = plan.visualDimension,
+                    orientation = plan.screenOrientation,
+                    templateId = schema.templateId,
+                    plannedMethods = impl.methods
+                )
+            }
+        } ?: planned.map {
+            GameSystemCatalog.explainImplementation(
+                system = it,
+                dimension = schema.visualDimension,
+                orientation = schema.screenOrientation,
+                templateId = schema.templateId
+            )
+        }
         return IntentConfirmation(
             userRequest = userRequest,
             intent = schema,
             summary = sb.toString(),
             designAssumptions = assumptions,
-            systemExplanations = planned.map {
-                GameSystemCatalog.explainImplementation(it, schema.visualDimension, schema.screenOrientation)
-            },
-            excludedSystems = schema.excludedSystems
+            systemExplanations = explanations,
+            excludedSystems = schema.excludedSystems,
+            draftPlan = draftPlan
         )
     }
 

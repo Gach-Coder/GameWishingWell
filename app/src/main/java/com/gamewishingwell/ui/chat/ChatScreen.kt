@@ -245,7 +245,7 @@ private fun IntentConfirmationCard(
     ) {
         Column(Modifier.padding(12.dp)) {
             Text(
-                "确认游戏需求",
+                "确认游戏方案",
                 style = MaterialTheme.typography.titleSmall
             )
             Spacer(Modifier.size(4.dp))
@@ -256,7 +256,7 @@ private fun IntentConfirmationCard(
             if (confirmation.systemExplanations.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
-                    "系统会怎样实现（业务验收边界）：",
+                    "游戏系统玩法与验收边界（只聊玩法，不涉及技术实现）：",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
                 )
@@ -297,7 +297,7 @@ private fun IntentConfirmationCard(
             }
             Spacer(Modifier.size(4.dp))
             Text(
-                "如与预期不符，请直接在下方输入框输入修改内容；确认前不会开始生成。",
+                "如与预期不符，请直接在下方输入框输入修改内容；确认后才会进入代码生成。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
             )
