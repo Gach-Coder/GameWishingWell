@@ -857,9 +857,23 @@ class GameAgent(
         if (!settingsRepository.isConfigured()) return null
         val preset = ProviderPresets.byId(s.providerId) ?: ProviderPresets.DEFAULT
         return injectedClientFactory?.invoke(s) ?: if (preset.protocol == Protocol.ANTHROPIC) {
-            AnthropicClient(okHttp, s.apiKey, s.baseUrl, s.model, preset.maxTokens)
+            AnthropicClient(
+                okHttp = okHttp,
+                apiKey = s.apiKey,
+                baseUrl = s.baseUrl,
+                model = s.model,
+                maxTokens = preset.maxTokens,
+                thinkingEnabled = s.thinkingEnabled
+            )
         } else {
-            OpenAiCompatibleClient(okHttp, s.apiKey, s.baseUrl, s.model, preset.maxTokens, preset.disableThinking)
+            OpenAiCompatibleClient(
+                okHttp = okHttp,
+                apiKey = s.apiKey,
+                baseUrl = s.baseUrl,
+                model = s.model,
+                maxTokens = preset.maxTokens,
+                disableThinking = preset.disableThinking || !s.thinkingEnabled
+            )
         }
     }
 

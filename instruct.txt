@@ -22,7 +22,7 @@
 	- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
    DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 自定义，
-   支持修改 Base URL、模型名、系统提示词，并可“测试连接”。
+   支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”。
    （注：Deepseek模型为deepseek-v4-flash和deepseek-v4-pro,已弃用deepseek-chat）
 
 核心思路：游戏不是编译出来的，而是 AI 生成的文本 = 可运行产物（HTML 文件），
@@ -33,10 +33,11 @@
 *前端 LLM SSE 显示 Agent 状态（游戏识别中/游戏策划中/游戏生成中/游戏校验中/对话回复中等）
 Agent处理message流程如下：
 	**默认契约：一个对话框只制作一个游戏，不处理单对话框的多游戏需求bug Game Schema JSON 对话框级别全局唯一，后续修改即以此为基础
-	→ 意图层：(develope/chat)
+	→ 意图层：(new feature/fix bug/chat)
 		分类用户意图，想制作或改进游戏(开发)，还是只是想聊天或询问游戏内容
-		develope:	read/write，可调用工具开发游戏文件
-		chat:		readonly，不改动任何外部文件，也不改变游戏特性变量，纯文本输出任务
+		new feature:	read/write，可调用工具开发游戏文件, 首次创建游戏或后期追加功能
+		fix bug:		read/write，可调用工具开发游戏文件，后期修复游戏异常bug，游戏功能特性不变
+		chat:			readonly，不改动任何外部文件，也不改变游戏特性变量，纯文本输出任务
 					直接 build prompt → LLM 然后输出文本
 	→ 识别层：（意图层分类结果为 dev）
 		检测 Game Schema JSON 会话级的游戏Json 是否为空：
@@ -87,6 +88,9 @@ Agent处理message流程如下：
   OpenAI		https://api.openai.com/v1		gpt-4o-mini        					OPENAI_COMPATIBLE   16384      否
   Claude		https://api.anthropic.com		claude-sonnet-4-6					ANTHROPIC           16384      否
   自定义         （留空自填）                    （留空自填）       						OPENAI_COMPATIBLE   8192       否
+
+（表中“关闭思考”为厂商预设级是否强制禁用；设置页另有“模型思考能力”开关，默认关闭：
+OpenAI 兼容协议关闭时发送 thinking={"type":"disabled"}，Anthropic 开启时发送 extended thinking。）
 
 三、技术栈（版本统一锁定于 gradle/libs.versions.toml）
 ------------------------------------------------------------
@@ -279,6 +283,7 @@ Android Studio 运行方式：
 - 构建同步报 SDK/JDK 错误：检查 local.properties 与 JDK 17。
 - 提示“请先在设置中配置 API Key、地址和模型”：isConfigured() 要求三项均非空。
 - 模型输出为空或抽不到 HTML：检查模型/网关是否支持流式 chat/completions；
-  DeepSeek 默认模型为 deepseek-v4-flash（deepseek-chat 已弃用），max_tokens 16384，按预设表不主动关闭思考。
+  DeepSeek 默认模型为 deepseek-v4-flash（deepseek-chat 已弃用），max_tokens 16384；
+  思考能力由设置页开关控制（默认关闭）。
 - 游戏白屏：确认生成 HTML 中 canvas 使用 vh/100% 也可渲染；HtmlEnhancer 已做视口修复，
   但模型仍应遵守“自包含、无外部资源”的提示词约束。

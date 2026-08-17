@@ -11,7 +11,9 @@ data class LlmSettings(
     val apiKey: String = "",
     val baseUrl: String = "",
     val model: String = "",
-    val systemPrompt: String = ""
+    val systemPrompt: String = "",
+    /** 模型思考能力开关：默认关闭。关闭时请求不启用模型思考输出。 */
+    val thinkingEnabled: Boolean = false
 )
 
 class SettingsRepository(context: Context) {
@@ -35,7 +37,8 @@ class SettingsRepository(context: Context) {
             apiKey = secure.getString("api_key") ?: "",
             baseUrl = secure.getString("base_url") ?: preset.baseUrl,
             model = model,
-            systemPrompt = secure.getString("system_prompt") ?: ""
+            systemPrompt = secure.getString("system_prompt") ?: "",
+            thinkingEnabled = secure.getString("thinking_enabled")?.toBoolean() ?: false
         )
     }
 
@@ -50,6 +53,7 @@ class SettingsRepository(context: Context) {
         secure.putString("base_url", normalized.baseUrl)
         secure.putString("model", normalized.model)
         secure.putString("system_prompt", normalized.systemPrompt)
+        secure.putString("thinking_enabled", normalized.thinkingEnabled.toString())
         _settings.value = normalized
     }
 

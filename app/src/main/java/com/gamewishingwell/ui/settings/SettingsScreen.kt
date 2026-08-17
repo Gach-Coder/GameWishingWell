@@ -26,6 +26,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -37,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
@@ -68,6 +70,7 @@ fun SettingsScreen() {
     var baseUrl by remember { mutableStateOf(settings.baseUrl) }
     var model by remember { mutableStateOf(settings.model) }
     var systemPrompt by remember { mutableStateOf(settings.systemPrompt) }
+    var thinkingEnabled by remember { mutableStateOf(settings.thinkingEnabled) }
     var showKey by remember { mutableStateOf(false) }
     var providerMenu by remember { mutableStateOf(false) }
 
@@ -77,6 +80,7 @@ fun SettingsScreen() {
         baseUrl = settings.baseUrl
         model = settings.model
         systemPrompt = settings.systemPrompt
+        thinkingEnabled = settings.thinkingEnabled
     }
 
     val currentPreset = ProviderPresets.byId(providerId)
@@ -85,7 +89,8 @@ fun SettingsScreen() {
         apiKey = apiKey,
         baseUrl = baseUrl,
         model = model,
-        systemPrompt = systemPrompt
+        systemPrompt = systemPrompt,
+        thinkingEnabled = thinkingEnabled
     )
 
     Scaffold(
@@ -176,6 +181,24 @@ fun SettingsScreen() {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
+
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("模型思考能力", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "关闭后模型不输出思考内容；开启后按服务商默认行为允许模型思考输出。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = thinkingEnabled,
+                    onCheckedChange = { thinkingEnabled = it }
+                )
+            }
 
             OutlinedTextField(
                 value = systemPrompt,

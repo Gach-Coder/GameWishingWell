@@ -11,9 +11,9 @@ data class ProviderPreset(
     /** 单次回复最大 token 数。完整 HTML 游戏通常远超模型默认的 4096，必须显式调高，否则输出被截断导致反复"提取不到 HTML"。 */
     val maxTokens: Int = 8192,
     /**
-     * 是否通过 thinking={"type":"disabled"} 关闭推理模型的思考过程。
-     * 以 instruct.txt 的厂商默认预设表为准：目前所有厂商预设均为“否”，
-     * 即不发送关闭思考字段，尊重服务端默认行为。
+     * 预设级兜底：为 true 时强制通过 thinking={"type":"disabled"} 关闭思考，
+     * 即使设置页的思考开关已打开也不生效。当前所有预设均为 false，
+     * 实际是否关闭思考以设置页开关（默认关闭）为准。
      */
     val disableThinking: Boolean = false
 )

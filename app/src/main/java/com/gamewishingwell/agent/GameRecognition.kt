@@ -71,7 +71,7 @@ object GameSystemCatalog {
         "竞速" to "竞速|赛车|跑道|冲刺",
         "平台跳跃" to "平台跳跃|横板跳跃|跳台|跑酷",
         "弹幕射击" to "射击|弹幕|飞机大战|子弹",
-        "反应躲避" to "反应|躲避|接水果|打地鼠|点按"
+        "反应躲避" to "反应|躲避|接水果|打地鼠"
     )
 
     fun extract(text: String): List<String> {

@@ -29,7 +29,7 @@ class OpenAiCompatibleClient(
     private val baseUrl: String,
     private val model: String,
     private val maxTokens: Int = 8192,
-    /** 是否发送 thinking={"type":"disabled"} 关闭推理模型的思考过程。 */
+    /** 是否发送 thinking={"type":"disabled"} 关闭推理模型的思考过程（由设置页思考开关驱动，默认关闭）。 */
     private val disableThinking: Boolean = false
 ) : LlmClient {
 

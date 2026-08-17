@@ -27,7 +27,9 @@ class AnthropicClient(
     private val apiKey: String,
     private val baseUrl: String,
     private val model: String,
-    private val maxTokens: Int = 8192
+    private val maxTokens: Int = 8192,
+    /** 是否请求 Anthropic extended thinking；false 时省略 thinking 字段（服务端默认关闭）。 */
+    private val thinkingEnabled: Boolean = false
 ) : LlmClient {
 
     override val protocol: Protocol = Protocol.ANTHROPIC
@@ -56,7 +58,14 @@ class AnthropicClient(
                     max_tokens = maxTokens,
                     stream = true,
                     system = system,
-                    messages = normalized
+                    messages = normalized,
+                    thinking = if (thinkingEnabled) {
+                        // budget_tokens 必须小于 max_tokens，且至少 1024；单文件游戏给足思考预算。
+                        val budget = (maxTokens - 1024).coerceIn(1024, 4096)
+                        AnthropicThinkingConfig(type = "enabled", budget_tokens = budget)
+                    } else {
+                        null
+                    }
                 )
             )
             val request = Request.Builder()
@@ -123,7 +132,14 @@ class AnthropicClient(
         val max_tokens: Int,
         val stream: Boolean,
         val system: String = "",
-        val messages: List<ChatMessage>
+        val messages: List<ChatMessage>,
+        val thinking: AnthropicThinkingConfig? = null
+    )
+
+    @Serializable
+    private data class AnthropicThinkingConfig(
+        val type: String,
+        val budget_tokens: Int
     )
 
     private companion object {
