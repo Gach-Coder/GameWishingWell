@@ -50,15 +50,6 @@ class GamePlanTest {
     }
 
     @Test
-    fun `P0-only 裁剪 P1P2`() {
-        val plan = PlanningEngine.build(IntentEngine.infer("做一个塔防游戏，有商店和技能", null))
-        val p0 = PlanningEngine.p0Only(plan)
-        assertEquals(emptyList<String>(), p0.p1Features)
-        assertEquals(emptyList<String>(), p0.p2Features)
-        assertTrue(p0.acceptanceChecklist.any { it.contains("P0-only") })
-    }
-
-    @Test
     fun `策划层输出系统实现清单与排除清单`() {
         val intent = IntentEngine.infer("做一个2D竖版塔防游戏，不要商店经济", null)
         val plan = PlanningEngine.build(intent)
@@ -90,15 +81,6 @@ class GamePlanTest {
         assertTrue(prompt.contains("拾取判定"))
     }
 
-    @Test
-    fun `P0-only 会把裁剪系统移入排除清单`() {
-        val plan = PlanningEngine.build(IntentEngine.infer("做一个塔防游戏，有商店和技能", null))
-        val p0 = PlanningEngine.p0Only(plan)
-        assertTrue("AI策略" in p0.excludedSystems)
-        assertTrue("商店经济" in p0.excludedSystems)
-        assertTrue(p0.implementations.all { it.layer == 0 })
-        assertTrue(p0.acceptanceChecklist.none { it.contains("商店经济") })
-    }
 }
 
 class QualityGateTest {

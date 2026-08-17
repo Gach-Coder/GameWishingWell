@@ -2,6 +2,8 @@ package com.gamewishingwell.llm
 
 import com.gamewishingwell.data.ChatMessage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runInterruptible
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -9,12 +11,12 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.InterruptedIOException
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Anthropic Messages API 的流式客户端。
@@ -36,7 +38,12 @@ class AnthropicClient(
         onThinking: (String) -> Unit,
         onDone: () -> Unit
     ) {
-        // runInterruptible：停止键取消协程时中断阻塞中的 OkHttp SSE 读取。
+        // runInterruptible + activeCall.cancel()：停止键取消协程时中断阻塞中的 OkHttp SSE 读取。
+        // 这里不设任何超时，默认用户可无限等待；只有用户主动停止才会取消底层网络调用。
+        val activeCall = AtomicReference<Call?>(null)
+        currentCoroutineContext()[Job]?.invokeOnCompletion {
+            activeCall.get()?.cancel()
+        }
         runInterruptible(Dispatchers.IO) {
             val system = messages.filter { it.role == "system" }.joinToString("\n\n") { it.content }
             val chat = mergeConsecutive(messages.filterNot { it.role == "system" })
@@ -60,29 +67,28 @@ class AnthropicClient(
                 .post(requestBody.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
-            okHttp.newCall(request).execute().use { response ->
+            val call = okHttp.newCall(request)
+            activeCall.set(call)
+            try {
+                call.execute().use { response ->
                 if (!response.isSuccessful) {
                     val err = response.body?.string()?.take(300) ?: ""
                     throw LlmError("API 错误 ${response.code}：$err")
                 }
                 val source = response.body!!.source()
-                // 与 OpenAI 客户端一致的内容停滞保护：绝对截止时间仅在收到实际内容时重新武装，
-                // 服务端静默挂起连接时 readUtf8Line 会阻塞，必须用 source 层超时兜底
-                source.timeout().deadline(STALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                // 默认用户可无限等待：不做内容停滞超时，用户主动停止时由 runInterruptible 中断读取。
                 while (true) {
-                    val line = try {
-                        source.readUtf8Line()
-                    } catch (e: InterruptedIOException) {
-                        break
-                    } ?: break
+                    val line = source.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val delta = parseDelta(line.removePrefix("data:").trim())
                     if (delta != null) {
-                        source.timeout().deadline(STALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                         onDelta(delta)
                     }
                 }
                 onDone()
+                }
+            } finally {
+                activeCall.compareAndSet(call, null)
             }
         }
     }
@@ -122,8 +128,5 @@ class AnthropicClient(
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-
-        /** 流内容停滞判定阈值：超过该时长没有任何新内容即强制结束流。 */
-        const val STALL_TIMEOUT_MS = 60_000L
     }
 }

@@ -30,15 +30,17 @@
 鸿蒙 ArkWeb 同为 Chromium 内核，双端可复用。
 
 二、Agent核心说明
-前端 LLM SSE 显示 Agent 状态（游戏识别中/游戏策划中/游戏生成中/游戏校验中/对话回复中等），将代码生成时前端显示的固定文本(Agent Loop:意图识别 -> 策划 -> 生成 -> 校验 -> 冒烟测试)改为
+*前端 LLM SSE 显示 Agent 状态（游戏识别中/游戏策划中/游戏生成中/游戏校验中/对话回复中等）
 Agent处理message流程如下：
-	→ 意图层：(new_game/modify_game/chat)
-		正则 + Lite LLM 抽取游戏特征，输出 Intent Schema JSON（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值
+	**默认契约：一个对话框只制作一个游戏，不处理单对话框的多游戏需求bug Game Schema JSON 对话框级别全局唯一，后续修改即以此为基础
+	→ 识别层：(意图层改为识别层：原识别三类意图对流程无意义，关键在识别游戏)
+		正则 + Lite LLM 抽取游戏特征，输出此对话框的Game Schema JSON（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
+			若返回为空实体，则判断 message 为普通 chat
 		解析实体包括：
 			画面维度：2D，2.5D，3D
 			画面方向：横板，竖版
 			游戏系统：人物实体，道具，战斗，技能，属性等级，关卡场景，AI策略，商店经济等。
-				(意图层事先定义较完整的游戏系统列表)
+				(识别层事先定义较完整的游戏系统列表)
 			参考对标游戏：市场内的某著名游戏或无，可辅助补全游戏特性。（映射到内部模板库template_id + 相似度，映射不上返回 template:null）
             （保留扩展位置）
 	→ 策划层：根据用户意图整理所需的游戏系统列表，然后根据针对每个系统策划出对应在这个游戏中具体合理的实现方式（业务验收边界）
@@ -50,7 +52,7 @@ Agent处理message流程如下：
 		按 template_class（画面维度×画面方向×主类型）选取特征矩阵（系统×默认参数），只做"选系统+覆盖参数"，不自由发明
 	→ Prompt：system 提示词 + 用户指令/策划 Schema 上下文最小化：
 		只放 rolling summary + 本次要动的文件内容，其余靠readfile按需取）
-	→ Agent Loop：
+	→ Agent Loop：（不设超时与重试预算，默认用户可无限等待）
 		→ 先出文件计划和依赖顺序（plan）→ implement → validate，中途不换文件切分方案
 		→ tool call readfile/writefile 读/写已有的源码文件(HTML+CSS+JS)
 			写入用版本化文件 + 指针切换（或OPFS），替代临时文件+rename；同会话加锁 / 文件 hash校验防并发覆盖
@@ -136,7 +138,7 @@ GameWishingWell/
       │  │  │  ├─ GameValidator.kt       # JS 语法(acorn 同等) + HTML 配对 + no-undef 等结构化校验
       │  │  │  ├─ GameSmokeTest.kt       # WebView 隔离 iframe 确定性 tick 冒烟测试
       │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入 / 行级 patch
-      │  │  │  ├─ RetryPolicy.kt         # 分类重试预算与错误签名哈希
+      │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
       │  │  │  ├─ QualityGate.kt         # 两段式自检 verdict
       │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
       │  │  │  └─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入

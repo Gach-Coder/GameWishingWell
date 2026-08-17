@@ -59,7 +59,6 @@ data class GameSession(
     /** 每通过校验的版本快照（可回滚），记录文件名与内容哈希。 */
     val snapshots: List<String> = emptyList(),
     val schemaVersion: Int = 2,
-    val budget: RetryBudget = RetryBudget(),
     /** 仅用于兼容旧会话；简化流程不再运行两段式质量自检，因此新状态中保持 null。 */
     val qualityVerdict: QualityVerdict? = null
 )
@@ -88,6 +87,8 @@ object AgentStage {
  *
  * 生成任务运行在 [agentScope]（全局协程）中：切换页面/对话只会取消 ViewModel 的等待，
  * 不会取消生成本身；生成完成后任何页面都能立即通过 [session] 看到结果。
+ *
+ * Agent Loop 不设超时和重试预算，默认用户可无限等待；停止键是唯一的主动中断方式。
  */
 class GameAgent(
     private val appContext: Context,
@@ -119,9 +120,11 @@ class GameAgent(
 
     private val okHttp by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(180, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
+            // 默认用户可无限等待：不设任何连接/读写超时，只有用户按停止键才会中断。
+            .connectTimeout(0, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS)
+            .writeTimeout(0, TimeUnit.SECONDS)
+            .callTimeout(0, TimeUnit.SECONDS)
             .build()
     }
 
@@ -195,7 +198,7 @@ class GameAgent(
      * 开始一个空会话。
      * [clearDraft] 为 true 时同时删除草稿文件；从底部“创作”进入新对话时传 false，
      * 这样不会破坏“我的游戏”页的“继续上次创作”入口。
-     * 跨会话的错误签名库会保留，只用于识别“同一错误”，不消耗新回合预算。
+     * 跨会话的错误签名库会保留，只用于错误历史记录；Agent Loop 不设重试上限。
      */
     suspend fun newSession(clearDraft: Boolean = true) {
         if (_session.value.isGenerating) return
@@ -231,7 +234,6 @@ class GameAgent(
             streamingText = null,
             agentStage = AgentStage.INTENT,
             pendingConfirmation = null,
-            budget = RetryBudget(),
             qualityVerdict = null
         )
         _session.value = base
@@ -259,7 +261,6 @@ class GameAgent(
             agentStage = AgentStage.PLANNING,
             pendingConfirmation = null,
             designPlan = finalPlan,
-            budget = RetryBudget(),
             qualityVerdict = null
         )
         _session.value = base
@@ -282,15 +283,11 @@ class GameAgent(
         val file = Regex("""(index\.html|[A-Za-z0-9_.-]+\.(?:html|js|css))""").find(jsError)?.value ?: "index.html"
         val line = Regex("""[:@](\d+)""").find(jsError)?.groupValues?.get(1)?.toIntOrNull()
         val normalized = ErrorSignature.normalize(jsError, file = file, line = line)
-        val degrade = RetryBookkeeping.shouldDegradeRuntime(s.knownErrors, normalized)
         val known = RetryBookkeeping.record(s.knownErrors, ErrorCategory.USER_RUNTIME, normalized)
         saveGlobalErrorSignatures(known)
 
-        val instruction = if (degrade) {
-            "该运行错误已经是第 3 次出现，请直接降级：移除或大幅简化触发该错误的系统，只输出 P0 核心玩法版本。\n$jsError"
-        } else {
-            "游戏运行时报错，请修复并输出完整新版代码（保持原有玩法与 P0 特性）：\n$jsError"
-        }
+        // 运行错误不做次数预算或自动降级：每次都以完整玩法为上下文继续修复，用户可无限等待。
+        val instruction = "游戏运行时报错，请修复并输出完整新版代码（保持原有玩法与 P0 特性）：\n$jsError"
         val messages = s.messages + ChatMessage("user", instruction)
         val base = s.copy(
             messages = messages,
@@ -299,7 +296,6 @@ class GameAgent(
             streamingText = null,
             agentStage = AgentStage.FIXING,
             pendingConfirmation = null,
-            budget = RetryBudget(),
             knownErrors = known,
             lastError = jsError.take(500),
             lastErrorSignature = ErrorSignature.hash(normalized),
@@ -320,8 +316,7 @@ class GameAgent(
                     instruction = instruction,
                     intent = intent,
                     existingHtml = html,
-                    forcePlan = s.designPlan,
-                    p0Only = degrade
+                    forcePlan = s.designPlan
                 )
             }
         })
@@ -419,8 +414,7 @@ class GameAgent(
                 agentStage = AgentStage.CONFIRM,
                 error = null,
                 designPlan = draftPlan,
-                qualityVerdict = null,
-                budget = RetryBudget()
+                qualityVerdict = null
             )
             currentCoroutineContext().ensureActive()
             _session.value = next
@@ -493,8 +487,7 @@ class GameAgent(
         instruction: String,
         intent: IntentSchema,
         existingHtml: String?,
-        forcePlan: DesignPlan?,
-        p0Only: Boolean = false
+        forcePlan: DesignPlan?
     ) {
         val llm = createClient()
         if (llm == null) {
@@ -504,8 +497,7 @@ class GameAgent(
 
         // 简化后的 Agent Loop：先出文件计划 → implement → 基础校验。
         // 校验通过立即退出并交付玩家试玩；冒烟测试、两段式自检等自动流程已移除。
-        var plan = forcePlan ?: PlanningEngine.finalize(intent)
-        if (p0Only) plan = PlanningEngine.p0Only(plan)
+        val plan = forcePlan ?: PlanningEngine.finalize(intent)
         val planningStage = if (plan.gameSystems.isEmpty()) {
             "游戏策划中：正在根据确认结果定稿 ${plan.primarySystem} 的方案"
         } else {
@@ -522,14 +514,14 @@ class GameAgent(
         )
 
         var workingHtml = existingHtml
-        var budget = RetryBudget().let { if (p0Only) it.copy(fallbackUsed = true) else it }
         var feedback = ""
-        var fallbackUsed = p0Only
         var round = 0
         var acceptedHtml: String? = null
         var lastReport: ValidationReport? = null
 
-        while (round < 6) {
+        // Agent Loop 不设最大轮次：基础校验失败会无限重试修复，默认用户可无限等待，
+        // 只有停止键、协程取消或底层网络异常会结束本循环。
+        while (true) {
             round++
             currentCoroutineContext().ensureActive()
 
@@ -541,7 +533,6 @@ class GameAgent(
             }
             _session.value = _session.value.copy(
                 agentStage = genStage,
-                budget = budget,
                 streamingText = null
             )
 
@@ -552,8 +543,7 @@ class GameAgent(
                         instruction = instruction,
                         plan = plan,
                         existingHtml = workingHtml,
-                        feedback = feedback,
-                        p0Only = fallbackUsed
+                        feedback = feedback
                     ),
                     stageLabel = genStage
                 )
@@ -573,16 +563,7 @@ class GameAgent(
                 val known = RetryBookkeeping.record(_session.value.knownErrors, category, normalized)
                 saveGlobalErrorSignatures(known)
                 feedback = "上一条回复无法抽取到完整 HTML（${extracted.error ?: "缺少 ```html 围栏或 <html> 标签"}）。请只输出一个完整 HTML 文件。"
-                val action = consumeOrFallback(budget, category)
-                if (action == null) {
-                    failTurn(_session.value, "代码抽取错误超过重试预算，已无法自动恢复")
-                    return
-                }
-                budget = action.budget
-                fallbackUsed = action.fallback
-                if (action.fallback) plan = PlanningEngine.p0Only(plan)
                 _session.value = _session.value.copy(
-                    budget = budget,
                     knownErrors = known,
                     lastError = feedback,
                     agentStage = "校验中：正在检查 Agent 输出是否为完整 HTML"
@@ -613,16 +594,7 @@ class GameAgent(
                 saveGlobalErrorSignatures(known)
                 feedback = validationFeedback(report, signature)
 
-                val action = consumeOrFallback(budget, category)
-                if (action == null) {
-                    failTurn(_session.value, "基础校验错误超过重试预算：${report.errors.firstOrNull()?.message ?: "校验未通过"}")
-                    return
-                }
-                budget = action.budget
-                fallbackUsed = action.fallback
-                if (action.fallback) plan = PlanningEngine.p0Only(plan)
                 _session.value = _session.value.copy(
-                    budget = budget,
                     knownErrors = known,
                     knownIssues = report.warnings.map { "${it.category}:${it.message}" },
                     lastError = feedback,
@@ -638,22 +610,20 @@ class GameAgent(
         }
 
         currentCoroutineContext().ensureActive()
-        if (acceptedHtml == null) {
-            failTurn(_session.value, "Agent Loop 达到最大轮次仍未产出通过基础校验的游戏")
-            return
-        }
+        // 理论不可达：while(true) 只有校验通过或异常/取消才会退出；保留防御性检查。
+        val accepted = checkNotNull(acceptedHtml) { "Agent Loop 已退出但未产出通过基础校验的游戏" }
 
         val assistantText = if (existingHtml.isNullOrBlank()) {
             "游戏已通过基础校验。点击「立即游玩」试玩吧——如遇报错可让 AI 修复，也可以直接在这里继续提改进需求。"
         } else {
             "游戏已按你的要求更新并通过基础校验。点击「立即游玩」确认效果；如遇报错或想继续调整，随时告诉我。"
         }
-        val report = lastReport ?: GameValidator.validate(acceptedHtml)
-        val snapshot = "index.html:${GameFileWorkspace.sha256(acceptedHtml)}"
-        val summary = buildRollingSummary(plan, report, acceptedHtml)
+        val report = lastReport ?: GameValidator.validate(accepted)
+        val snapshot = "index.html:${GameFileWorkspace.sha256(accepted)}"
+        val summary = buildRollingSummary(plan, report, accepted)
         val next = _session.value.copy(
             messages = _session.value.messages + ChatMessage("assistant", assistantText),
-            currentHtml = acceptedHtml,
+            currentHtml = accepted,
             streamingText = null,
             isGenerating = false,
             error = null,
@@ -668,8 +638,8 @@ class GameAgent(
                     WorkspaceFile(
                         "index.html",
                         _session.value.snapshots.size + 1,
-                        GameFileWorkspace.sha256(acceptedHtml),
-                        acceptedHtml.toByteArray(Charsets.UTF_8).size
+                        GameFileWorkspace.sha256(accepted),
+                        accepted.toByteArray(Charsets.UTF_8).size
                     )
                 )
             ),
@@ -677,7 +647,6 @@ class GameAgent(
             designPlan = plan,
             knownIssues = report.warnings.map { "${it.category}:${it.message}" },
             lastError = null,
-            budget = budget,
             qualityVerdict = null,
             decisionLog = _session.value.decisionLog + listOf(
                 "第 $round 轮基础校验通过：${report.errors.size} error / ${report.warnings.size} warning",
@@ -709,19 +678,6 @@ class GameAgent(
         if (systems.isEmpty()) return plan.primarySystem.ifBlank { "核心玩法" }
         val index = ((round - 1) % systems.size + systems.size) % systems.size
         return systems[index]
-    }
-
-    private fun consumeOrFallback(budget: RetryBudget, category: ErrorCategory): BudgetAction? {
-        return if (budget.canRetry(category)) {
-            BudgetAction(budget.consume(category), fallback = false)
-        } else {
-            // 同一类预算耗尽：确定性裁剪 P1/P2，只保留 P0 机制；如果已经裁剪过则放弃。
-            if (!budget.fallbackUsed) {
-                BudgetAction(budget.copy(fallbackUsed = true), fallback = true)
-            } else {
-                null
-            }
-        }
     }
 
     private fun classifyFailure(report: ValidationReport): ErrorCategory {
@@ -811,8 +767,7 @@ class GameAgent(
         instruction: String,
         plan: DesignPlan,
         existingHtml: String?,
-        feedback: String,
-        p0Only: Boolean
+        feedback: String
     ): List<ChatMessage> {
         val customSystem = settingsRepository.settings.value.systemPrompt.trim()
         val msgs = mutableListOf(ChatMessage("system", GamePrompt.systemPrompt(customSystem.ifBlank { null })))
@@ -837,9 +792,6 @@ class GameAgent(
         val body = buildString {
             append("用户指令：$instruction\n\n")
             append(GamePrompt.planContext(plan))
-            if (p0Only) {
-                append("\n【降级指令】预算已耗尽，进入 P0-only 模式：只实现 P0 特性，P1/P2 全部裁剪，资产用几何占位符。\n")
-            }
             if (feedback.isNotBlank()) {
                 append("\n【上一轮校验失败，必须修复】\n$feedback\n")
             }
@@ -886,7 +838,7 @@ class GameAgent(
         return sb.toString()
     }
 
-    // ---------- 错误签名库（跨会话持久化，只用于识别“同一错误”，不消耗预算） ----------
+    // ---------- 错误签名库（跨会话持久化，只记录错误历史，不参与重试限制） ----------
 
     private fun errorLibraryFile(): File =
         File(appContext.filesDir, "agent/error_signatures.json").also { it.parentFile?.mkdirs() }
@@ -906,5 +858,4 @@ class GameAgent(
         if (persisted.isNullOrBlank()) GameSession()
         else runCatching { sessionJson.decodeFromString<GameSession>(persisted) }.getOrDefault(GameSession())
 
-    private data class BudgetAction(val budget: RetryBudget, val fallback: Boolean)
 }

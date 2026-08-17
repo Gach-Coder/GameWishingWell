@@ -2,6 +2,8 @@ package com.gamewishingwell.llm
 
 import com.gamewishingwell.data.ChatMessage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runInterruptible
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -10,12 +12,12 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.InterruptedIOException
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * OpenAI 兼容协议的流式客户端（适用于 DeepSeek / Kimi(Moonshot) / OpenAI 等）。
@@ -39,20 +41,25 @@ class OpenAiCompatibleClient(
         onThinking: (String) -> Unit,
         onDone: () -> Unit
     ) {
-        // runInterruptible：停止键取消协程时中断阻塞中的 OkHttp SSE 读取，保证“随时中断”。
+        // runInterruptible + activeCall.cancel()：停止键取消协程时会中断阻塞中的 OkHttp SSE 读取。
+        // 这里不设任何超时，默认用户可无限等待；只有用户主动停止才会取消底层网络调用。
+        val activeCall = AtomicReference<Call?>(null)
+        currentCoroutineContext()[Job]?.invokeOnCompletion {
+            activeCall.get()?.cancel()
+        }
         runInterruptible(Dispatchers.IO) {
             try {
-                executeStream(buildRequest(messages, includeMaxTokens = true, includeThinking = true), onDelta, onThinking, onDone)
+                executeStream(buildRequest(messages, includeMaxTokens = true, includeThinking = true), onDelta, onThinking, onDone, activeCall)
             } catch (e: LlmError) {
                 if (Thread.currentThread().isInterrupted) throw e
                 val msg = e.message ?: ""
                 when {
                     // 个别老模型不支持 max_tokens 字段，收到相关 4xx 时去掉该字段重试
                     msg.contains("max_tokens", ignoreCase = true) ->
-                        executeStream(buildRequest(messages, includeMaxTokens = false, includeThinking = true), onDelta, onThinking, onDone)
+                        executeStream(buildRequest(messages, includeMaxTokens = false, includeThinking = true), onDelta, onThinking, onDone, activeCall)
                     // 个别网关不支持 thinking 字段，去掉后重试
                     msg.contains("thinking", ignoreCase = true) ->
-                        executeStream(buildRequest(messages, includeMaxTokens = true, includeThinking = false), onDelta, onThinking, onDone)
+                        executeStream(buildRequest(messages, includeMaxTokens = true, includeThinking = false), onDelta, onThinking, onDone, activeCall)
                     else -> throw e
                 }
             }
@@ -81,32 +88,27 @@ class OpenAiCompatibleClient(
         request: Request,
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit,
-        onDone: () -> Unit
+        onDone: () -> Unit,
+        activeCall: AtomicReference<Call?>
     ) {
-        okHttp.newCall(request).execute().use { response ->
+        val call = okHttp.newCall(request)
+        activeCall.set(call)
+        try {
+            call.execute().use { response ->
             if (!response.isSuccessful) {
                 val err = response.body?.string()?.take(300) ?: ""
                 throw LlmError("API 错误 ${response.code}：$err")
             }
             val source = response.body!!.source()
-            // 内容停滞保护：部分服务端在输出完成后不关闭连接（keep-alive 或静默挂起），
-            // 此时 readUtf8Line 会一直阻塞、超时永不触发，界面卡在"生成中"。
-            // 用 source 级绝对截止时间兜底，且只在收到实际内容增量时重新武装：
-            // keep-alive 注释行/空行不会延长等待，60 秒无新内容即强制结束流。
-            source.timeout().deadline(STALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            // 默认用户可无限等待：不做内容停滞超时，服务端多久没有新内容都继续等；
+            // 用户主动按停止键时由 runInterruptible 中断阻塞读取。
             var reasoningChars = 0L
             var contentChars = 0L
             var lastFinishReason: String? = null
             var lastPayloadTail: String? = null
-            var endedByStall = false
             var endedByDone = false
             while (true) {
-                val line = try {
-                    source.readUtf8Line()
-                } catch (e: InterruptedIOException) {
-                    endedByStall = true
-                    break
-                } ?: break
+                val line = source.readUtf8Line() ?: break
                 if (line.startsWith("data:")) {
                     val payload = line.removePrefix("data:").trim()
                     if (payload == "[DONE]") { endedByDone = true; break }
@@ -118,7 +120,6 @@ class OpenAiCompatibleClient(
                             ?.jsonPrimitive?.contentOrNull ?: lastFinishReason
                     } catch (e: Exception) { /* 忽略解析失败 */ }
                     if (content != null || reasoning != null) {
-                        source.timeout().deadline(STALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                         if (content != null) { contentChars += content.length; onDelta(content) }
                         if (reasoning != null) { reasoningChars += reasoning.length; onThinking(reasoning) }
                     }
@@ -126,10 +127,13 @@ class OpenAiCompatibleClient(
             }
             android.util.Log.d(
                 "OpenAiClient",
-                "流结束: done=$endedByDone stall=$endedByStall 推理字符=$reasoningChars 内容字符=$contentChars " +
+                "流结束: done=$endedByDone 推理字符=$reasoningChars 内容字符=$contentChars " +
                     "finish_reason=$lastFinishReason 尾帧=$lastPayloadTail"
             )
             onDone()
+            }
+        } finally {
+            activeCall.compareAndSet(call, null)
         }
     }
 
@@ -159,8 +163,5 @@ class OpenAiCompatibleClient(
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-
-        /** 流内容停滞判定阈值：超过该时长没有任何新内容（含思考过程）即强制结束流。 */
-        const val STALL_TIMEOUT_MS = 60_000L
     }
 }

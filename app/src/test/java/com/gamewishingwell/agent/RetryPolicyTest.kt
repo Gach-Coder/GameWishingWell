@@ -1,20 +1,18 @@
 package com.gamewishingwell.agent
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RetryPolicyTest {
 
     @Test
-    fun `预算按类别消耗并在回合重置`() {
-        val budget = RetryBudget().consume(ErrorCategory.SYNTAX).consume(ErrorCategory.SYNTAX)
-        assertTrue(budget.canRetry(ErrorCategory.SYNTAX))
-        val exhausted = budget.consume(ErrorCategory.SYNTAX)
-        assertFalse(exhausted.canRetry(ErrorCategory.SYNTAX))
-        assertEquals(0, exhausted.freshRound().syntaxUsed)
+    fun `同签名错误只更新计数不重复占库`() {
+        val n = ErrorSignature.normalize("x is not defined", "index.html", 1)
+        val once = RetryBookkeeping.record(emptyList(), ErrorCategory.SYNTAX, n)
+        val twice = RetryBookkeeping.record(once, ErrorCategory.SYNTAX, n)
+        assertEquals(1, twice.size)
+        assertEquals(2, twice.single().occurrences)
     }
 
     @Test
@@ -31,12 +29,4 @@ class RetryPolicyTest {
         assertNotEquals(ErrorSignature.hash(a), ErrorSignature.hash(b))
     }
 
-    @Test
-    fun `用户运行时同一错误重复两次直接降级`() {
-        val n = ErrorSignature.normalize("boom", "index.html", 1)
-        val once = RetryBookkeeping.record(emptyList(), ErrorCategory.USER_RUNTIME, n)
-        val twice = RetryBookkeeping.record(once, ErrorCategory.USER_RUNTIME, n)
-        assertFalse(RetryBookkeeping.shouldDegradeRuntime(once, n))
-        assertTrue(RetryBookkeeping.shouldDegradeRuntime(twice, n))
-    }
 }

@@ -38,7 +38,6 @@ class AgentSessionJsonTest {
             knownErrors = listOf(KnownError(ErrorCategory.SYNTAX, "sig", "norm")),
             decisionLog = listOf("d1"),
             snapshots = listOf("index.html:hash"),
-            budget = RetryBudget(syntaxUsed = 1),
             qualityVerdict = QualityVerdict(true, note = "ok")
         )
         val encoded = json.encodeToString(state)

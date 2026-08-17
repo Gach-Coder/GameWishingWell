@@ -285,33 +285,6 @@ object PlanningEngine {
         return result.toList()
     }
 
-    /** 超预算降级：确定性裁剪 P1/P2，只保留 P0 机制。 */
-    fun p0Only(plan: DesignPlan): DesignPlan {
-        val p0Systems = plan.implementations
-            .filter { it.layer == 0 }
-            .map { it.system }
-            .toSet()
-            .let { layered ->
-                // 兼容旧会话里没有 implementations 的 DesignPlan，回退通用系统矩阵。
-                layered.ifEmpty { plan.gameSystems.filter { systemMatrix[it]?.layer == 0 }.toSet() }
-            }
-        return plan.copy(
-            title = plan.title,
-            gameSystems = plan.gameSystems.filter { it in p0Systems },
-            p1Features = emptyList(),
-            p2Features = emptyList(),
-            implementations = plan.implementations.filter { it.system in p0Systems },
-            excludedSystems = (plan.excludedSystems + plan.gameSystems.filterNot { it in p0Systems }).distinct(),
-            acceptanceChecklist = plan.acceptanceChecklist.filter { item ->
-                item.startsWith("基础校验") ||
-                    item.startsWith("无 eval") || item.startsWith("触控可用") ||
-                    (item.startsWith("业务验收：") && p0Systems.any { system ->
-                        item.startsWith("业务验收：${system}·")
-                    })
-            } + "P0-only 降级版：只保留核心机制，资产用几何占位符"
-        )
-    }
-
     /** 策划 Schema 的紧凑提示词片段（上下文最小化）。 */
     fun toPrompt(plan: DesignPlan): String = """
         <design_schema>
