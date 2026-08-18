@@ -12,14 +12,25 @@ import org.junit.Test
 class GameRecognitionTest {
 
     @Test
-    fun `意图层只输出 develop 或 chat 两个意图`() {
-        assertEquals(IntentDecision.INTENT_DEVELOP, IntentLayer.inferLocally("做一个打地鼠游戏").intent)
+    fun `意图层输出 new_feature fix_bug chat 三个意图`() {
+        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.inferLocally("做一个打地鼠游戏").intent)
         assertEquals(IntentDecision.INTENT_CHAT, IntentLayer.inferLocally("你好").intent)
-        assertEquals(IntentDecision.INTENT_DEVELOP, IntentLayer.inferLocally("加个连击计分").intent)
+        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.inferLocally("加个连击计分").intent)
+        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.inferLocally("游戏报错了，点开始没反应，修复一下").intent)
+        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.inferLocally("修复bug").intent)
+        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.inferLocally("闪退了帮我修修").intent)
+        // 制作新游戏的指令优先于修复词：“修汽车”是游戏内容，不是修 bug
+        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.inferLocally("做一个修汽车的装修游戏").intent)
+        assertTrue(IntentLayer.inferLocally("修复bug").isDevelop)
+        assertFalse(IntentLayer.inferLocally("你好").isDevelop)
 
         val parsed = IntentLayer.parseLiteLlmReply("""{"intent":"chat","confidence":0.9,"reason":"问候"}""")
         assertEquals(IntentDecision.INTENT_CHAT, parsed?.intent)
         assertTrue(parsed?.isChat == true)
+        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.parseLiteLlmReply("""{"intent":"fix_bug","confidence":0.9}""")?.intent)
+        // 兼容旧二分类时期 LLM 可能输出的 develop 标签
+        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.parseLiteLlmReply("""{"intent":"develop","confidence":0.9}""")?.intent)
+        assertNull(IntentLayer.parseLiteLlmReply("""{"intent":"外星意图","confidence":0.9}"""))
     }
 
     @Test

@@ -158,7 +158,7 @@ object IntentSchemaValidator {
  * 修正低置信度字段，最后统一走 [IntentSchemaValidator]。
  */
 object IntentEngine {
-    /** 新意图层便捷入口：只返回 develop / chat 二分类。 */
+    /** 新意图层便捷入口：返回 new_feature / fix_bug / chat 三分类结果。 */
     fun infer(userText: String): IntentDecision = IntentLayer.inferLocally(userText)
 
     private val modifyPattern = Regex(

@@ -457,7 +457,7 @@ object GameSchemaValidator {
 }
 
 /**
- * 识别层：仅在意图层分类为 develop 后运行。
+ * 识别层：仅在意图层分类为 new_feature 后运行（fix_bug 直通修复，不经过识别层）。
  *
  * 会话 Game Schema JSON 为空 → 首次制作；非空 → 已经锚定某个游戏，默认继续修改。
  * 正则 + Lite LLM 抽取特征后，把合法字段补全/覆盖到同一份 Game Schema 上。

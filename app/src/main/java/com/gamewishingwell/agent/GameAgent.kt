@@ -83,7 +83,8 @@ object AgentStage {
 }
 
 /**
- * 游戏创作 Agent：意图层(develop/chat) → 识别层(Game Schema JSON) → 策划草案(LLM 细化系统实现) → 确认门 → 决策层 → Prompt → Agent Loop（生成/基础校验/修复）→ 持久化。
+ * 游戏创作 Agent：意图层(new_feature/fix_bug/chat) → 识别层(Game Schema JSON) → 策划草案(LLM 细化系统实现) → 确认门 → 决策层 → Prompt → Agent Loop（生成/基础校验/修复）→ 持久化。
+ * fix_bug 意图在已锚定游戏时直通 Agent Loop 修复（功能特性不变）；chat 为纯文本回复。
  *
  * 简化后的 Agent Loop 只做语法与基本逻辑校验：通过后立即交付玩家试玩，
  * 运行错误和玩家反馈再回到 Agent Loop 修复，避免自动测试流程过长。
@@ -225,6 +226,8 @@ class GameAgent(
 
         // 确认门期间输入框发来的任何文字都是“补充/修正”，不会当作确认语句；
         // 进入决策层的唯一入口是界面上的确认按钮（confirmIntent）。
+        // 修正回合期间保留当前确认卡：重组后的新摘要会覆盖它，
+        // 修正失败/中断时上一版方案仍然可见、可确认。
         val priorConfirmation = current.pendingConfirmation
         val last = current.messages.lastOrNull()
         val duplicate = last != null && last.isUser && last.content == trimmed
@@ -236,7 +239,6 @@ class GameAgent(
             error = null,
             streamingText = null,
             agentStage = AgentStage.INTENT,
-            pendingConfirmation = null,
             qualityVerdict = null
         )
         _session.value = base
@@ -391,16 +393,34 @@ class GameAgent(
                 return@withLock
             }
 
-            // 1) 意图层：只区分 develop / chat。chat 为 readonly，不写文件也不改 Game Schema。
-            _session.value = s.copy(agentStage = AgentStage.INTENT)
-            val intent = classifyIntent(instruction, llm)
+            // 1) 意图层：new_feature / fix_bug / chat 三分类。
+            //    确认门待确认期间的任何文本输入一律判定为“修正”：跳过意图分类，
+            //    不落入 chat 回退、不走 fix_bug 直通，只会回到策划层重组摘要再次回显。
+            val intent = if (priorConfirmation != null) {
+                IntentDecision(
+                    intent = IntentDecision.INTENT_NEW_FEATURE,
+                    confidence = 1.0,
+                    reason = "确认门待确认期间的文本输入一律视为修正"
+                )
+            } else {
+                _session.value = s.copy(agentStage = AgentStage.INTENT)
+                classifyIntent(instruction, llm)
+            }
             currentCoroutineContext().ensureActive()
             if (intent.isChat) {
                 generateChatReply(s, instruction, llm)
                 return@withLock
             }
 
-            // 2) 识别层：只在 develop 分支运行。检测会话级 Game Schema JSON：
+            // fix_bug：会话已锚定游戏时跳过识别/策划/确认门，携带现有方案直通
+            // Agent Loop 修复，游戏功能特性保持不变；还没有可修复的游戏时回落
+            // new_feature 流程，由识别层复核去向。
+            if (intent.isFixBug && hasAnchoredGame(s)) {
+                fixBugFromUserText(s, instruction)
+                return@withLock
+            }
+
+            // 2) 识别层：只在 new_feature 分支运行。检测会话级 Game Schema JSON：
             //    null  → 本对话还没有游戏 → 默认为首次制作；
             //    非 null → 已锚定一个游戏 → 在本轮消息上补全/覆盖同一份 JSON。
             _session.value = _session.value.copy(agentStage = AgentStage.RECOGNITION)
@@ -415,17 +435,28 @@ class GameAgent(
             currentCoroutineContext().ensureActive()
 
             // 意图层可能误判；识别层抽不到任何游戏实体时回退为普通文本聊天。
-            if (recognition.emptyEntities) {
+            // 确认门修正回合例外：即使本轮没抽到新实体（如口语化补充），也沿用
+            // 上一版策划草案重组摘要、再次回显待确认，绝不退化为聊天回复。
+            if (recognition.emptyEntities && priorConfirmation == null) {
                 generateChatReply(s, instruction, llm)
                 return@withLock
             }
-            val schema = recognition.gameSchema
+            val schema = if (recognition.emptyEntities) {
+                priorConfirmation?.schema ?: recognition.gameSchema
+            } else {
+                recognition.gameSchema
+            }
             // 识别结果先写回会话，后续策划/确认/生成都共享同一份 JSON。
             _session.value = _session.value.copy(gameSchema = schema)
 
             // 3) 策划层：根据识别层共享的 Game Schema 整理系统列表，并由 LLM
             //    逐项阐述每个系统在这款游戏中的具体实现方式（业务验收边界）。
-            val draftPlan = draftPlanWithLlm(schema, s, instruction, llm)
+            //    修正回合没抽到新实体时直接沿用上一版草案，省去一次重复的策划 LLM 调用。
+            val draftPlan = if (recognition.emptyEntities && priorConfirmation?.draftPlan != null) {
+                priorConfirmation.draftPlan
+            } else {
+                draftPlanWithLlm(schema, s, instruction, llm)
+            }
             currentCoroutineContext().ensureActive()
 
             // 确认门期间的任何文字输入都视为补充/修正；直到点击确认按钮才进入决策层。
@@ -461,7 +492,7 @@ class GameAgent(
         }
     }
 
-    /** 意图层：正则优先，低置信度时用 Lite LLM 复核 develop / chat。 */
+    /** 意图层：正则优先，低置信度时用 Lite LLM 复核 new_feature / fix_bug / chat。 */
     private suspend fun classifyIntent(userText: String, llm: LlmClient): IntentDecision {
         val local = IntentLayer.inferLocally(userText)
         if (local.confidence >= 0.8) return local
@@ -479,6 +510,41 @@ class GameAgent(
             null
         }
         return IntentLayer.parseLiteLlmReply(reply ?: "") ?: local
+    }
+
+    /** 会话是否已锚定一个游戏（有代码 / Game Schema / 设计稿 / 编辑中的已保存游戏）。 */
+    private fun hasAnchoredGame(s: GameSession): Boolean =
+        !s.currentHtml.isNullOrBlank() || s.gameSchema != null ||
+            s.designPlan != null || editingGameId != null
+
+    /**
+     * fix_bug 意图回合：跳过识别层/策划层/确认门，带着已确认的玩法方案与现有代码
+     * 直通 Agent Loop，只修复玩家反馈的异常，游戏功能特性保持不变。
+     */
+    private suspend fun fixBugFromUserText(s: GameSession, instruction: String) {
+        val html = s.currentHtml
+        if (html.isNullOrBlank()) {
+            failTurn(s, "当前没有可修复的游戏代码；如想制作或改进游戏，请直接描述你的需求。")
+            return
+        }
+        val schema = s.gameSchema
+            ?: legacyAnchoredSchema(s)
+            ?: GameSchema(confidence = 1.0)
+        val fixInstruction = "玩家反馈了游戏缺陷，请修复该问题并保持原有玩法与全部功能特性不变：\n$instruction"
+        _session.value = s.copy(
+            isGenerating = true,
+            error = null,
+            streamingText = null,
+            agentStage = AgentStage.FIXING,
+            gameSchema = schema,
+            qualityVerdict = null
+        )
+        generateFromIntent(
+            instruction = fixInstruction,
+            intent = schema,
+            existingHtml = html,
+            forcePlan = s.designPlan
+        )
     }
 
     /** 识别层 Lite LLM：只补全 Game Schema 补丁 JSON，不含意图字段。 */
@@ -597,10 +663,17 @@ class GameAgent(
         // 简化后的 Agent Loop：先出文件计划 → implement → 基础校验。
         // 校验通过立即退出并交付玩家试玩；冒烟测试、两段式自检等自动流程已移除。
         val plan = forcePlan ?: PlanningEngine.finalize(intent)
-        val planningStage = if (plan.gameSystems.isEmpty()) {
-            "游戏策划中：正在根据确认结果定稿 ${plan.primarySystem} 的方案"
+        // 修复轮（fix_bug 意图或运行时报错）：沿用已确认方案，只修异常，不重新定稿。
+        val isFixTurn = forcePlan != null && !existingHtml.isNullOrBlank()
+        val planningStage = when {
+            isFixTurn -> "修复中：正在定位问题并保持玩法与系统特性不变"
+            plan.gameSystems.isEmpty() -> "游戏策划中：正在根据确认结果定稿 ${plan.primarySystem} 的方案"
+            else -> "游戏策划中：正在根据确认结果定稿 ${plan.gameSystems.joinToString("、")}（已排除 ${plan.excludedSystems.size} 个系统）"
+        }
+        val decisionEntry = if (isFixTurn) {
+            "修复轮：沿用已确认方案（${plan.templateClass}，${plan.implementations.size} 个系统不变），只修复异常、功能特性不变；文件计划 index.html"
         } else {
-            "游戏策划中：正在根据确认结果定稿 ${plan.gameSystems.joinToString("、")}（已排除 ${plan.excludedSystems.size} 个系统）"
+            "决策层定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
         }
         _session.value = _session.value.copy(
             isGenerating = true,
@@ -610,7 +683,7 @@ class GameAgent(
             gameSchema = intent,
             designPlan = plan,
             filePlan = listOf("index.html"),
-            decisionLog = _session.value.decisionLog + "决策层定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
+            decisionLog = _session.value.decisionLog + decisionEntry
         )
 
         var workingHtml = existingHtml
