@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -41,6 +42,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -86,10 +88,9 @@ fun ChatScreen(
     var showSaveDialog by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
-    // 列表总条目数 = 消息 + 生成中占位 + 错误卡片占位
+    // 列表总条目数 = 消息（含确认卡） + 生成中占位 + 错误卡片占位
     val listItemCount = session.messages.size +
         (if (session.isGenerating) 1 else 0) +
-        (if (session.pendingConfirmation != null) 1 else 0) +
         (if (session.error != null) 1 else 0)
 
     // 使用 reverseLayout 模拟微信消息流：index 0 固定在列表底部，
@@ -134,21 +135,34 @@ fun ChatScreen(
                 if (session.isGenerating) {
                     item(key = "typing") { TypingBubble(stage = session.agentStage) }
                 }
-                val pending = session.pendingConfirmation
-                if (pending != null && !session.isGenerating) {
-                    item(key = "confirm") {
-                        IntentConfirmationCard(
-                            confirmation = pending,
-                            onConfirm = { vm.confirmIntent() }
-                        )
-                    }
+                // 确认卡随聊天流保留；仅最后一张与 pendingConfirmation 匹配的卡片
+                // 可交互（生成中临时禁用），历史卡片永久只读回显（勾选框与按钮 disabled）。
+                val pendingKey = session.pendingConfirmation
+                    ?.let { IntentConfirmation.cardContent(it) }
+                val enabledCardIndex = if (pendingKey == null) -1 else session.messages.indexOfLast {
+                    it.isConfirmCard && it.content == pendingKey
                 }
                 val lastIndex = session.messages.lastIndex
                 items(
                     count = session.messages.size,
                     key = { reversedIndex -> lastIndex - reversedIndex }
                 ) { reversedIndex ->
-                    MessageBubble(session.messages[lastIndex - reversedIndex])
+                    val index = lastIndex - reversedIndex
+                    val msg = session.messages[index]
+                    if (msg.isConfirmCard) {
+                        val card = IntentConfirmation.fromCardContent(msg.content)
+                        if (card != null) {
+                            IntentConfirmationCard(
+                                confirmation = card,
+                                enabled = index == enabledCardIndex && !session.isGenerating,
+                                onConfirm = { unchecked -> vm.confirmIntent(unchecked) }
+                            )
+                        } else {
+                            MessageBubble(msg)
+                        }
+                    } else {
+                        MessageBubble(msg)
+                    }
                 }
             }
             if (session.currentHtml != null && !session.isGenerating && session.error == null && session.pendingConfirmation == null) {
@@ -235,8 +249,15 @@ private fun TypingBubble(stage: String) {
 @Composable
 private fun IntentConfirmationCard(
     confirmation: IntentConfirmation,
-    onConfirm: () -> Unit
+    enabled: Boolean,
+    onConfirm: (Set<String>) -> Unit
 ) {
+    // 勾选状态默认全选；确认时锁定进卡片消息（uncheckedModules），历史卡重显不复位。
+    val checkedModules = remember(confirmation) {
+        mutableStateMapOf<String, Boolean>().apply {
+            confirmation.modules.forEach { put(it.module, it.module !in confirmation.uncheckedModules) }
+        }
+    }
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer,
         contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
@@ -245,7 +266,7 @@ private fun IntentConfirmationCard(
     ) {
         Column(Modifier.padding(12.dp)) {
             Text(
-                "确认游戏方案",
+                if (confirmation.revised) "已按你的补充重新整理，请再次确认" else "确认游戏方案",
                 style = MaterialTheme.typography.titleSmall
             )
             Spacer(Modifier.size(4.dp))
@@ -253,10 +274,46 @@ private fun IntentConfirmationCard(
                 confirmation.summary,
                 style = MaterialTheme.typography.bodySmall
             )
-            if (confirmation.systemExplanations.isNotEmpty()) {
+            if (confirmation.modules.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
-                    "游戏系统玩法与验收边界（只聊玩法，不涉及技术实现）：",
+                    "游戏系统（勾选＝实现，取消＝不实现，只聊玩法不涉及技术实现）：",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+                )
+                confirmation.modules.forEach { module ->
+                    Row(
+                        verticalAlignment = Alignment.Top,
+                        modifier = Modifier.fillMaxWidth().padding(top = 2.dp)
+                    ) {
+                        Checkbox(
+                            checked = checkedModules[module.module] ?: true,
+                            onCheckedChange = { checkedModules[module.module] = it },
+                            enabled = enabled,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                        Column(
+                            Modifier
+                                .weight(1f)
+                                .padding(start = 4.dp, top = 6.dp, bottom = 6.dp)
+                        ) {
+                            Text(
+                                "${module.module}：${module.implementation}",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Text(
+                                "验收边界：${module.acceptanceBoundary}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+                            )
+                        }
+                    }
+                }
+            } else if (confirmation.systemExplanations.isNotEmpty()) {
+                // 旧会话兼容：无结构化 module 数据时退化为纯文本回显
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    "游戏系统玩法与验收边界：",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
                 )
@@ -292,15 +349,21 @@ private fun IntentConfirmationCard(
                 )
             }
             Spacer(Modifier.size(10.dp))
-            Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) {
+            Button(
+                onClick = { onConfirm(checkedModules.filterValues { !it }.keys) },
+                enabled = enabled,
+                modifier = Modifier.fillMaxWidth()
+            ) {
                 Text("确认，按此方案生成")
             }
-            Spacer(Modifier.size(4.dp))
-            Text(
-                "如与预期不符，请直接在下方输入框输入修改内容；确认后才会进入代码生成。",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
-            )
+            if (enabled) {
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    "如与预期不符，可直接在下方输入框补充修改；也可先取消勾选不需要的系统。确认后才会进入代码生成。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+                )
+            }
         }
     }
 }

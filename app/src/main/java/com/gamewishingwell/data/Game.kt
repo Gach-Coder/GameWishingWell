@@ -24,4 +24,11 @@ data class ChatMessage(
 ) {
     val isUser: Boolean get() = role == "user"
     val isSystem: Boolean get() = role == "system"
+
+    companion object {
+        /** 确认门卡片消息：content 为 IntentConfirmation 的精简 JSON，随聊天流持久化。 */
+        const val ROLE_CONFIRM_CARD = "confirm_card"
+    }
+
+    val isConfirmCard: Boolean get() = role == ROLE_CONFIRM_CARD
 }

@@ -132,6 +132,69 @@ class GameRecognitionTest {
     }
 
     @Test
+    fun `对标模板无覆盖填补画面方向空位且不覆盖用户明确值`() {
+        // 赛车模板建议横板：用户未明确指定时由模板填补空位
+        val racing = RecognitionEngine.recognize("做一个赛车游戏", null).gameSchema
+        assertEquals("racing", racing.templateId)
+        assertEquals("横板", racing.screenOrientation)
+
+        // 用户明确“竖版”时优先于模板建议值
+        val explicit = RecognitionEngine.recognize("做一个竖版的赛车游戏", null).gameSchema
+        assertEquals("racing", explicit.templateId)
+        assertEquals("竖版", explicit.screenOrientation)
+
+        // 修改轮换上新模板同样只填补空位
+        val first = RecognitionEngine.recognize("做一个竖版塔防游戏", null).gameSchema
+        assertEquals("竖版", first.screenOrientation)
+        val switched = RecognitionEngine.recognize("换成跑酷", first).gameSchema
+        assertEquals("endless_runner", switched.templateId)
+        assertEquals("横板", switched.screenOrientation)
+    }
+
+    @Test
+    fun `识别结果携带本轮补丁供策划层判断重组范围`() {
+        val first = RecognitionEngine.recognize("做一个黄金矿工游戏", null)
+        assertTrue(first.appliedPatch!!.hasEntities)
+
+        val second = RecognitionEngine.recognize("加一个技能系统，大招要炫酷", first.gameSchema)
+        assertEquals(listOf("技能"), second.appliedPatch!!.gameSystems)
+    }
+
+    @Test
+    fun `确认门卡片提供module勾选数据且可持久化往返`() {
+        val schema = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val draft = PlanningEngine.build(schema)
+        val confirmation = RecognitionEngine.buildConfirmation(
+            "做一个黄金矿工游戏",
+            schema,
+            draft,
+            isNewGame = true,
+            revised = false
+        )
+
+        // module_list 与策划草案一致，卡片据此渲染勾选框
+        assertEquals(draft.gameSystems, confirmation.modules.map { it.module })
+        assertTrue(confirmation.modules.all { it.acceptanceBoundary.isNotBlank() })
+        assertTrue(confirmation.modules.all { it.implementation.isNotBlank() })
+        assertTrue(confirmation.modules.none { it.implementation.contains("Canvas") })
+
+        // 卡片消息编码剥离 draftPlan/gameSchema，回显数据可完整往返
+        val decoded = IntentConfirmation.fromCardContent(IntentConfirmation.cardContent(confirmation))
+        assertEquals(confirmation.modules, decoded!!.modules)
+        assertEquals(confirmation.summary, decoded.summary)
+        assertEquals(confirmation.excludedSystems, decoded.excludedSystems)
+        assertNull(decoded.draftPlan)
+        assertNull(decoded.gameSchema)
+        assertEquals(confirmation.copy(intent = null, gameSchema = null, draftPlan = null), decoded)
+
+        // 确认时勾选状态锁进卡片消息：历史卡重显保持取消勾选，不会复位成全选
+        val locked = confirmation.copy(uncheckedModules = listOf("物理"))
+        val decodedLocked = IntentConfirmation.fromCardContent(IntentConfirmation.cardContent(locked))
+        assertEquals(listOf("物理"), decodedLocked!!.uncheckedModules)
+        assertTrue(decodedLocked.modules.isNotEmpty())
+    }
+
+    @Test
     fun `Game Schema JSON 可持久化往返`() {
         val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
         val schema = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema

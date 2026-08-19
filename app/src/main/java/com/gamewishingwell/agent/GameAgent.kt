@@ -248,26 +248,42 @@ class GameAgent(
         job.join()
     }
 
-    /** 确认门唯一入口：“按此方案生成”按钮；点击后进入决策层并开始生成代码。 */
-    suspend fun confirmIntent() {
+    /**
+     * 确认门唯一入口：“按此方案生成”按钮；点击后进入决策层并开始生成代码。
+     * [uncheckedModules] 为卡片上被取消勾选的 module：本轮不实现、直接从方案中
+     * 剔除（无 LLM 调用），但不视作玩家明确排除——不进任何“禁止实现”清单，
+     * 后续文本点名该系统会自动恢复到范围。
+     */
+    suspend fun confirmIntent(uncheckedModules: Set<String> = emptySet()) {
         val pending = _session.value.pendingConfirmation ?: return
         if (_session.value.isGenerating) return
 
         // 决策层：以确认门共享的同一份 Game Schema JSON 为输入，把已确认的
-        // 策划草案定稿为最终 DesignPlan；排除系统/方案继续硬性生效。
+        // 策划草案定稿为最终 DesignPlan；明确排除的系统/方案继续硬性生效。
         val session = _session.value
-        val schema = pending.gameSchema
+        val baseSchema = pending.gameSchema
             ?: pending.intent?.toGameSchema()
             ?: session.gameSchema
             ?: legacyAnchoredSchema(session)
             ?: GameSchema()
+        val schema = PlanningEngine.schemaApplyingUnchecked(baseSchema, uncheckedModules)
         val finalPlan = PlanningEngine.finalize(
             schema = schema,
             confirmedDraft = pending.draftPlan,
-            existingTitle = session.designPlan?.title
+            existingTitle = session.designPlan?.title,
+            uncheckedModules = uncheckedModules
         )
 
+        // 勾选状态锁进对应的卡片消息：确认/游玩/退出后卡片回显保持取消勾选，
+        // 不因页面重组（remember 重置）恢复成默认全选。
+        val pendingKey = IntentConfirmation.cardContent(pending)
+        val lockedContent = IntentConfirmation.cardContent(
+            pending.copy(uncheckedModules = uncheckedModules.sorted().distinct())
+        )
         val base = session.copy(
+            messages = session.messages.map { msg ->
+                if (msg.isConfirmCard && msg.content == pendingKey) msg.copy(content = lockedContent) else msg
+            },
             isGenerating = true,
             error = null,
             streamingText = null,
@@ -449,13 +465,20 @@ class GameAgent(
             // 识别结果先写回会话，后续策划/确认/生成都共享同一份 JSON。
             _session.value = _session.value.copy(gameSchema = schema)
 
-            // 3) 策划层：根据识别层共享的 Game Schema 整理系统列表，并由 LLM
-            //    逐项阐述每个系统在这款游戏中的具体实现方式（业务验收边界）。
-            //    修正回合没抽到新实体时直接沿用上一版草案，省去一次重复的策划 LLM 调用。
-            val draftPlan = if (recognition.emptyEntities && priorConfirmation?.draftPlan != null) {
-                priorConfirmation.draftPlan
-            } else {
-                draftPlanWithLlm(schema, s, instruction, llm)
+            // 3) 策划层：策划子 Agent 拿到识别层共享的 module_list，逐项策划每个
+            //    module 在这款游戏中的具体实现方式（业务验收边界）。
+            //    确认门修正回合走重组：删除的 module 直接移除（无 LLM），
+            //    追加/修改的 module 才重新 LLM 策划，未涉及的沿用上一版结果；
+            //    修正回合没抽到新实体时直接沿用上一版草案，省去一次策划 LLM 调用。
+            val priorPlan = priorConfirmation?.draftPlan
+            val touchedModules = recognition.appliedPatch
+                ?.let { patch -> (patch.gameSystems + patch.reAddSystems).filter { GameSystemCatalog.isValid(it) } }
+                .orEmpty()
+                .distinct()
+            val draftPlan = when {
+                recognition.emptyEntities && priorPlan != null -> priorPlan
+                priorPlan == null -> draftPlanWithLlm(schema, s, instruction, llm)
+                else -> reorganizePlanWithLlm(schema, priorPlan, touchedModules, instruction, llm)
             }
             currentCoroutineContext().ensureActive()
 
@@ -469,14 +492,16 @@ class GameAgent(
                 userRequest = effectiveRequest,
                 schema = schema,
                 draftPlan = draftPlan,
-                isNewGame = recognition.isNewGame
+                isNewGame = recognition.isNewGame,
+                revised = priorConfirmation != null
             )
-            val assistantReply = confirmationMessage(
-                confirmation,
-                if (priorConfirmation != null) "已根据你的补充重新整理需求" else "已识别需求"
-            )
+            // 确认卡作为消息写入聊天流：确认/重组后卡片始终保留在对话中，
+            // 仅最后一张与 pendingConfirmation 匹配的卡片可交互，其余只读回显。
             val next = _session.value.copy(
-                messages = _session.value.messages + ChatMessage("assistant", assistantReply),
+                messages = _session.value.messages + ChatMessage(
+                    ChatMessage.ROLE_CONFIRM_CARD,
+                    IntentConfirmation.cardContent(confirmation)
+                ),
                 pendingConfirmation = confirmation,
                 gameSchema = schema,
                 isGenerating = false,
@@ -584,6 +609,34 @@ class GameAgent(
         )
     }
 
+    /**
+     * 确认门重组：追加/修改的 module 由策划子 Agent 重新策划，删除的直接移除，
+     * 未涉及的沿用上一版结果（无 LLM 调用）。
+     */
+    private suspend fun reorganizePlanWithLlm(
+        schema: GameSchema,
+        priorPlan: DesignPlan,
+        touchedModules: List<String>,
+        instruction: String,
+        llm: LlmClient
+    ): DesignPlan {
+        val replan = PlanningEngine.modulesNeedingReplan(schema, priorPlan, touchedModules)
+        val stage = if (replan.isEmpty()) {
+            "游戏策划中：已按你的修正直接增删系统，无需重新策划"
+        } else {
+            "游戏策划中：正在重新策划（${replan.joinToString("、")}），其余系统沿用已确认方案"
+        }
+        _session.value = _session.value.copy(agentStage = stage)
+        return PlanningEngine.reorganizeWithLlm(
+            schema = schema,
+            previousPlan = priorPlan,
+            touchedModules = touchedModules,
+            llm = llm,
+            currentUserRequest = instruction,
+            existingTitle = _session.value.designPlan?.title
+        )
+    }
+
     /** 兼容旧会话：没有 gameSchema 但已有设计稿或代码时，视为已经锚定了一个游戏。 */
     private fun legacyAnchoredSchema(session: GameSession): GameSchema? {
         session.gameSchema?.let { return it }
@@ -604,21 +657,6 @@ class GameAgent(
         } else {
             null
         }
-    }
-
-    /** 确认门消息：摘要 + 每个系统的具体玩法与验收边界 + 操作提示。 */
-    private fun confirmationMessage(confirmation: IntentConfirmation, prefix: String): String = buildString {
-        append(prefix)
-        append("：\n")
-        append(confirmation.summary)
-        if (confirmation.systemExplanations.isNotEmpty()) {
-            append("\n\n游戏系统玩法与验收边界：\n")
-            confirmation.systemExplanations.forEach { append("· $it\n") }
-        }
-        if (confirmation.excludedSystems.isNotEmpty()) {
-            append("\n已排除系统：${confirmation.excludedSystems.joinToString("、")}")
-        }
-        append("\n请点击下方唯一的确认按钮，确认后我会按此方案生成代码；如需修改，直接在底部输入框输入新的要求。")
     }
 
     private suspend fun generateChatReply(s: GameSession, instruction: String, llm: LlmClient) {

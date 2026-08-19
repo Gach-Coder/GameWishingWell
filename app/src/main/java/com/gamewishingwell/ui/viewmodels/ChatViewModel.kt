@@ -49,8 +49,9 @@ class ChatViewModel(
         viewModelScope.launch { agent.fixWithError(error) }
     }
 
-    fun confirmIntent() {
-        viewModelScope.launch { agent.confirmIntent() }
+    /** 确认门入口；[uncheckedModules] 为卡片上取消勾选、玩家不希望实现的系统。 */
+    fun confirmIntent(uncheckedModules: Set<String> = emptySet()) {
+        viewModelScope.launch { agent.confirmIntent(uncheckedModules) }
     }
 
     fun saveAs(title: String, onDone: (GameMeta?) -> Unit) {

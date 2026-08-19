@@ -112,13 +112,49 @@ object PlanningEngine {
     fun finalize(
         schema: GameSchema,
         confirmedDraft: DesignPlan? = null,
-        existingTitle: String? = null
+        existingTitle: String? = null,
+        uncheckedModules: Set<String> = emptySet()
     ): DesignPlan {
-        val base = confirmedDraft ?: build(schema, existingTitle)
+        val effectiveSchema = schemaApplyingUnchecked(schema, uncheckedModules)
+        val base = confirmedDraft ?: build(effectiveSchema, existingTitle)
         val title = existingTitle ?: base.title
-        return base.copy(
-            title = title,
-            designAssumptions = base.designAssumptions.ifEmpty { RecognitionEngine.buildAssumptions(schema) }
+        if (uncheckedModules.isEmpty()) {
+            return base.copy(
+                title = title,
+                designAssumptions = base.designAssumptions.ifEmpty { RecognitionEngine.buildAssumptions(effectiveSchema) }
+            )
+        }
+
+        // 确认门取消勾选的 module：直接从已确认草案中剔除（无 LLM 调用），
+        // 派生字段（主系统/模板class/P0-P2/验收/排除清单）按剩余 module 重建。
+        // 区别于明确排除：未勾选 module 不进入 excluded_systems，提示词中完全不出现，
+        // 生成层只是“不在本轮范围内”，不是“禁止实现”。
+        val implByModule = base.implementations.associateBy { it.system }
+        val remaining = effectiveSchema.gameSystems
+            .filter { GameSystemCatalog.isValid(it) && it !in uncheckedModules }
+            .distinct()
+        val implementations = remaining.map { module ->
+            implByModule[module] ?: staticImplementation(effectiveSchema, module)
+        }
+        val assembled = assemblePlan(effectiveSchema, title, remaining, implementations)
+        return assembled.copy(
+            designAssumptions = assembled.designAssumptions.ifEmpty { RecognitionEngine.buildAssumptions(effectiveSchema) }
+        )
+    }
+
+    /**
+     * 把确认门取消勾选的 module 落到 Game Schema：移出本轮实现范围并记入
+     * uncheckedSystems；不写入 excludedSystems（那是玩家文本明确排除的语义）。
+     */
+    fun schemaApplyingUnchecked(schema: GameSchema, uncheckedModules: Set<String>): GameSchema {
+        if (uncheckedModules.isEmpty()) return schema
+        val valid = uncheckedModules.filter { GameSystemCatalog.isValid(it) }.toSet()
+        if (valid.isEmpty()) return schema
+        return GameSchemaValidator.validate(
+            schema.copy(
+                gameSystems = schema.gameSystems.filter { it !in valid },
+                uncheckedSystems = (schema.uncheckedSystems + valid).distinct()
+            )
         )
     }
 
@@ -136,15 +172,67 @@ object PlanningEngine {
         val base = build(schema, existingTitle)
         if (base.gameSystems.isEmpty()) return base
 
-        val reply = try {
-            collectPlanningReply(llm, schema, currentUserRequest)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            null
-        }
-        val elaborations = reply?.let { parseLlmSystemDesigns(it) }.orEmpty()
+        val elaborations = requestLlmDesigns(llm, schema, base.gameSystems, currentUserRequest)
         return applyLlmSystemDesigns(base, schema, elaborations)
+    }
+
+    /**
+     * 确认门重组：策划子 Agent 只对“追加或修改的 module”重新 LLM 策划，
+     * 删除的 module 直接移除（无 LLM 调用），未涉及的 module 沿用上一版策划结果。
+     *
+     * @param touchedModules 本轮用户文本明确点名的 module（识别补丁的 gameSystems + reAddSystems），
+     *   视为“修改”，即使上一版已有其实现也要重新策划。
+     */
+    suspend fun reorganizeWithLlm(
+        schema: GameSchema,
+        previousPlan: DesignPlan,
+        touchedModules: Collection<String>,
+        llm: LlmClient,
+        currentUserRequest: String? = null,
+        existingTitle: String? = null
+    ): DesignPlan {
+        val target = schema.gameSystems
+            .filter {
+                GameSystemCatalog.isValid(it) &&
+                    it !in schema.excludedSystems &&
+                    it !in schema.uncheckedSystems
+            }
+            .distinct()
+        val replan = modulesNeedingReplan(schema, previousPlan, touchedModules)
+
+        val previousByModule = previousPlan.implementations.associateBy { it.system }
+        val staticByModule = build(schema, existingTitle ?: previousPlan.title)
+            .implementations.associateBy { it.system }
+
+        val designs = requestLlmDesigns(llm, schema, replan, currentUserRequest)
+            .associateBy { it.system }
+
+        val implementations = target.mapNotNull { module ->
+            when {
+                module in replan -> {
+                    val design = designs[module]
+                    val fallback = previousByModule[module] ?: staticByModule[module]
+                    if (design == null) fallback else mergeLlmDesign(fallback, design)
+                }
+                // 未涉及的 module 沿用上一版策划（含 LLM 阐述），不重复调用 LLM。
+                else -> previousByModule[module] ?: staticByModule[module]
+            }
+        }
+        return assemblePlan(schema, existingTitle ?: previousPlan.title, target, implementations)
+    }
+
+    /**
+     * 重组时需要重新策划的 module：
+     * 1) 上一版没有的新增 module；2) 本轮用户文本点名的修改 module。
+     * 其余（包括被删除的）都不需要 LLM。
+     */
+    fun modulesNeedingReplan(
+        schema: GameSchema,
+        previousPlan: DesignPlan,
+        touchedModules: Collection<String>
+    ): List<String> {
+        val previous = previousPlan.gameSystems.toSet()
+        return schema.gameSystems.filter { it !in previous || it in touchedModules }
     }
 
     /**
@@ -225,35 +313,54 @@ object PlanningEngine {
     /** 新流程核心构建：Game Schema 中已经包含最终系统集合。 */
     fun build(schema: GameSchema, existingTitle: String? = null): DesignPlan {
         val excluded = schema.excludedSystems.toSet()
-        val fallbackSystems = listOf("反应躲避", "收集").filterNot { it in excluded }
+        val unchecked = schema.uncheckedSystems.toSet()
+        val fallbackSystems = listOf("反应躲避", "收集").filterNot { it in excluded || it in unchecked }
         val selected = schema.gameSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+            .filter { GameSystemCatalog.isValid(it) && it !in excluded && it !in unchecked }
             .distinct()
             .ifEmpty { fallbackSystems }
 
         val templateRef = schema.templateId?.let { TemplateLibrary.findById(it) }
+        // 模板补全同样尊重取消勾选：未勾选 module 不因模板建议值自动回到范围。
         val merged = (selected + (templateRef?.suggestedSystems ?: emptyList()))
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+            .filter { GameSystemCatalog.isValid(it) && it !in excluded && it !in unchecked }
             .distinct()
             .ifEmpty { fallbackSystems }
 
-        val primary = derivePrimarySystem(merged, templateRef?.id)
-        val matrixClass = "${schema.visualDimension}×${schema.screenOrientation}×${primary}"
+        val implementations = merged.map { staticImplementation(schema, it) }
+        return assemblePlan(schema, existingTitle ?: defaultTitle(schema), merged, implementations)
+    }
 
-        val implementations = merged.map { system ->
-            val spec = systemMatrix[system]
-            SystemImplementation(
+    /** 模板库/系统矩阵给出的静态实现：LLM 策划的种子与回退。 */
+    private fun staticImplementation(schema: GameSchema, system: String): SystemImplementation {
+        val spec = systemMatrix[system]
+        return SystemImplementation(
+            system = system,
+            methods = GameSystemCatalog.implementationMethods(
                 system = system,
-                methods = GameSystemCatalog.implementationMethods(
-                    system = system,
-                    dimension = schema.visualDimension,
-                    orientation = schema.screenOrientation,
-                    templateId = schema.templateId
-                ),
-                layer = TemplateSystemCatalog.resolve(schema.templateId, system)?.layer ?: spec?.layer ?: 2,
-                acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system, schema.templateId)
-            )
-        }
+                dimension = schema.visualDimension,
+                orientation = schema.screenOrientation,
+                templateId = schema.templateId
+            ),
+            layer = TemplateSystemCatalog.resolve(schema.templateId, system)?.layer ?: spec?.layer ?: 2,
+            acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system, schema.templateId)
+        )
+    }
+
+    /**
+     * 由“已确定的 module 列表 + 每项实现方式”组装完整策划 Schema：
+     * 主系统/模板class/P0-P2/验收清单/排除清单等派生字段全部由此重建，
+     * 首次策划、确认门重组、确认剔除共用同一套派生逻辑。
+     */
+    private fun assemblePlan(
+        schema: GameSchema,
+        title: String,
+        systems: List<String>,
+        implementations: List<SystemImplementation>
+    ): DesignPlan {
+        val templateRef = schema.templateId?.let { TemplateLibrary.findById(it) }
+        val primary = derivePrimarySystem(systems, schema.templateId)
+        val matrixClass = "${schema.visualDimension}×${schema.screenOrientation}×${primary}"
 
         val p0 = linkedSetOf<String>()
         val p1 = linkedSetOf<String>()
@@ -270,25 +377,24 @@ object PlanningEngine {
         p1 += "音效反馈（WebAudio）"
         p2 += "界面动效与难度曲线"
 
-        val acceptance = buildAcceptance(schema, implementations, templateRef)
-        val lines = 220 + merged.size * 60
-        val scripts = 1 + if (merged.size >= 4) 1 else 0
+        val lines = 220 + systems.size * 60
+        val scripts = 1 + if (systems.size >= 4) 1 else 0
 
         return DesignPlan(
             templateClass = matrixClass,
-            title = existingTitle ?: defaultTitle(schema),
+            title = title,
             visualDimension = schema.visualDimension,
             screenOrientation = schema.screenOrientation,
             primarySystem = primary,
-            gameSystems = merged,
+            gameSystems = systems,
             p0Features = p0.toList(),
             p1Features = p1.toList(),
             p2Features = p2.toList(),
-            acceptanceChecklist = acceptance,
+            acceptanceChecklist = buildAcceptance(schema, implementations, templateRef),
             complexityBudget = ComplexityBudget(estimatedLines = lines, estimatedScripts = scripts),
             designAssumptions = RecognitionEngine.buildAssumptions(schema),
             implementations = implementations,
-            excludedSystems = buildExcludedSystems(schema, merged),
+            excludedSystems = buildExcludedSystems(schema, systems),
             excludedApproaches = buildExcludedApproaches(schema, templateRef)
         )
     }
@@ -351,22 +457,64 @@ object PlanningEngine {
             .distinctBy { it.system }
     }
 
+    /**
+     * 策划子 Agent LLM 调用：只为 [systems] 中列出的 module 请求策划结果。
+     * LLM 异常/输出非法时返回空列表，由调用方回退到静态种子或上一版实现。
+     */
+    private suspend fun requestLlmDesigns(
+        llm: LlmClient,
+        schema: GameSchema,
+        systems: List<String>,
+        currentUserRequest: String?
+    ): List<LlmSystemDesign> {
+        if (systems.isEmpty()) return emptyList()
+        val reply = try {
+            collectPlanningReply(llm, schema, currentUserRequest, systems)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+        return reply?.let { parseLlmSystemDesigns(it) }.orEmpty()
+    }
+
     private suspend fun collectPlanningReply(
         llm: LlmClient,
         schema: GameSchema,
-        currentUserRequest: String?
+        currentUserRequest: String?,
+        systems: List<String>
     ): String {
         val sb = StringBuilder()
         llm.streamChat(
             listOf(
-                ChatMessage("system", GamePrompt.planningSystemPrompt()),
-                ChatMessage("user", GamePrompt.planningPrompt(schema, currentUserRequest))
+                ChatMessage("system", GamePrompt.planningSystemPrompt(systems.size < schema.gameSystems.size)),
+                ChatMessage("user", GamePrompt.planningPrompt(schema, currentUserRequest, systems))
             ),
             onDelta = { sb.append(it) },
             onThinking = {},
             onDone = {}
         )
         return sb.toString()
+    }
+
+    /** 单个 module 的 LLM 策划结果覆盖到回退实现上；缺失字段保留回退值。 */
+    private fun mergeLlmDesign(
+        fallback: SystemImplementation?,
+        design: LlmSystemDesign
+    ): SystemImplementation {
+        val methods = design.methods
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .take(6)
+            .ifEmpty { fallback?.methods ?: emptyList() }
+        return SystemImplementation(
+            system = design.system,
+            methods = methods,
+            layer = design.layer.takeIf { it in 0..2 } ?: fallback?.layer ?: 2,
+            acceptanceBoundary = design.acceptanceBoundary.trim().ifBlank { fallback?.acceptanceBoundary ?: "" },
+            playerFacing = design.implementation.trim()
+        )
     }
 
     /** 把 LLM 系统阐述覆盖到静态草案上；LLM 缺失/非法系统保留静态实现。 */
@@ -383,48 +531,9 @@ object PlanningEngine {
 
         val implementations = base.implementations.map { old ->
             val llm = validBySystem[old.system]
-            if (llm == null) {
-                old
-            } else {
-                val methods = llm.methods
-                    .map { it.trim() }
-                    .filter { it.isNotBlank() }
-                    .distinct()
-                    .take(6)
-                    .ifEmpty { old.methods }
-                SystemImplementation(
-                    system = old.system,
-                    methods = methods,
-                    layer = llm.layer.takeIf { it in 0..2 } ?: old.layer,
-                    acceptanceBoundary = llm.acceptanceBoundary.trim().ifBlank { old.acceptanceBoundary },
-                    playerFacing = llm.implementation.trim()
-                )
-            }
+            if (llm == null) old else mergeLlmDesign(old, llm)
         }
-
-        val p0 = linkedSetOf<String>()
-        val p1 = linkedSetOf<String>()
-        val p2 = linkedSetOf<String>()
-        p0 += coreP0Features
-        implementations.forEach { impl ->
-            val params = impl.methods.take(4).map { "${impl.system}：$it" }
-            when (impl.layer) {
-                0 -> p0 += params
-                1 -> p1 += params
-                else -> p2 += params
-            }
-        }
-        p1 += "音效反馈（WebAudio）"
-        p2 += "界面动效与难度曲线"
-
-        val templateRef = schema.templateId?.let { TemplateLibrary.findById(it) }
-        return base.copy(
-            p0Features = p0.toList(),
-            p1Features = p1.toList(),
-            p2Features = p2.toList(),
-            implementations = implementations,
-            acceptanceChecklist = buildAcceptance(schema, implementations, templateRef)
-        )
+        return assemblePlan(schema, base.title, base.gameSystems, implementations)
     }
 
     private fun derivePrimarySystem(systems: List<String>, templateId: String?): String {
@@ -459,11 +568,12 @@ object PlanningEngine {
      * 策划层的排除清单：
      * 1) 玩家明确排除的系统；
      * 2) 白名单里未进入本次范围的其他系统，生成层不得擅自添加。
+     * 取消勾选的系统不属于任何一类：不进硬性排除清单，仅从本轮范围移除。
      */
     private fun buildExcludedSystems(schema: GameSchema, selected: List<String>): List<String> {
         val result = linkedSetOf<String>()
         result += schema.excludedSystems.filter { GameSystemCatalog.isValid(it) }
-        result += GameSystemCatalog.ALL.filterNot { it in selected }
+        result += GameSystemCatalog.ALL.filterNot { it in selected || it in schema.uncheckedSystems }
         return result.toList()
     }
 

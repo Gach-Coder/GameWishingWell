@@ -50,8 +50,17 @@ object GamePrompt {
     fun readTemplate(context: Context): String =
         context.assets.open("game_template.html").bufferedReader().use { it.readText() }
 
-    /** 策划层 LLM 的 system 提示词：只负责把每个系统解释成“这款游戏里的具体实现”。 */
-    fun planningSystemPrompt(): String = """
+    /**
+     * 策划层 LLM 的 system 提示词：只负责把每个系统解释成“这款游戏里的具体实现”。
+     * [partial] 为 true 时表示这是确认门重组：只需输出本轮点名的 module，其余沿用已确认方案。
+     */
+    fun planningSystemPrompt(partial: Boolean = false): String {
+        val scopeRule = if (partial) {
+            "1. 本轮是方案重组：只需输出任务中列出的系统（其余系统已按之前确认的方案保留，不要输出）；"
+        } else {
+            "1. 只能输出 systems 中列出的系统，不得新增系统；"
+        }
+        return """
         你是游戏策划。用户确认了 Game Schema JSON 中的系统范围，你需要逐项说明：
         “这个系统在这款具体游戏里到底怎么玩、有什么内容、做到什么程度才算验收通过”。
 
@@ -71,22 +80,35 @@ object GamePrompt {
         }
 
         规则：
-        1. 只能输出 systems 中列出的系统，不得新增系统；
+$scopeRule
         2. implementation 必须结合 reference_game/template 和用户需求，说明该系统在这款游戏里的具体内容，例如黄金矿工的道具系统要说明有黄金/石头/炸弹、黄金和石头随体积越大价值越大、石头更廉价等；
         3. methods 是给代码生成层的具体实现要点，可以有“钩子前端与道具做圆形碰撞判定”这类确定性规则；
         4. layer：0=P0 核心玩法、1=P1 重要特性、2=P2 打磨项；
         5. 排除系统不得出现。
-    """.trimIndent()
+        """.trimIndent()
+    }
 
-    /** 策划层 LLM 输入：会话级 Game Schema JSON + 首轮需求 + 模板库种子实现。 */
-    fun planningPrompt(schema: GameSchema, currentUserRequest: String? = null): String {
-        val seedSystems = schema.gameSystems.joinToString("\n") { system ->
+    /**
+     * 策划层 LLM 输入：会话级 Game Schema JSON + 首轮需求 + 模板库种子实现。
+     * [systems] 为本轮要策划的 module 子集（重组时只含追加/修改项，默认全量）。
+     */
+    fun planningPrompt(
+        schema: GameSchema,
+        currentUserRequest: String? = null,
+        systems: List<String> = schema.gameSystems
+    ): String {
+        val seedSystems = systems.joinToString("\n") { system ->
             "  - $system：种子方法=${GameSystemCatalog.implementationMethods(
                 system, schema.visualDimension, schema.screenOrientation, schema.templateId
             ).joinToString("|")}；种子验收=${GameSystemCatalog.acceptanceBoundary(system, schema.templateId)}"
         }
+        val scopeNote = if (systems.size < schema.gameSystems.size) {
+            "请只策划 <modules_to_plan> 中列出的系统（其余系统沿用已确认方案，不要输出）。"
+        } else {
+            "请为以下 Game Schema 中的每个系统，策划出它在这款游戏里的具体实现方式。"
+        }
         return """
-        请为以下 Game Schema 中的每个系统，策划出它在这款游戏里的具体实现方式。
+        $scopeNote
 
         <game_schema>
         schema_version:${schema.schemaVersion}
@@ -100,6 +122,10 @@ object GamePrompt {
         first_user_request:${schema.firstUserRequest ?: "（无）"}
         current_user_request:${currentUserRequest ?: schema.lastUserRequest ?: "（无）"}
         </game_schema>
+
+        <modules_to_plan>
+${systems.joinToString(",")}
+        </modules_to_plan>
 
         <template_seed>
 $seedSystems
