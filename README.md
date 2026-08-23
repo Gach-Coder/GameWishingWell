@@ -34,88 +34,6 @@
 - 🔐 **API Key 加密存储** —— Android Keystore AES-GCM 加密
 - ⚙️ **多厂商 LLM 配置** —— DeepSeek / Kimi / OpenAI / Anthropic Claude / 自定义，支持修改 Base URL、模型名、系统提示词、思考能力开关，并可"测试连接"
 
-## 🧠 Agent 工作流
-
-一次创作请求在 Agent 内部经过以下分层处理：
-
-```mermaid
-flowchart TD
-    A[用户输入] --> B{意图层<br/>feature / bug / chat}
-    B -- chat --> C[纯文本回复<br/>readonly 不改文件]
-    B -- feature / bug --> D{识别层<br/>Game Schema JSON}
-    D --> E[策划层<br/>逐系统策划实现方式]
-    E --> F{确认门<br/>卡片回显勾选}
-    F -- 用户输入修正 --> E
-    F -- 用户确认 --> G[决策层<br/>完整策划 Schema JSON]
-    G --> H[Agent Loop<br/>plan → implement → validate]
-    H -- 校验失败 --> H
-    H -- 校验通过 --> I[WebView 运行游戏]
-    I -- 运行时报错 --> H
-    I -- 用户继续迭代 --> H
-    I --> J[✅ 保存游戏库<br/>快照 + 增量持久化]
-```
-
-<details>
-<summary><b>📋 各层职责详解（点击展开）</b></summary>
-
-| 层级 | 职责 |
-| --- | --- |
-| **意图层** | 分类用户意图：`feature`（增/改/删游戏特性）、`bug`（程序异常）、`chat`（纯聊天询问，不改动任何文件） |
-| **识别层** | 正则 + Lite LLM 抽取游戏特征（画面维度、画面方向、游戏系统、对标游戏），补全或修正会话级 Game Schema JSON；先过 JSON Schema + 枚举白名单校验；对标游戏映射到内部模板库 `template_id` |
-| **策划层** | 策划子 Agent 针对每个 module（人物实体、道具、战斗、技能、关卡等）阐述合理实现方式与验收边界，不涉及引擎/算法等底层技术细节 |
-| **确认门** | 卡片回显策划结果，每个 module 带勾选框（默认勾选）；用户可点确认，或再次输入文本修正（增删 module / 调整实现），回到策划层重组摘要，直到确认 |
-| **决策层** | 按用户最终确认的信息输出完整策划 Schema JSON；按 `template_class`（画面维度×画面方向×主类型）选取特征矩阵，只做"选系统 + 覆盖参数"，不自由发明 |
-| **Agent Loop** | 先出文件计划和依赖顺序 → implement → validate，中途不换文件切分方案；上下文最小化（rolling summary + 本次要动的文件）；生成代码契约：无 eval、无动态 require、浏览器全局白名单、声明前置；不设超时与重试预算 |
-| **持久化** | GameSession 持久化：文件清单、设计 Schema、known-issues、决策 log、`schema_version`，每通过校验的版本打快照（可回滚）+ 增量持久化（只存变更文件） |
-
-</details>
-
-## 🏗️ 技术栈
-
-| 分类 | 技术 |
-| --- | --- |
-| 语言 / 构建 | Kotlin 2.0.21 · Gradle Wrapper 8.11.1 · AGP 8.9.1 · JDK 17 |
-| UI | Jetpack Compose（BOM 2024.12.01）· Material 3 · Navigation Compose 2.8.5 |
-| 架构 | 单 Activity + Compose · MVVM（ViewModel + StateFlow）· 手动 DI（AppContainer） |
-| 网络 / 序列化 | OkHttp 4.12.0（LLM SSE 流式）· kotlinx-serialization-json 1.7.3 |
-| 异步 / WebView | kotlinx-coroutines 1.9.0 · androidx.webkit 1.12.1 |
-| 安全 | Android Keystore AES-GCM（API Key 加密存储） |
-| 测试 | JUnit 4.13.2 · OkHttp MockWebServer 4.12.0 |
-| SDK | minSdk 26 · targetSdk / compileSdk 36 · versionName 0.1.0 |
-
-## 📁 项目结构
-
-```text
-GameWishingWell/
-├─ gradle/libs.versions.toml          # 全工程版本目录（version catalog）
-└─ app/src/
-   ├─ main/
-   │  ├─ assets/game_template.html    # 首次生成时给 LLM 的示例游戏模板
-   │  └─ java/com/gamewishingwell/
-   │     ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
-   │     ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
-   │     ├─ agent/                    # 创作Agent 核心
-   │     │  ├─ GameAgent.kt           #   核心状态机 / Agent Loop
-   │     │  ├─ GameIntent.kt          #   意图层（feature/bug/chat）
-   │     │  ├─ GameRecognition.kt     #   识别层：Schema JSON / 白名单 / 确认门
-   │     │  ├─ GamePlan.kt            #   策划层：P0/P1/P2、验收清单
-   │     │  ├─ GamePrompt.kt          #   system 提示词 / 代码契约
-   │     │  ├─ GameValidator.kt       #   JS/HTML 结构化校验
-   │     │  ├─ GameSmokeTest.kt       #   WebView 冒烟测试
-   │     │  ├─ GameFileWorkspace.kt   #   文件沙箱 / 版本化写入 / 行级 patch
-   │     │  └─ ...
-   │     ├─ llm/                      # LLM 客户端
-   │     │  ├─ LlmClient.kt           #   流式客户端统一接口
-   │     │  ├─ OpenAiCompatibleClient.kt
-   │     │  ├─ AnthropicClient.kt
-   │     │  └─ ProviderPreset.kt      #   厂商预设与协议枚举
-   │     ├─ data/                     # 游戏库 / 设置 / 加密存储
-   │     └─ ui/                        # Compose UI
-   │        ├─ home/ · chat/ · game/ · settings/
-   │        └─ viewmodels/
-   └─ test/                            # 本地 JVM 单元测试
-```
-
 ## 🚀 快速开始
 
 ### 环境要求
@@ -154,18 +72,18 @@ Debug APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 4. 在确认门卡片中勾选/确认游戏系统
 5. 生成完成后 **立即游玩**，或 **保存** 到 **我的游戏**
 
-## ⚙️ LLM 厂商预设
+## 🏗️ 技术栈
 
-| 厂商 | Base URL | 默认模型 | 协议 | 最大 tokens |
-| --- | --- | --- | --- | --- |
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-v4-flash` | OpenAI 兼容 | 16384 |
-| Kimi (Moonshot) | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` | OpenAI 兼容 | 16384 |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | OpenAI 兼容 | 16384 |
-| Claude | `https://api.anthropic.com` | `claude-sonnet-4-6` | Anthropic | 16384 |
-| 自定义 | 自填 | 自填 | OpenAI 兼容 | 8192 |
-
-> 💡 DeepSeek 默认模型为 `deepseek-v4-flash` / `deepseek-v4-pro`（`deepseek-chat` 已弃用）。
-> 设置页另有 **模型思考能力** 开关（默认关闭）：OpenAI 兼容协议关闭时发送 `thinking={"type":"disabled"}`，Anthropic 开启时发送 extended thinking。
+| 分类 | 技术 |
+| --- | --- |
+| 语言 / 构建 | Kotlin 2.0.21 · Gradle Wrapper 8.11.1 · AGP 8.9.1 · JDK 17 |
+| UI | Jetpack Compose（BOM 2024.12.01）· Material 3 · Navigation Compose 2.8.5 |
+| 架构 | 单 Activity + Compose · MVVM（ViewModel + StateFlow）· 手动 DI（AppContainer） |
+| 网络 / 序列化 | OkHttp 4.12.0（LLM SSE 流式）· kotlinx-serialization-json 1.7.3 |
+| 异步 / WebView | kotlinx-coroutines 1.9.0 · androidx.webkit 1.12.1 |
+| 安全 | Android Keystore AES-GCM（API Key 加密存储） |
+| 测试 | JUnit 4.13.2 · OkHttp MockWebServer 4.12.0 |
+| SDK | minSdk 26 · targetSdk / compileSdk 36 · versionName 0.1.0 |
 
 ## ❓ 常见问题
 
@@ -197,11 +115,3 @@ Debug APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
 - 当前版本 `0.1.0`（versionCode 1），release 暂关闭混淆
 - 仓库使用 Aliyun 镜像优先（gradle-plugin / google / public），`google()` / `mavenCentral()` 兜底
-
----
-
-<div align="center">
-
-**⛲ 许愿井 Wishwell —— 向井里许个愿，AI 帮你把游戏做出来。**
-
-</div>
