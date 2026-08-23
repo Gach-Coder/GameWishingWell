@@ -4,6 +4,7 @@
 
 **安卓端 AI 游戏创作 Agent 平台 —— 一句话描述，即刻生成、即刻游玩**
 
+[![CI](https://github.com/Gach-Coder/GameWishingWell/actions/workflows/ci.yml/badge.svg)](https://github.com/Gach-Coder/GameWishingWell/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/Platform-Android-3DDC84?logo=android&logoColor=white)](https://developer.android.com)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-4285F4?logo=jetpackcompose&logoColor=white)](https://developer.android.com/compose)
