@@ -18,10 +18,12 @@ class GamePlanningLlmTest {
             messages: List<ChatMessage>,
             onDelta: (String) -> Unit,
             onThinking: (String) -> Unit,
-            onDone: () -> Unit
-        ) {
+            onDone: () -> Unit,
+            tools: List<com.gamewishingwell.llm.ToolSpec>
+        ): com.gamewishingwell.llm.LlmResponse {
             onDelta(reply)
             onDone()
+            return com.gamewishingwell.llm.LlmResponse(text = reply)
         }
     }
 
@@ -34,11 +36,13 @@ class GamePlanningLlmTest {
             messages: List<ChatMessage>,
             onDelta: (String) -> Unit,
             onThinking: (String) -> Unit,
-            onDone: () -> Unit
-        ) {
+            onDone: () -> Unit,
+            tools: List<com.gamewishingwell.llm.ToolSpec>
+        ): com.gamewishingwell.llm.LlmResponse {
             prompts += messages.filter { it.role == "user" }.joinToString("\n") { it.content }
             if (reply.isNotEmpty()) onDelta(reply)
             onDone()
+            return com.gamewishingwell.llm.LlmResponse(text = reply)
         }
     }
 

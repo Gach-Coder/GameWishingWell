@@ -1,6 +1,6 @@
 ============================================================
  许愿井 GameWishingWell — 安卓 AI 游戏 Agent 平台 · 工程说明
- 更新日期：2026-08-16
+ 更新日期：2026-09-02
 ============================================================
 
 一、项目简介
@@ -21,7 +21,7 @@
 	- 运行时 JS 报错会弹出覆盖层，可“让 AI 修复”；也可继续对话迭代（如“加连击计分”），修改基于上一个版本的游戏文件进行。
 	- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
-   DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 自定义，
+   DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 自定义，
    支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”。
    （注：Deepseek模型为deepseek-v4-flash和deepseek-v4-pro,已弃用deepseek-chat）
 
@@ -31,55 +31,90 @@
 
 二、Agent核心说明
 *前端 LLM SSE 显示 Agent 状态（游戏识别中/游戏策划中/游戏生成中/游戏校验中/对话回复中等）
+*UI 零错误细节纪律：用户只输入游戏需求、只关心进度与结果；消除 bug 是 Agent 的内部职责。
+	阶段进度词允许出现轮次计数与简短术语（第 N 轮 / 工具名如 editfile / 冒烟测试 / 兼容模式 / function calling 等），
+	但错误原文与 bug 细节（校验报错内容、stack、具体哪行什么变量）不得出现在任何用户可见文案中；
+	错误细节只进入模型上下文（tool_result 反馈/遗留问题注入）与决策日志（decisionLog 的"失败详情"，不对用户展示）；
+	用户可见文案只有三种：阶段进度（含轮次与术语）、成功结果（+试玩建议）、失败结果（进度已保留+重试/换模型建议，零细节）。
 Agent处理message流程如下：
-	**默认契约：一个对话框只制作一个游戏，不处理单对话框的多游戏需求bug Game Schema JSON 对话框级别全局唯一，后续修改即以此为基础
-	→ 意图层：(new feature/fix bug/chat)
-		分类用户意图，想制作或改进游戏(开发)，还是只是想聊天或询问游戏内容
-		new feature:	read/write，可调用工具开发游戏文件，首次创建游戏或后期追加功能
-		fix bug:		read/write，可调用工具开发游戏文件，后期修复游戏异常bug，游戏功能特性不变
-		chat:			readonly，不改动任何外部文件，也不改变游戏特性变量，纯文本输出任务
-					直接 build prompt → LLM 然后输出文本
-	→ 识别层：（意图层分类结果为 dev）
+	**默认契约：一个对话框只制作一个游戏，不处理单对话框的多游戏需求。 Game Schema JSON 对话框级别全局唯一，后续修改即以此为基础。
+	game_generated == false时(dev默认创建游戏)：
+		message → 意图层 → 识别层 → 策划层 → 确认门 → prompt → Agent Loop → HTML+CSS+JS game
+	game_generated == True时(dev默认修复或改进游戏)
+		message → 意图层 → prompt → Agent Loop → HTML+CSS+JS game
+	→ 意图层：(dev/chat 二分类；本地正则优先，置信度<0.8 时 Lite LLM 复核，LLM 自报置信度<0.6 视为不可联回落本地默认)
+		分类器只回答一个问题：用户是否想让游戏发生变化
+		dev:	创建/追加/改进/调整/修复游戏的一切诉求	file权限：read/write，可调用工具开发游戏文件, game_lock=true
+			默认偏向 dev：dev 误判成 chat 会丢弃用户的开发请求（致命），chat 误判成 dev 只多一次识别层调用后回退聊天（温和）
+		chat:	readonly，不改动任何外部文件，也不改变游戏特性变量，纯文本输出任务，直接 build prompt → LLM 然后输出文本
+			system prompt 附当前会话 rolling summary 作只读上下文（解决"它能联机吗"答非所问；readonly 约束文件不约束上下文）
+		修复快车道（不经文本分类，由会话状态推导）：已锚定游戏 且 lastError/lastErrorSignature 非空
+			（成功回合会把 lastError 清空，非空即"存在未消化的运行时错误"）→ 跳过识别/策划/确认门直通 Agent Loop，
+			指令以玩家本轮诉求为准（最小改动修复优先，不预设"功能特性不变"——玩家嘴里的异常可能实际是行为调整）
+		（feature/bug 之分下推给策划层与 Agent Loop：它们看得到代码与用户诉求，判得更准；
+		  new_game vs 迭代由会话级 Game Schema 是否为空判定，同样不靠分类）
+	(区分feature和module，feature包含module，feature可小为一个按钮的样子或位置，module为游戏中某个系统模块例如)
+	→ 识别层：
 		检测 Game Schema JSON 会话级的游戏Json 是否为空：
-			Json为空 → 对话历史不包含游戏 → 默认为首次制作游戏
-			Json非空 → 对话已经锚定某游戏 → 则默认改进这个游戏
-		正则 + Lite LLM 抽取游戏特征，补全或修正 Game Schema JSON 信息（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
-			若返回为空实体，则判断 message 为普通 chat （意图层可能误判漏判）
+			Json为空 → 对话历史不包含游戏 → 默认为首次 dev 对话
+			Json非空 → 对话已经锚定某游戏 
+		正则 + Lite LLM 抽取游戏特征（除非用户说明，游戏系统默认为可玩的最简洁版本），补全或修正 Game Schema JSON 信息（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
+	 		若返回为空实体，则判断 message 为普通 chat （意图层可能误判漏判）
 		解析实体包括：
 			画面维度：2D，2.5D，3D
 			画面方向：横板，竖版
 			游戏系统：人物实体，道具，战斗，技能，属性等级，关卡场景，AI策略，商店经济等。
 				(识别层事先定义较完整的游戏系统列表)
 			参考对标游戏：市场内的某著名游戏或无，可辅助补全游戏特性。（映射到内部模板库template_id + 相似度，映射不上返回 template:null）
-				若存在对标游戏 → 抽取对标游戏特性列表 → (无覆盖)填补至 Game Schema JSON 空位 
         例如"做一个2D版竖切面的我的世界游戏"：
-			第一步检测对标游戏<我的世界> -> ["3D","竖版",[人物实体,道具,战斗]] -> 初始化JSON
-			第二部抽取游戏特性 -> ["2D","",[]] -> 键值修正 + 列表元素追加或删除 -> 需求版JSON
-	→ 策划层：策划子Agent 拿到上游的系统列表module_list，例如[人物实体,道具,战斗]，针对每个 module 元素策划出在这个游戏中合理的实现方式（业务验收边界）
+			第一步检测对标游戏<我的世界> -> ["3D","竖版",[人物实体,道具,战斗]]
+			第二步抽取游戏特性 -> ["2D","",[]] -> 键值修正 + 列表元素追加或删除
+			得到 game_module_list 列表，初始化Game Schema JSON
+	→ 策划层：
+		策划子 Agent 拿到上游的系统列表 game_module_list，例如[人物实体,道具,战斗]，针对每个 module 元素策划出在这个游戏中合理的实现方式（业务验收边界）
 		例如<我的世界>游戏的"人物实体" module，简单诠释其在游戏的核心实现方式：用户可操作移动，有对应坐标...等
 		（不用策划出或和用户探讨具体的技术细节，例如游戏引擎，算法等底层技术或逻辑。这里只探讨游戏内容和玩法系统逻辑。）
 		若收到确认门的重组
-			追加或修改module —> 策划子Agent LLM 重新策划该module
-			删除module -> 直接删除，无LLM调用
+			追加或修改 module —> 策划子 Agent LLM 重新策划该module
+			删除 module -> 直接删除，无LLM调用
 	→ 确认门：用卡片回显上游游戏JSON的综合策划结果，
-		卡片中对于module_list的每个module都有一个可选框供用户勾选(默认为勾选，确认或取消勾选代表是否希望实现这个游戏系统)
+		卡片中对于 game_module_list 的每个 module 都有一个可选框供用户勾选(默认为勾选，确认或取消勾选代表是否希望实现这个游戏系统)
+		（勾选只做加法不做减法：勾选=纳入本轮实现范围；取消勾选=仅不纳入，不进任何禁止清单，后续文本点名该系统自动恢复；
+		  excluded_systems 只包含用户文本明确说"不要"的系统——任何未勾选/未提及的系统都不做禁止，模型按用户原话与最简可玩原则自行取舍；
+		  全部不勾选=裸需求模式——不套用预设系统清单，等价于用户原话直接交给 Agent，
+		  需要哪些玩法系统由模型按需求自行判断（最简可玩），照常进入 Agent Loop 不影响生成）
 		用户可点击卡片中确认按钮或再次输入文本修改，
 		若用户输入文本，判定为修正，可能增删module_list元素或修改某module的具体实现，则回到策划层重组摘要再次回显待确认，
 		直到用户点击确认则进入下一步。保留卡片于聊天框，只disable勾选框和按钮功能即可
 	→ 决策层：根据用户最后确认的完整信息(需要实现的系统以及对应实现方法，需要排除的系统和方案)，输出完整策划 Schema JSON
 		按 template_class（画面维度×画面方向×主类型）选取特征矩阵（系统×默认参数），只做"选系统+覆盖参数"，不自由发明
-	→ Prompt：system 提示词 + 用户指令/策划 Schema 上下文最小化：
-		只放 rolling summary + 本次要动的文件内容，其余靠readfile按需取）
-	→ Agent Loop：（不设超时与重试预算，默认用户可无限等待）
-		→ 先出文件计划和依赖顺序（plan）→ implement → validate，中途不换文件切分方案
-		→ tool call readfile/writefile 读/写已有的源码文件(HTML+CSS+JS)
-			写入用版本化文件 + 指针切换（或OPFS），替代临时文件+rename；同会话加锁 / 文件 hash校验防并发覆盖
-			修改已有文件用行级 patch，全量重写仅限首次生成
-			生成代码契约：无 eval、无动态require、浏览器全局白名单、声明前置；
-			校验用现成解析器（acorn 语法检查 + htmlparser2 HTML 配对 + eslint no-undef 规则），不自写 HTML 配对/作用域检查
-		→ 基本校验
-			语法和基本逻辑校验，尽量得到可运行的功能基本正确的游戏，校验成功后退出Agent Loop。
+	→ Prompt：根据用户最后确认的完整信息组成游戏内容提示文本加入system 提示词（工具模式：文件内容一律经工具写入，回复正文不出现代码）+ 上下文最小化：
+		首次生成放参考模板；迭代放 rolling summary（"最新内容请通过 readfile 获取"），其余靠工具按需取
+	→ Agent Loop：（硬上限防死循环：工具模式总轮次40 / 兼容模式15 / 同一错误签名连续10 / 连续24轮无文件修改，任一超限即如实失败终止并保留中间版本；网络层连接30s/读5min/写60s超时防蜂窝NAT死连接）
+		主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/editfile，沙箱严格限游戏工作区目录）
+			→ 模型发起 tool call → 宿主经 GameFileWorkspace 执行（版本化文件+指针切换+同会话加锁+hash防并发覆盖；
+			  修改用 old_string 逐字符精确替换且要求唯一（或 replace_all），全量重写仅限首次生成或 overwrite=true 结构性重构）
+			→ 每次写入后宿主自动跑基础校验器，结构化报告作为"观察"附在 tool_result 回传（校验是观察不是门，模型自己决定怎么修）
+			→ 模型不再发起工具调用即自然终止；修改轮验收要求最终内容哈希≠种子哈希（防"不做任何修改就宣称完成"的假成功）
+			→ 每次写入即刻发布中间版本到会话，中断后玩家可立即试玩
+		交付约束：交给用户前必须通过基础校验（0 error）与沙箱冒烟测试（同 WebView 内核确定性 tick 跑通），不存在"带错交付"
+		防死循环与交付约束：不做"带错交付"（交给用户前必须通过基础校验0 error与沙箱冒烟），但设有硬上限——
+			同一错误签名连续3次注入"换思路"提示、连续6次起强制"重写问题模块/换实现"（同签名次数写入阶段条供用户判断是否卡死）；
+			同一错误签名连续10次、总轮次40（工具模式）/15（兼容模式）、连续24轮无文件修改，任一触发即如实失败终止并保留最新中间版本（可试玩，属主动止损而非交付）；
+			熔断签名语义：按"单条错误"追踪（签名=类别+错误消息原文，保留变量名等标识符、不含行号），同一条错误连续N轮未被修掉才计数；
+			错误集合的其它变化（修好一条/新增一条）不清零顽固项的连续计数——聚合式整集合比较会把"修好A新增B、C始终没修"误判为进展而漏熔断，标识符归一化会把不同变量的同类错误合并误熔断，均已规避
+			用户停止键可随时中断（中断后保留中间版本可试玩，属用户主动选择）
+			冒烟测试失败但无任何错误信息（探针结果不可读等设施问题）视为测试设施异常，跳过冒烟不阻塞交付——探针运行在 srcdoc iframe 内，结果经 contentWindow 读取
+		协议层：OpenAI 兼容 delta.tool_calls 按 index 流式聚合（arguments 分片拼接）；Anthropic tool_use content block
+			解析与 tool_result 回填（连续工具结果合并进同一 user 消息满足角色交替）；
+			网关不支持 function calling（4xx 提及 tool/function）时去掉 tools 重试，模型首轮在正文直接输出整份 HTML 时
+			自动降级为"全量重写→抽取→校验→文本反馈"回环（每轮重建 prompt 不累积历史，保留为兼容模式）
+		生成代码契约：无 eval、无动态require、浏览器全局白名单、声明前置；
+		校验用现成解析器（Rhino AST 做 acorn 同等的语法检查+no-undef 作用域链 + jsoup 做 htmlparser2 同等 HTML 配对 + 资源自包含检查），不自写 HTML 配对/作用域检查
+		→ 基本校验(可正确运行测试)
+			语法和基本逻辑校验，得到可运行的功能基本正确的游戏，校验成功后退出Agent Loop。
 	→ HTML+CSS+JS game
+		game_generated = True
 	→（用户进入游戏测试和游玩）
 		→ 运行时报错（格式化回传：file:line + stack + console 片段）再回到Agent Loop 修复
 		→ 运行无报错，用户可选择输入文本改进游戏或报告缺陷，则回到Agent Loop 修复
@@ -94,8 +129,9 @@ Agent处理message流程如下：
   -----------------------------------------------------------------------------------------------------------------------
   DeepSeek		https://api.deepseek.com/v1		deepseek-v4-flash					OPENAI_COMPATIBLE	16384      否
   Kimi			https://api.moonshot.cn/v1		moonshot-v1-8k     					OPENAI_COMPATIBLE   16384      否
-  OpenAI		https://api.openai.com/v1		gpt-4o-mini        					OPENAI_COMPATIBLE   16384      否
+  OpenAI		https://api.openai.com/v1		gpt-4o-mini        					OPENAI_COMPATIBLE	16384      否
   Claude		https://api.anthropic.com		claude-sonnet-4-6					ANTHROPIC           16384      否
+  智谱 GLM		https://open.bigmodel.cn/api/paas/v4	glm-5.3-flash					OPENAI_COMPATIBLE	16384      否
   自定义         （留空自填）                    （留空自填）       						OPENAI_COMPATIBLE   8192       否
 
 （表中“关闭思考”为厂商预设级是否强制禁用；设置页另有“模型思考能力”开关，默认关闭：
@@ -150,9 +186,10 @@ GameWishingWell/
       │  ├─ java/com/gamewishingwell/
       │  │  ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
-      │  │  ├─ agent/
-      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / Agent Loop
-      │  │  │  ├─ GameIntent.kt          # 意图层：只分 develop/chat 两个意图
+	      │  │  ├─ agent/
+	      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / 工具模式 Agent Loop（含无工具降级回环与修复快车道）
+	      │  │  │  ├─ GameTools.kt           # 工具定义(listfiles/readfile/writefile/editfile) + 沙箱执行器（写后自动校验回传）
+	      │  │  │  ├─ GameIntent.kt          # 意图层：dev/chat 二分类（正则优先+Lite LLM 复核）；修复快车道由会话状态推导
       │  │  │  ├─ GameIntentLegacy.kt    # 旧版三意图 Schema/引擎，仅供历史会话与旧测试兼容
       │  │  │  ├─ GameRecognition.kt     # 识别层：会话级 Game Schema JSON、白名单校验、模板库、确认门
       │  │  │  ├─ GameTemplateSystems.kt # 对标模板的具体系统实现/验收边界（LLM 策划的种子与回退）

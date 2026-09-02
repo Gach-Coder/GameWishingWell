@@ -33,7 +33,7 @@
 - 🔄 **后台持续生成** —— 切换页面/对话时，生成任务在 ViewModel 协程与全局 GameAgent 中继续运行，完成后可在 WebView 中立刻游玩
 - 🖥️ **运行时增强（VIEWPORT_PRELUDE）** —— 自动修复 vh 视口问题、注入游戏内设置面板（音量控制/暂停/重新开始）、自动隐藏游戏自带的重复重开按钮
 - 🔐 **API Key 加密存储** —— Android Keystore AES-GCM 加密
-- ⚙️ **多厂商 LLM 配置** —— DeepSeek / Kimi / OpenAI / Anthropic Claude / 自定义，支持修改 Base URL、模型名、系统提示词、思考能力开关，并可"测试连接"
+- ⚙️ **多厂商 LLM 配置** —— DeepSeek / Kimi / OpenAI / Anthropic Claude / 智谱 GLM / 自定义，支持修改 Base URL、模型名、系统提示词、思考能力开关，并可"测试连接"
 
 ## 🚀 快速开始
 

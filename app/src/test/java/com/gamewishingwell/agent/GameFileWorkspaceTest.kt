@@ -61,4 +61,20 @@ class GameFileWorkspaceTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun `writeUpdated 全量替换并版本递增`() {
+        runBlocking {
+            val dir = File(System.getProperty("java.io.tmpdir"), "ws-update-${System.nanoTime()}")
+            val ws = GameFileWorkspace(dir)
+            ws.writeInitial("index.html", "v1")
+            val updated = ws.writeUpdated("index.html", "v2")
+            assertEquals(2, updated?.version)
+            assertEquals("v2", ws.read("index.html"))
+            assertTrue(File(dir, ".versions/1-index.html").exists())
+            // 不存在的文件不允许走 writeUpdated（首次必须 writeInitial）
+            assertNull(ws.writeUpdated("other.html", "x"))
+            dir.deleteRecursively()
+        }
+    }
 }

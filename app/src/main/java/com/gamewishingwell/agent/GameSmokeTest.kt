@@ -40,8 +40,8 @@ object NoopSmokeTestRunner : SmokeTestRunner {
  * DOMContentLoaded 后同步跑满最多 [MAX_FRAMES] 帧；任何帧内异常都会被捕获，
  * 同时设置超时兜底，防止定时器失控。替代 jsdom/Playwright。
  *
- * 简化后的主流程已不调用本探针，仅保留给单元测试与需要时的本地诊断；
- * 玩家实际试玩 + 运行时错误回传取代了生成阶段的自动冒烟测试。
+ * Agent Loop 在静态校验通过且内容确有变化后调用本探针验证“可正确运行”，
+ * 失败结果作为观察回填给模型继续修复（同签名熔断同样生效）。
  */
 object SmokeTestProbe {
     const val MAX_FRAMES = 8
@@ -113,7 +113,7 @@ object SmokeTestProbe {
 /**
  * 同 WebView 内核的隔离 iframe 冒烟测试：
  * 在离屏 WebView 中加载 [SmokeTestProbe] 注入后的 HTML，等待确定性 tick 结果。
- * 带 8 秒超时。保留为可选诊断工具，GameAgent 主流程已不再调用。
+ * 带 8 秒超时。由 GameAgent 在验收阶段调用（JVM 单测经注入点替换或跳过）。
  */
 class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner {
 
@@ -163,8 +163,10 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                     view.webViewClient = object : WebViewClient() {
                         override fun onPageFinished(view: WebView, url: String?) {
                             // 等探针 tick 完成后读取结构化结果。
+                            // 探针运行在 srcdoc iframe 内，结果挂在 iframe 的 window 上——
+                            // 必须经 contentWindow 读取；父 window 上取永远为 undefined。
                             view.postDelayed({
-                                val js = "(function(){try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed,f:r&&r.framesRun,e:r&&r.errors||[]});}catch(e){return JSON.stringify({p:false,f:0,e:[String(e)]});}})()"
+                                val js = "(function(){try{var w=null;try{var f=document.getElementById('__ww_game_frame');w=f&&f.contentWindow;}catch(e){}var r=(w&&w.__wwSmokeResult)||window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed,f:r&&r.framesRun,e:r&&r.errors||[]});}catch(e){return JSON.stringify({p:false,f:0,e:[String(e)]});}})()"
                                 view.evaluateJavascript(js) { value ->
                                     val result = parseProbeResult(value, consoleErrors.toList())
                                     finish(result)

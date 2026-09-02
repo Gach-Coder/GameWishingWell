@@ -58,3 +58,30 @@ object RetryBookkeeping {
     }
 
 }
+
+/**
+ * “顽固错误”追踪：熔断语义是“同一条错误连续 N 轮未被修掉”，而不是“整个错误
+ * 集合恰好完全相同”。单条签名 = hash(类别|消息原文)——
+ * - 保留变量名等标识符：同名未定义变量才算同一处失败，不同变量的错误签名不同；
+ * - 不含行号：行号随编辑漂移，不代表错误本身变化（消息文本里本就不含行号）。
+ * 聚合式签名有两个已知缺陷，本追踪器都规避：标识符归一化会把不同来源合并成
+ * 同一签名（误熔断）；整集合比较在“修好一条+新增一条”时清零计数，真正顽固的
+ * 错误永远数不满（漏熔断）。
+ */
+object StubbornErrorTracker {
+
+    /** 单条错误签名：同一条错误的签名跨轮稳定，不同错误（不同类别或不同消息）签名不同。 */
+    fun issueSignature(category: String, message: String): String =
+        ErrorSignature.hash("issue|" + category.trim() + "|" + message.trim())
+
+    /**
+     * 用本轮仍存在的错误更新连续计数：存在 +1（首次出现计 1），消失即移除。
+     * 集合的其它变化（修好一条/新增一条）不影响某条错误自己的连续计数。
+     */
+    fun update(prev: Map<String, Int>, currentSignatures: Set<String>): Map<String, Int> =
+        currentSignatures.associateWith { sig -> (prev[sig] ?: 0) + 1 }
+
+    /** 最顽固的错误：(签名, 连续轮数)；空集合返回 null。 */
+    fun worst(counts: Map<String, Int>): Pair<String, Int>? =
+        counts.maxByOrNull { it.value }?.toPair()
+}

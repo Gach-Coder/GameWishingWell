@@ -394,7 +394,7 @@ object PlanningEngine {
             complexityBudget = ComplexityBudget(estimatedLines = lines, estimatedScripts = scripts),
             designAssumptions = RecognitionEngine.buildAssumptions(schema),
             implementations = implementations,
-            excludedSystems = buildExcludedSystems(schema, systems),
+            excludedSystems = buildExcludedSystems(schema),
             excludedApproaches = buildExcludedApproaches(schema, templateRef)
         )
     }
@@ -541,7 +541,10 @@ object PlanningEngine {
         val byTemplate = templateId?.let { id ->
             TemplateLibrary.findById(id)?.suggestedSystems?.firstOrNull { systems.contains(it) }
         }
-        return byTemplate ?: priority.firstOrNull { systems.contains(it) } ?: systems.firstOrNull() ?: "反应躲避"
+        // 空系统时的回退必须是中性标签而不是某个具体系统名：伪装成系统名会同时
+        // 污染阶段条展示（"正在生成「反应躲避」"）与 design_schema 的 primary_system，
+        // 把生成往用户从未选择的系统上带。
+        return byTemplate ?: priority.firstOrNull { systems.contains(it) } ?: systems.firstOrNull() ?: "核心玩法"
     }
 
     private fun buildAcceptance(
@@ -565,17 +568,13 @@ object PlanningEngine {
     }
 
     /**
-     * 策划层的排除清单：
-     * 1) 玩家明确排除的系统；
-     * 2) 白名单里未进入本次范围的其他系统，生成层不得擅自添加。
-     * 取消勾选的系统不属于任何一类：不进硬性排除清单，仅从本轮范围移除。
+     * 策划层的排除清单：只包含玩家在文本里明确排除的系统（如“不要商店经济”）。
+     * 勾选机制是纯加法：design_schema.systems 即本轮要实现的范围，范围之外的
+     * 系统不做任何禁止——模型按用户原话与最简可玩原则自行取舍；
+     * 取消勾选 ≠ 禁止实现（后续文本点名该系统自动恢复）。
      */
-    private fun buildExcludedSystems(schema: GameSchema, selected: List<String>): List<String> {
-        val result = linkedSetOf<String>()
-        result += schema.excludedSystems.filter { GameSystemCatalog.isValid(it) }
-        result += GameSystemCatalog.ALL.filterNot { it in selected || it in schema.uncheckedSystems }
-        return result.toList()
-    }
+    private fun buildExcludedSystems(schema: GameSchema): List<String> =
+        schema.excludedSystems.filter { GameSystemCatalog.isValid(it) }.distinct()
 
     /** 由已确认的画面维度/方向推导必须排除的实现方案，并追加平台硬约束。 */
     private fun buildExcludedApproaches(schema: GameSchema, templateRef: GameTemplateRef?): List<String> {

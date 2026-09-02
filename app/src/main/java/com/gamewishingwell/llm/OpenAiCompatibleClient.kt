@@ -8,6 +8,9 @@ import kotlinx.coroutines.runInterruptible
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -22,6 +25,11 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * OpenAI 兼容协议的流式客户端（适用于 DeepSeek / Kimi(Moonshot) / OpenAI 等）。
  * 接口：POST {baseUrl}/chat/completions，SSE 输出 data: {...} / data: [DONE]。
+ *
+ * 工具调用：请求体携带 tools（function calling）；SSE 中 delta.tool_calls 按 index
+ * 分片到达（id/name 可能只出现一次、arguments 逐段追加），此处聚合成完整调用后
+ * 随 [LlmResponse] 返回。网关不支持 tools 字段时（4xx 且错误信息提及），
+ * 去掉该字段重试一次，模型将以纯文本回答——调用方可据此降级。
  */
 class OpenAiCompatibleClient(
     private val okHttp: OkHttpClient,
@@ -39,41 +47,63 @@ class OpenAiCompatibleClient(
         messages: List<ChatMessage>,
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit,
-        onDone: () -> Unit
-    ) {
+        onDone: () -> Unit,
+        tools: List<ToolSpec>
+    ): LlmResponse {
         // runInterruptible + activeCall.cancel()：停止键取消协程时会中断阻塞中的 OkHttp SSE 读取。
         // 这里不设任何超时，默认用户可无限等待；只有用户主动停止才会取消底层网络调用。
         val activeCall = AtomicReference<Call?>(null)
         currentCoroutineContext()[Job]?.invokeOnCompletion {
             activeCall.get()?.cancel()
         }
-        runInterruptible(Dispatchers.IO) {
+        return runInterruptible(Dispatchers.IO) {
             try {
-                executeStream(buildRequest(messages, includeMaxTokens = true, includeThinking = true), onDelta, onThinking, onDone, activeCall)
+                executeStream(
+                    buildRequest(messages, includeMaxTokens = true, includeThinking = true, tools = tools),
+                    onDelta, onThinking, onDone, activeCall
+                )
             } catch (e: LlmError) {
                 if (Thread.currentThread().isInterrupted) throw e
                 val msg = e.message ?: ""
                 when {
                     // 个别老模型不支持 max_tokens 字段，收到相关 4xx 时去掉该字段重试
                     msg.contains("max_tokens", ignoreCase = true) ->
-                        executeStream(buildRequest(messages, includeMaxTokens = false, includeThinking = true), onDelta, onThinking, onDone, activeCall)
+                        executeStream(
+                            buildRequest(messages, includeMaxTokens = false, includeThinking = true, tools = tools),
+                            onDelta, onThinking, onDone, activeCall
+                        )
                     // 个别网关不支持 thinking 字段，去掉后重试
                     msg.contains("thinking", ignoreCase = true) ->
-                        executeStream(buildRequest(messages, includeMaxTokens = true, includeThinking = false), onDelta, onThinking, onDone, activeCall)
+                        executeStream(
+                            buildRequest(messages, includeMaxTokens = true, includeThinking = false, tools = tools),
+                            onDelta, onThinking, onDone, activeCall
+                        )
+                    // 网关不支持 function calling：去掉 tools 重试，由调用方按纯文本回复降级处理
+                    tools.isNotEmpty() && msg.contains(Regex("tool|function", RegexOption.IGNORE_CASE)) ->
+                        executeStream(
+                            buildRequest(messages, includeMaxTokens = true, includeThinking = true, tools = emptyList()),
+                            onDelta, onThinking, onDone, activeCall
+                        )
                     else -> throw e
                 }
             }
         }
     }
 
-    private fun buildRequest(messages: List<ChatMessage>, includeMaxTokens: Boolean, includeThinking: Boolean): Request {
+    private fun buildRequest(
+        messages: List<ChatMessage>,
+        includeMaxTokens: Boolean,
+        includeThinking: Boolean,
+        tools: List<ToolSpec>
+    ): Request {
         val body = Json.encodeToString(
             OpenAiChatRequest(
                 model = model,
                 stream = true,
                 max_tokens = if (includeMaxTokens) maxTokens else null,
                 thinking = if (includeThinking && disableThinking) ThinkingConfig("disabled") else null,
-                messages = mergeConsecutive(messages)
+                messages = mergeConsecutive(messages).map { it.toWire() },
+                tools = tools.takeIf { it.isNotEmpty() }?.map { it.toWire() }
             )
         )
         return Request.Builder()
@@ -90,7 +120,7 @@ class OpenAiCompatibleClient(
         onThinking: (String) -> Unit,
         onDone: () -> Unit,
         activeCall: AtomicReference<Call?>
-    ) {
+    ): LlmResponse {
         val call = okHttp.newCall(request)
         activeCall.set(call)
         try {
@@ -107,47 +137,67 @@ class OpenAiCompatibleClient(
             var lastFinishReason: String? = null
             var lastPayloadTail: String? = null
             var endedByDone = false
+            val text = StringBuilder()
+            val aggregator = ToolCallAggregator()
             while (true) {
                 val line = source.readUtf8Line() ?: break
                 if (line.startsWith("data:")) {
                     val payload = line.removePrefix("data:").trim()
                     if (payload == "[DONE]") { endedByDone = true; break }
-                    val (content, reasoning) = parseDelta(payload)
                     lastPayloadTail = payload.takeLast(120)
                     try {
-                        lastFinishReason = Json.parseToJsonElement(payload).jsonObject["choices"]
-                            ?.jsonArray?.firstOrNull()?.jsonObject?.get("finish_reason")
-                            ?.jsonPrimitive?.contentOrNull ?: lastFinishReason
-                    } catch (e: Exception) { /* 忽略解析失败 */ }
-                    if (content != null || reasoning != null) {
-                        if (content != null) { contentChars += content.length; onDelta(content) }
-                        if (reasoning != null) { reasoningChars += reasoning.length; onThinking(reasoning) }
-                    }
+                        val el = Json.parseToJsonElement(payload).jsonObject
+                        lastFinishReason = el["choices"]?.jsonArray?.firstOrNull()?.jsonObject
+                            ?.get("finish_reason")?.jsonPrimitive?.contentOrNull ?: lastFinishReason
+                        val delta = el["choices"]?.jsonArray?.firstOrNull()
+                            ?.jsonObject?.get("delta")?.jsonObject
+                        val content = delta?.get("content")?.jsonPrimitive?.contentOrNull
+                        val reasoning = delta?.get("reasoning_content")?.jsonPrimitive?.contentOrNull
+                        val toolCallDeltas = delta?.get("tool_calls")?.jsonArray
+                        if (toolCallDeltas != null) aggregator.accept(toolCallDeltas)
+                        if (content != null) {
+                            text.append(content)
+                            contentChars += content.length
+                            onDelta(content)
+                        }
+                        if (reasoning != null) {
+                            reasoningChars += reasoning.length
+                            onThinking(reasoning)
+                        }
+                    } catch (e: Exception) { /* 忽略单帧解析失败 */ }
                 }
             }
+            val toolCalls = aggregator.build()
             android.util.Log.d(
                 "OpenAiClient",
                 "流结束: done=$endedByDone 推理字符=$reasoningChars 内容字符=$contentChars " +
-                    "finish_reason=$lastFinishReason 尾帧=$lastPayloadTail"
+                    "工具调用=${toolCalls.size} finish_reason=$lastFinishReason 尾帧=$lastPayloadTail"
             )
             onDone()
+            return LlmResponse(text = text.toString(), toolCalls = toolCalls)
             }
         } finally {
             activeCall.compareAndSet(call, null)
         }
     }
 
-    /** 返回 (最终内容, 思考过程)，推理模型思考阶段 content 为 null、reasoning_content 有值。 */
-    private fun parseDelta(payload: String): Pair<String?, String?> = try {
-        val el = Json.parseToJsonElement(payload).jsonObject
-        val delta = el["choices"]?.jsonArray?.firstOrNull()
-            ?.jsonObject?.get("delta")?.jsonObject
-        val content = delta?.get("content")?.jsonPrimitive?.contentOrNull
-        val reasoning = delta?.get("reasoning_content")?.jsonPrimitive?.contentOrNull
-        content to reasoning
-    } catch (e: Exception) {
-        null to null
-    }
+    /** OpenAI 线格式消息：assistant 携带 tool_calls 数组，工具结果走 role="tool" + tool_call_id。 */
+    private fun ChatMessage.toWire(): OpenAiMessage = OpenAiMessage(
+        role = if (role == "tool") "tool" else role,
+        content = content.ifBlank { if (toolCalls.isNotEmpty() || role == "tool") null else content },
+        tool_calls = toolCalls.takeIf { it.isNotEmpty() }?.map { tc ->
+            OpenAiToolCall(id = tc.id, function = OpenAiFunctionCall(name = tc.name, arguments = tc.arguments))
+        },
+        tool_call_id = toolCallId
+    )
+
+    private fun ToolSpec.toWire(): OpenAiToolDef = OpenAiToolDef(
+        function = OpenAiFunctionSpec(
+            name = name,
+            description = description,
+            parameters = Json.parseToJsonElement(parameters)
+        )
+    )
 
     @Serializable
     private data class OpenAiChatRequest(
@@ -155,7 +205,42 @@ class OpenAiCompatibleClient(
         val stream: Boolean,
         val max_tokens: Int? = null,
         val thinking: ThinkingConfig? = null,
-        val messages: List<ChatMessage>
+        val messages: List<OpenAiMessage>,
+        val tools: List<OpenAiToolDef>? = null
+    )
+
+    @Serializable
+    private data class OpenAiMessage(
+        val role: String,
+        val content: String? = null,
+        val tool_calls: List<OpenAiToolCall>? = null,
+        val tool_call_id: String? = null
+    )
+
+    @Serializable
+    private data class OpenAiToolCall(
+        val id: String,
+        val type: String = "function",
+        val function: OpenAiFunctionCall
+    )
+
+    @Serializable
+    private data class OpenAiFunctionCall(
+        val name: String,
+        val arguments: String
+    )
+
+    @Serializable
+    private data class OpenAiToolDef(
+        val type: String = "function",
+        val function: OpenAiFunctionSpec
+    )
+
+    @Serializable
+    private data class OpenAiFunctionSpec(
+        val name: String,
+        val description: String,
+        val parameters: JsonElement
     )
 
     @Serializable
@@ -164,4 +249,48 @@ class OpenAiCompatibleClient(
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
+}
+
+/**
+ * OpenAI 流式 tool_calls 聚合器：delta 里的每个元素带 index，id/name 通常只在首帧出现，
+ * arguments 以任意位置截断的分片多次到达；必须按 index 累积到流结束才得到完整 JSON。
+ */
+private class ToolCallAggregator {
+
+    private data class Partial(
+        var id: String? = null,
+        var name: StringBuilder = StringBuilder(),
+        var arguments: StringBuilder = StringBuilder()
+    )
+
+    private val parts = LinkedHashMap<Int, Partial>()
+
+    fun accept(deltaArray: JsonArray) {
+        for (element in deltaArray) {
+            val obj = element as? JsonObject ?: continue
+            val index = obj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                ?: run {
+                    // 个别实现不带 index：优先按已见过的 id 归位，否则视作新调用
+                    val id = obj["id"]?.jsonPrimitive?.contentOrNull
+                    val known = id?.let { wanted -> parts.entries.firstOrNull { it.value.id == wanted }?.key }
+                    known ?: parts.size
+                }
+            val partial = parts.getOrPut(index) { Partial() }
+            obj["id"]?.jsonPrimitive?.contentOrNull?.let { partial.id = it }
+            obj["function"]?.jsonObject?.let { fn ->
+                fn["name"]?.jsonPrimitive?.contentOrNull?.let { partial.name.append(it) }
+                fn["arguments"]?.jsonPrimitive?.contentOrNull?.let { partial.arguments.append(it) }
+            }
+        }
+    }
+
+    fun build(): List<com.gamewishingwell.data.ToolCallData> = parts.values
+        .filter { it.name.isNotEmpty() || it.arguments.isNotEmpty() }
+        .mapIndexed { idx, p ->
+            com.gamewishingwell.data.ToolCallData(
+                id = p.id?.takeIf { it.isNotBlank() } ?: "call_$idx",
+                name = p.name.toString(),
+                arguments = p.arguments.toString().ifBlank { "{}" }
+            )
+        }
 }

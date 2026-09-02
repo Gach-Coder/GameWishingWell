@@ -18,6 +18,14 @@ class ProviderPresetTest {
         assertEquals("moonshot-v1-8k", ProviderPresets.byId("kimi")!!.defaultModel)
         assertEquals("gpt-4o-mini", ProviderPresets.byId("openai")!!.defaultModel)
         assertEquals("claude-sonnet-4-6", ProviderPresets.byId("anthropic")!!.defaultModel)
+
+        val zhipu = ProviderPresets.byId("zhipu")!!
+        assertEquals("glm-5.3-flash", zhipu.defaultModel)
+        assertEquals("https://open.bigmodel.cn/api/paas/v4", zhipu.baseUrl)
+        assertEquals(Protocol.OPENAI_COMPATIBLE, zhipu.protocol)
+        assertEquals(16384, zhipu.maxTokens)
+        assertFalse(zhipu.disableThinking)
+
         assertEquals(8192, ProviderPresets.byId("custom")!!.maxTokens)
     }
 }

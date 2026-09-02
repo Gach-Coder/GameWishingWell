@@ -56,9 +56,12 @@ class GamePlanTest {
         val tower = plan.implementations.first { it.system == "塔防" }
         assertTrue(tower.methods.any { it.contains("防御塔") })
         assertTrue(tower.acceptanceBoundary.contains("基地生命"))
+        // 排除清单是纯加法：只有用户文本明确说"不要"的系统才进禁止清单
         assertTrue("商店经济" in plan.excludedSystems)
-        assertTrue("AI策略" !in plan.excludedSystems)
         assertTrue("AI策略" in plan.gameSystems)
+        // 未勾选/未提及的系统不做任何禁止
+        assertTrue("音乐节奏" !in plan.excludedSystems)
+        assertTrue("弹幕射击" !in plan.excludedSystems)
         assertTrue(plan.excludedApproaches.any { it.contains("3D") })
         assertTrue(PlanningEngine.toPrompt(plan).contains("implementations"))
         assertTrue(PlanningEngine.toPrompt(plan).contains("excluded_systems"))
@@ -79,6 +82,28 @@ class GamePlanTest {
         assertTrue(prompt.contains("黄金"))
         assertTrue(prompt.contains("炸弹"))
         assertTrue(prompt.contains("拾取判定"))
+    }
+
+    @Test
+    fun `全部取消勾选时进入裸需求模式且不出现无关系统名`() {
+        // 勾选只做加法不做减法：全不勾选 = 用户原话直接交给 Agent，
+        // 不套用预设系统清单、不硬排除任何系统，生成照常进行。
+        val intent = IntentEngine.infer("做一个塔防游戏", null)
+        val schema = intent.toGameSchema()
+        val allUnchecked = schema.gameSystems.toSet()
+        val effective = PlanningEngine.schemaApplyingUnchecked(schema, allUnchecked)
+        val plan = PlanningEngine.finalize(
+            schema = effective,
+            confirmedDraft = PlanningEngine.build(schema),
+            uncheckedModules = allUnchecked
+        )
+        assertTrue(plan.gameSystems.none { it in allUnchecked })
+        assertEquals("核心玩法", plan.primarySystem)
+        assertTrue(PlanningEngine.toPrompt(plan).contains("primary_system:核心玩法"))
+        // 裸需求模式：未勾选的系统不进硬排除清单，其余白名单系统也不得整体封禁
+        assertTrue(plan.excludedSystems.isEmpty())
+        assertTrue(GamePrompt.planContext(plan).contains("未勾选任何游戏系统"))
+        assertTrue(GamePrompt.planContext(plan).contains("以用户指令为准"))
     }
 
 }

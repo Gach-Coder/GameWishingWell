@@ -88,4 +88,14 @@ class GameSmokeProbeTest {
         assertTrue(injected.contains("smoke-timeout"))
         assertTrue(injected.contains("requestAnimationFrame"))
     }
+
+    @Test
+    fun `常用交互与画布全局不误报 no-undef`() {
+        val html = "<html><body><script>var name = prompt('你的名字'); alert(name); " +
+            "var ctx = document.createElement('canvas').getContext('2d'); " +
+            "var g = ctx.createLinearGradient(0, 0, 10, 10); g.addColorStop(0, '#fff'); " +
+            "queueMicrotask(function(){});</script></body></html>"
+        val report = GameValidator.validate(html)
+        assertFalse(report.errors.any { it.message.contains("no-undef") })
+    }
 }

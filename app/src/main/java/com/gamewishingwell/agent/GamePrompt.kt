@@ -4,18 +4,23 @@ import android.content.Context
 
 object GamePrompt {
 
-    fun systemPrompt(custom: String? = null): String {
+    /**
+     * 生成阶段 system 提示词。[toolMode] 为 true 时（Agent Loop 工具模式），
+     * 文件内容一律经 writefile/editfile 写入，回复正文不出现代码；
+     * false 时保持旧契约：回复即完整 HTML（兼容不支持 function calling 的网关）。
+     */
+    fun systemPrompt(custom: String? = null, toolMode: Boolean = false): String {
         if (!custom.isNullOrBlank()) {
             return custom.trim() + "\n\n" + hardRules()
         }
-        return baseSystemPrompt()
+        return baseSystemPrompt(toolMode)
     }
 
-    private fun baseSystemPrompt(): String = """
+    private fun baseSystemPrompt(toolMode: Boolean): String = """
         你是"许愿井"游戏创作 Agent。用户会用中文提出游戏需求，你必须产出一个完整、可直接运行、自包含的 HTML5 单文件游戏。
 
         【输出要求】
-        1. 只输出一个 HTML 文件，用 ```html ... ``` 代码围栏包裹，不要任何多余解释。
+        1. ${if (toolMode) "文件内容一律通过 writefile / editfile 工具写入；回复正文只用于与玩家沟通，禁止粘贴代码。" else "只输出一个 HTML 文件，用 ```html ... ``` 代码围栏包裹，不要任何多余解释。"}
         2. 禁止外部资源：不得使用 CDN、外部图片、外部字体、外部 JS 库。所有图形用 Canvas 2D 自绘（纯色、几何、渐变均可），音效使用 WebAudio 振荡器生成。全部代码内联在文件中。
         3. 必须适配手机触控：不依赖键盘或鼠标；用 touchstart / touchmove / touchend 实现虚拟摇杆、点按或滑动操作，并 preventDefault 阻止页面滚动；canvas 随窗口尺寸自适应。
         4. 开场即可玩，默认难度合理，保证普通玩家能玩到游戏内容；有得分显示和开始/暂停/重玩控制；页面美观、配色协调。不要在游戏页面里自行绘制"重新开始/重开"按钮（平台会统一在右上角提供"设置"按钮，设置面板内含重新游戏和音量控制），禁止把任何控制按钮放在底部中央遮挡游戏区域。
@@ -42,10 +47,15 @@ object GamePrompt {
         - 首次生成可全量写 index.html；后续修改用行级 patch。
     """.trimIndent()
 
-    fun chatSystemPrompt(): String = """
-        你是"许愿井"里的创作助手。用户还没有要求生成游戏，只是在聊天。
-        请用简洁的中文回答，不要输出 HTML 代码；如果用户询问能力，说明你可以根据一句话生成可直接游玩的 HTML5 小游戏。
-    """.trimIndent()
+    /** chat 意图 system 提示词；[summary] 为当前会话的 rolling summary（只读上下文）。 */
+    fun chatSystemPrompt(summary: String? = null): String = buildString {
+        append("你是\"许愿井\"里的创作助手。用户还没有要求生成游戏，只是在聊天。\n")
+        append("请用简洁的中文回答，不要输出 HTML 代码；如果用户询问能力，说明你可以根据一句话生成可直接游玩的 HTML5 小游戏。")
+        if (!summary.isNullOrBlank()) {
+            append("\n\n当前会话的游戏概况（只读上下文，据此回答，不要修改任何文件）：\n")
+            append(summary)
+        }
+    }
 
     fun readTemplate(context: Context): String =
         context.assets.open("game_template.html").bufferedReader().use { it.readText() }
@@ -84,7 +94,8 @@ $scopeRule
         2. implementation 必须结合 reference_game/template 和用户需求，说明该系统在这款游戏里的具体内容，例如黄金矿工的道具系统要说明有黄金/石头/炸弹、黄金和石头随体积越大价值越大、石头更廉价等；
         3. methods 是给代码生成层的具体实现要点，可以有“钩子前端与道具做圆形碰撞判定”这类确定性规则；
         4. layer：0=P0 核心玩法、1=P1 重要特性、2=P2 打磨项；
-        5. 排除系统不得出现。
+        5. 排除系统不得出现；
+        6. 除非用户明确说明，各系统按“可玩的最简洁版本”策划：先保证核心玩法闭环，再考虑扩展内容。
         """.trimIndent()
     }
 
@@ -135,17 +146,61 @@ $seedSystems
         """.trimIndent()
     }
 
-    /** 策划 Schema 的上下文最小化注入。 */
-    fun planContext(plan: DesignPlan): String = PlanningEngine.toPrompt(plan)
+    /** 策划 Schema 的上下文最小化注入；未勾选任何系统时退化为“裸需求”模式。 */
+    fun planContext(plan: DesignPlan): String =
+        if (plan.gameSystems.isEmpty()) {
+            // 确认门一个系统都没勾 = 裸需求模式：不套用任何预设系统清单、
+            // 不硬排除任何系统，等价于把用户原话直接交给 Agent——需要哪些
+            // 玩法系统由模型按需求自行判断（保持最简可玩）。
+            PlanningEngine.toPrompt(plan) +
+                "\n（本轮未勾选任何游戏系统：以上不含预设系统清单，不要套用任何游戏模板；" +
+                "请完全以用户指令为准，自行判断需要实现哪些玩法系统，按最简可玩落地。）"
+        } else {
+            PlanningEngine.toPrompt(plan)
+        }
 
     /** 生成代码契约与输出格式。 */
     fun codeContract(): String = """
         【本轮输出格式】
         只输出一个完整 HTML 文件，代码围栏必须是 ```html。全量重写仅限首次生成；修改版本必须保持未要求部分不变。
         先在心里列文件计划与依赖顺序（本项目单文件：index.html，依赖顺序为 HTML 骨架 → CSS → JS），再 implement，最后自行对照验收标准逐项检查。
-        严格按 design_schema 的 implementations 实现系统；excluded_systems 与 excluded_approaches 是硬性排除范围，不得实现或引入被排除的系统与方案。
+        design_schema.systems 是本轮要实现的系统清单（加法）：清单内的系统必须实现；清单外不做禁止，仅在用户指令需要时按最简可玩补充。
+        excluded_systems（仅含用户明确说“不要”的系统）与 excluded_approaches 是硬性排除范围，不得实现或引入。
         复杂系统（AI、商店、技能、关卡等）先在 JS 中隔离成独立函数/模块并优先自检，不得与核心循环交叉污染。
         基础校验通过后即交付玩家试玩，不要在游戏内添加自动测试代码、测试按钮或调试面板；运行错误由玩家回传后再修复。
         输出前确认：无 eval、无外部资源、restart() 存在、触控可玩、声明前置。
     """.trimIndent()
+
+    /**
+     * 工具模式工作流提示词：模型通过 readfile/writefile/editfile 亲自读写游戏文件，
+     * 基础校验报告随工具结果自动回传；全部完成后停止调用工具、输出给玩家的总结。
+     * [firstGeneration] 为 true 表示工作区还没有 index.html（先全量写入），
+     * false 表示已有文件（必须增量修改）。
+     */
+    fun toolWorkflowPrompt(firstGeneration: Boolean): String {
+        val flow = if (firstGeneration) {
+            """
+        【工具工作流（首次生成）】
+        1. 先规划文件结构（HTML 骨架 → CSS → JS），再用 writefile 一次性写入完整 index.html；
+        2. 每次写入后系统自动运行基础校验，报告会附在工具结果里；有 error 必须用 editfile 修复后继续；
+        3. 全部完成、校验通过后，停止调用工具，直接输出给玩家的一段简短总结（不要输出代码）。
+            """.trimIndent()
+        } else {
+            """
+        【工具工作流（修改迭代）】
+        1. 如上下文中没有 index.html 的最新内容，先 readfile 读取；
+        2. 用 editfile 做最小化的精确修改，保持未要求部分逐字不变；禁止无差别全量重写（overwrite 仅结构性重构允许）；
+        3. 每次修改后系统自动运行基础校验，报告会附在工具结果里；有 error 必须修复；
+        4. 修复完成、校验通过后，停止调用工具，直接输出给玩家的一段简短总结（不要输出代码）。
+            """.trimIndent()
+        }
+        return flow + "\n\n【工具纪律】\n" + """
+        - editfile 的 old_string 必须与文件原文逐字符一致（含缩进）；匹配失败时先 readfile 对准原文，不要凭记忆猜代码。
+  - 同一处反复修复失败时，换实现思路（重构该函数 / 换数据结构），而不是重复同样的修改。
+  - 不要在回复正文里粘贴整个文件的代码——文件内容只通过工具写入。
+  - 除非用户明确说明，新系统按“可玩的最简洁版本”实现：先核心玩法闭环，后扩展内容。
+  - 互不依赖的多处修改，请在同一轮并行发起多个 editfile 调用（一次响应可包含多个 tool call），不要每轮只改一处。
+  - 文件被修改后，此前的 readfile 结果会被标记过期；请依据 editfile 返回的修改点上下文片段继续编辑，避免反复整读文件。
+        """.trimIndent()
+    }
 }

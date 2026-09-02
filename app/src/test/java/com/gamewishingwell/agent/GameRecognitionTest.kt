@@ -12,25 +12,32 @@ import org.junit.Test
 class GameRecognitionTest {
 
     @Test
-    fun `意图层输出 new_feature fix_bug chat 三个意图`() {
-        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.inferLocally("做一个打地鼠游戏").intent)
+    fun `意图层输出 dev chat 两个意图`() {
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("做一个打地鼠游戏").intent)
         assertEquals(IntentDecision.INTENT_CHAT, IntentLayer.inferLocally("你好").intent)
-        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.inferLocally("加个连击计分").intent)
-        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.inferLocally("游戏报错了，点开始没反应，修复一下").intent)
-        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.inferLocally("修复bug").intent)
-        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.inferLocally("闪退了帮我修修").intent)
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("加个连击计分").intent)
+        // 修复类词汇不再参与路由：文本报告的异常统一按 dev 走正常管线，
+        // 快车道由会话状态（运行时错误签名）推导，不靠猜文本。
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("游戏报错了，点开始没反应，修复一下").intent)
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("修复bug").intent)
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("闪退了帮我修修").intent)
         // 制作新游戏的指令优先于修复词：“修汽车”是游戏内容，不是修 bug
-        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.inferLocally("做一个修汽车的装修游戏").intent)
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("做一个修汽车的装修游戏").intent)
         assertTrue(IntentLayer.inferLocally("修复bug").isDevelop)
         assertFalse(IntentLayer.inferLocally("你好").isDevelop)
+        // 短问句陷阱：开发诉求不得被疑问前缀误判成 chat 并以高置信度短路
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("能不能简单一点").intent)
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("再难一点").intent)
 
         val parsed = IntentLayer.parseLiteLlmReply("""{"intent":"chat","confidence":0.9,"reason":"问候"}""")
         assertEquals(IntentDecision.INTENT_CHAT, parsed?.intent)
         assertTrue(parsed?.isChat == true)
-        assertEquals(IntentDecision.INTENT_FIX_BUG, IntentLayer.parseLiteLlmReply("""{"intent":"fix_bug","confidence":0.9}""")?.intent)
-        // 兼容旧二分类时期 LLM 可能输出的 develop 标签
-        assertEquals(IntentDecision.INTENT_NEW_FEATURE, IntentLayer.parseLiteLlmReply("""{"intent":"develop","confidence":0.9}""")?.intent)
+        // 历史标签归一：旧三分类的 fix_bug / 旧二分类的 develop 都表示“要动游戏” → dev
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.parseLiteLlmReply("""{"intent":"fix_bug","confidence":0.9}""")?.intent)
+        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.parseLiteLlmReply("""{"intent":"develop","confidence":0.9}""")?.intent)
         assertNull(IntentLayer.parseLiteLlmReply("""{"intent":"外星意图","confidence":0.9}"""))
+        // LLM 自报低置信度视为不可信，回落本地默认（dev）
+        assertNull(IntentLayer.parseLiteLlmReply("""{"intent":"chat","confidence":0.3}"""))
     }
 
     @Test

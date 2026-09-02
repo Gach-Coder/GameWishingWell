@@ -64,6 +64,18 @@ class GameFileWorkspace(private val rootDir: File) {
         }
 
     /**
+     * 已有文件的全量替换（版本递增、旧版入版本库）。工具 writefile 的 overwrite
+     * 语义与“模型直接在回复里给出整份代码”的隐式写入走这里；常规迭代仍应优先
+     * 字符串精确替换（editfile），避免全量重写的回归与 token 开销。
+     */
+    suspend fun writeUpdated(relativePath: String, content: String, expectedHash: String? = null): WorkspaceFile? =
+        mutex.withLock {
+            val file = resolve(relativePath) ?: return@withLock null
+            if (!file.isFile) return@withLock null
+            writeLocked(relativePath, content, expectedHash)
+        }
+
+    /**
      * 已有文件的更新：默认行级 patch（[fromLine, toLine] 替换）。
      * 全量重写仅允许首次生成；如果调用方确需全量替换已有文件，必须先 delete 文件。
      */

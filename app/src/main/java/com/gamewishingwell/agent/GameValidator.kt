@@ -303,7 +303,7 @@ object GameValidator {
         todo.forEach { m ->
             issues += ValidationIssue(
                 "placeholders", FILE_INDEX_HTML, lineOf(source, m.value, startLine),
-                "发现占位实现标记：${m.value}", "warning"
+                "代码中包含疑似未完成的占位标记（TODO/FIXME/占位/待实现）：${m.value}", "warning"
             )
         }
 
@@ -333,13 +333,18 @@ object GameValidator {
         "requestAnimationFrame", "cancelAnimationFrame", "setTimeout", "clearTimeout", "setInterval", "clearInterval",
         "requestIdleCallback", "cancelIdleCallback", "fetch", "XMLHttpRequest", "Image", "Audio",
         "AudioContext", "webkitAudioContext", "OfflineAudioContext", "AudioNode", "GainNode", "OscillatorNode",
-        "CanvasRenderingContext2D", "WebGLRenderingContext", "Path2D", "DOMParser", "Event", "CustomEvent",
+        "CanvasRenderingContext2D", "WebGLRenderingContext", "WebGL2RenderingContext", "Path2D", "DOMParser", "Event", "CustomEvent",
         "KeyboardEvent", "MouseEvent", "TouchEvent", "PointerEvent", "WheelEvent", "IntersectionObserver",
         "MutationObserver", "ResizeObserver", "getComputedStyle", "matchMedia", "URL", "URLSearchParams",
         "Blob", "FileReader", "TextEncoder", "TextDecoder", "atob", "btoa", "crypto", "performance",
         "requestFileSystem", "webkitRequestFileSystem", "Notification", "WebSocket", "Worker", "gamepad",
-        "ontouchstart", "ontouchend", "ontouchmove", "orientation"
-    )
+        "ontouchstart", "ontouchend", "ontouchmove", "orientation",
+        // 游戏常用交互/画布/新近标准全局：缺项会被 no-undef 误报成"未定义变量"，
+        // 模型按报错去"修复"反而改坏代码，且此类误报修不掉会触发同签名熔断。
+        "alert", "confirm", "prompt", "queueMicrotask", "structuredClone", "reportError",
+        "OffscreenCanvas", "CanvasGradient", "CanvasPattern", "TextMetrics", "DOMRect",
+        "speechSynthesis", "SpeechSynthesisUtterance", "vibrate"
+    ).toSet()
 
     private val JS_BUILTINS: Set<String> = setOf(
         "Array", "ArrayBuffer", "BigInt", "Boolean", "DataView", "Date", "Error", "EvalError", "Float32Array",

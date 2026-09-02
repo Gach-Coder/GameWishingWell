@@ -179,6 +179,70 @@ class OpenAiClientTest {
     }
 
     @Test
+    fun `流式 tool_calls 分片聚合`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    // id/name 只在首帧出现；arguments 分两片到达，中间任意截断
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"editfile\",\"arguments\":\"{\\\"path\"}}]}}]}\n\n" +
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":\\\"index.html\\\"}\"}}]}}]}\n\n" +
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+                        "data: [DONE]\n\n"
+                )
+        )
+        server.start()
+
+        val resp = client(server).streamChat(
+            listOf(ChatMessage("user", "改一下")),
+            onDelta = {},
+            onDone = {},
+            tools = listOf(ToolSpec("editfile", "增量修改", """{"type":"object"}"""))
+        )
+        assertEquals(1, resp.toolCalls.size)
+        assertEquals("call_1", resp.toolCalls[0].id)
+        assertEquals("editfile", resp.toolCalls[0].name)
+        assertEquals("{\"path\":\"index.html\"}", resp.toolCalls[0].arguments)
+        assertTrue(resp.usedTools)
+
+        val body = server.takeRequest().body.readUtf8()
+        assertTrue(body.contains("\"tools\":["))
+        assertTrue(body.contains("\"name\":\"editfile\""))
+        assertTrue(body.contains("\"parameters\":{\"type\":\"object\"}"))
+
+        server.shutdown()
+    }
+
+    @Test
+    fun `网关不支持 tools 时去掉字段重试并返回纯文本`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setResponseCode(400).setBody("{\"error\":\"tools is not supported\"}"))
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n")
+        )
+        server.start()
+
+        val resp = client(server).streamChat(
+            listOf(ChatMessage("user", "hi")),
+            onDelta = {},
+            onDone = {},
+            tools = listOf(ToolSpec("readfile", "读文件", """{"type":"object"}"""))
+        )
+        assertEquals("OK", resp.text)
+        assertTrue(resp.toolCalls.isEmpty())
+
+        val first = server.takeRequest()
+        assertTrue(first.body.readUtf8().contains("\"tools\":["))
+        val second = server.takeRequest()
+        assertFalse(second.body.readUtf8().contains("\"tools\""))
+
+        server.shutdown()
+    }
+
+    @Test
     fun `API 错误时抛出 LlmError`() = runBlocking {
         val server = MockWebServer()
         server.enqueue(MockResponse().setResponseCode(401).setBody("{\"error\":\"invalid key\"}"))

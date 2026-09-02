@@ -26,6 +26,9 @@ object ProviderPresets {
         ProviderPreset("kimi", "Kimi (Moonshot)", "https://api.moonshot.cn/v1", "moonshot-v1-8k", Protocol.OPENAI_COMPATIBLE, 16384),
         ProviderPreset("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini", Protocol.OPENAI_COMPATIBLE, 16384),
         ProviderPreset("anthropic", "Anthropic Claude", "https://api.anthropic.com", "claude-sonnet-4-6", Protocol.ANTHROPIC, 16384),
+        // 智谱开放平台 OpenAI 兼容端点（Bearer 鉴权、/chat/completions、SSE、function calling 均兼容）；
+        // 默认 glm-5.3-flash，模型名可在设置页直接改为其他 GLM 系列（如 glm-5.3 / glm-4.6 / glm-4-flash）。
+        ProviderPreset("zhipu", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-5.3-flash", Protocol.OPENAI_COMPATIBLE, 16384),
         ProviderPreset("custom", "自定义", "", "", Protocol.OPENAI_COMPATIBLE, 8192)
     )
 
