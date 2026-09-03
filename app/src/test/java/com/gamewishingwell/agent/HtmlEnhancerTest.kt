@@ -50,12 +50,16 @@ class HtmlEnhancerTest {
     }
 
     @Test
-    fun `注入游戏内设置面板与设置按钮`() {
+    fun `注入平台设置桥接接口且不再注入页面内面板`() {
         val out = HtmlEnhancer.inject(htmlWithHead)
-        assertTrue(out.contains("__ww_game_settings_btn"))
-        assertTrue(out.contains("__ww_game_settings_overlay"))
-        assertTrue(out.contains("重新游戏"))
-        assertTrue(out.contains("音量"))
+        // 原生顶栏"设置"面板的页面侧接口
+        assertTrue(out.contains("window.__wwSetVolume = __wwSetVolume"))
+        assertTrue(out.contains("window.__wwSetPaused ="))
+        // 默认音量 0.8（原生滑条可放大到 1.5）
+        assertTrue(out.contains("var __wwVolume = 0.8"))
+        // 页面内不再注入任何设置按钮/面板
+        assertFalse(out.contains("__ww_game_settings_btn"))
+        assertFalse(out.contains("__ww_game_settings_overlay"))
     }
 
     @Test

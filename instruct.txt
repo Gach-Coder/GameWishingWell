@@ -61,7 +61,7 @@ Agent处理message流程如下：
 		检测 Game Schema JSON 会话级的游戏Json 是否为空：
 			Json为空 → 对话历史不包含游戏 → 默认为首次 dev 对话
 			Json非空 → 对话已经锚定某游戏 
-		正则 + Lite LLM 抽取游戏特征（除非用户说明，游戏系统默认为可玩的最简洁版本），补全或修正 Game Schema JSON 信息（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
+		正则 + Lite LLM 抽取游戏特征（除非用户说明，按该游戏类型的核心+标配系统集合识别），补全或修正 Game Schema JSON 信息（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
 	 		若返回为空实体，则判断 message 为普通 chat （意图层可能误判漏判）
 		解析实体包括：
 			画面维度：2D，2.5D，3D
@@ -77,15 +77,20 @@ Agent处理message流程如下：
 		策划子 Agent 拿到上游的系统列表 game_module_list，例如[人物实体,道具,战斗]，针对每个 module 元素策划出在这个游戏中合理的实现方式（业务验收边界）
 		例如<我的世界>游戏的"人物实体" module，简单诠释其在游戏的核心实现方式：用户可操作移动，有对应坐标...等
 		（不用策划出或和用户探讨具体的技术细节，例如游戏引擎，算法等底层技术或逻辑。这里只探讨游戏内容和玩法系统逻辑。）
+		策划默认口径为"类型标配的完整可玩版本"：核心玩法闭环=P0；类型常见标配内容（多种单位/敌人、波次或关卡递进、升级成长、经济资源）=P1 一并纳入；仅锦上添花的打磨=P2（除非用户明确说明）。
 		若收到确认门的重组
 			追加或修改 module —> 策划子 Agent LLM 重新策划该module
 			删除 module -> 直接删除，无LLM调用
 	→ 确认门：用卡片回显上游游戏JSON的综合策划结果，
 		卡片中对于 game_module_list 的每个 module 都有一个可选框供用户勾选(默认为勾选，确认或取消勾选代表是否希望实现这个游戏系统)
 		（勾选只做加法不做减法：勾选=纳入本轮实现范围；取消勾选=仅不纳入，不进任何禁止清单，后续文本点名该系统自动恢复；
-		  excluded_systems 只包含用户文本明确说"不要"的系统——任何未勾选/未提及的系统都不做禁止，模型按用户原话与最简可玩原则自行取舍；
+		  excluded_systems 只包含用户文本明确说"不要"的系统——任何未勾选/未提及的系统都不做禁止，模型按用户原话与类型标配的完整可玩版本自行取舍；
 		  全部不勾选=裸需求模式——不套用预设系统清单，等价于用户原话直接交给 Agent，
-		  需要哪些玩法系统由模型按需求自行判断（最简可玩），照常进入 Agent Loop 不影响生成）
+		  需要哪些玩法系统由模型按需求自行判断（类型标配完整可玩），照常进入 Agent Loop 不影响生成）
+		系统清单末尾提供"全选"开关（TriStateCheckbox，一键全选/全不选，半选=部分勾选；全不选时显示裸需求模式提示）；
+		其后为"生成预算"挡位滑条：用户预期的 Agent Loop 轮数，只在固定挡位间跳动
+		（1/2/3/4/5/8/10/12/15/20/25/30/40/50/75/100，默认 5；档位随值显示 快速/均衡/精品），
+		确认后写入会话 GameSession.expectedLoops 并锁定进卡片；
 		用户可点击卡片中确认按钮或再次输入文本修改，
 		若用户输入文本，判定为修正，可能增删module_list元素或修改某module的具体实现，则回到策划层重组摘要再次回显待确认，
 		直到用户点击确认则进入下一步。保留卡片于聊天框，只disable勾选框和按钮功能即可
@@ -98,19 +103,19 @@ Agent处理message流程如下：
 	写入策略（一般 Agent 惯例：工具能力全开，选择权在模型，系统不做策略门禁）：
 		writefile=整量写入（新建或彻底重写均可，版本化写入保底可回滚）；editfile=精确替换（常规修改首选：改动最小、最快、不回归未要求部分）；
 		appendfile=末尾追加（新增代码段，无行数限制）；用哪个由模型按任务自行权衡，执行层一律放行
-		无截断机制：不捕获/不处理 finish_reason 截断信号，不注入截断相关引导——模型输出由 max_tokens 预设与"最简可玩"体量控制自然约束
+		无截断机制：不捕获/不处理 finish_reason 截断信号，不注入截断相关引导——模型输出由 max_tokens 预设与策划清单体量控制自然约束（首次生成体量大时允许 writefile 骨架 + appendfile 分段拼装，避免单次输出过长）
 			→ 模型发起 tool call → 宿主经 GameFileWorkspace 执行（版本化文件+指针切换+同会话加锁+hash防并发覆盖；
 			  修改用 old_string 逐字符精确替换且要求唯一（或 replace_all），全量重写仅限首次生成或 overwrite=true 结构性重构）
 			→ 每次写入后宿主自动检查产品契约（外部资源/eval 禁令，无解析器代差），报告作为"观察"附在 tool_result 回传
-			→ 模型不再发起工具调用即自然终止；验收 = 产品契约通过 + 修改轮内容哈希≠种子哈希（防"空口完成"）+ 沙箱运行通过
+			→ 模型不再发起工具调用即自然终止；验收 = 产品契约通过 + 修改轮内容哈希≠种子哈希（防"空口完成"）+ 沙箱运行通过 + 可玩性自检轮全部完成
 			→ 每次写入即刻发布中间版本到会话，中断后玩家可立即试玩
-		交付约束：交给用户前必须通过基础校验（0 error）与沙箱冒烟测试（同 WebView 内核确定性 tick 跑通），不存在"带错交付"
+		交付约束：交给用户前必须通过基础校验（0 error）、沙箱冒烟测试（同 WebView 内核确定性 tick 跑通）与两轮可玩性自检（内容完整性、体验与平台合规），不存在"带错交付"
 	防死循环与交付约束：不做"带错交付"（交给用户前必须沙箱运行通过）——
 		bug 修复轮数不设上限（多轮修复属正常现象，同错误 3/6 次仅注入"换思路/重写模块"提示，不终止）；
 		仅两类非修复性退出熔断：无进展（连续24轮无任何文件修改 / 连续多轮无工具产出）与运行验证环境异常；
 		用户停止键可随时中断（中断后保留中间版本可试玩，属用户主动选择）
 			沙箱失败但无任何错误文本（探针结果不可读等设施问题）视为测试设施异常，以"运行验证环境异常"退出不交付——探针运行在 srcdoc iframe 内，结果经 contentWindow 读取
-			超时语义：探针内部超时 6s/外层兜底 20s（模拟器/低端机 WebView 定时器慢 3~5 倍）；"超时且无任何真实错误文本"= 慢环境时序问题而非游戏缺陷，
+			超时语义：探针内部超时 45s/外层兜底 80s（模拟器/低端机 WebView 定时器慢 3~5 倍）；"超时且无任何真实错误文本"= 慢环境时序问题而非游戏缺陷，
 			按通过交付并记决策日志——绝不作为可修错误回传（模型无从修起，只会无限空转）；超时伴随真实错误时只回传真实错误
 	确认门与 Agent Loop 的关系（通用 Agent 流程，参考 DSH/ZaiAgent 形态）：
 		卡片勾选与否只影响 prompt 构建（design_schema 内容），不影响后续 Agent Loop 流程——
@@ -124,11 +129,17 @@ Agent处理message流程如下：
 			兼容回环入口带 seedHash 防假修改闸：输出与种子完全一致时拒绝，要求输出包含修改的新版本
 		校验体系（沙箱唯一裁决）：运行正确性的唯一校验来源是沙箱——同内核 WebView 直载探针注入后的游戏 HTML
 			（不用 iframe/srcdoc——实测模拟器上 iframe 加载/结果读取链路不可靠，历史累计 200+ 次超时，且 srcdoc 的 opaque origin 引发跨源异常）；
-			探针跑帧捕获异常 + 全局 error 监听（含事件回调）+ console error 采集 + 画布中心带坐标的 touchstart/click 派发（让"开始"类交互真实触发）
-			+ localStorage 内存 stub + 15s 内部超时/30s 外层兜底（离屏 WebView 未挂窗时 Chromium 按后台节流定时器至约1次/秒，8帧需8~12s）；宿主以 700ms 间隔轮询 window.__wwSmokeResult 直至终态（跑满帧或出现错误），onPageFinished 不触发时也有定时兜底轮询；
+			探针跑帧捕获异常（24帧×50ms/帧≈1.2s游戏时间）+ 全局 error 监听（含事件回调）+ console error 采集 + 多点触控派发（中心/底部中央/左右下侧的 touchstart/touchend/click + 一次拖动，开始后与跑帧中段各一轮，让"开始"类交互真实触发并进入运行态）
+			+ localStorage 内存 stub + 顶部保留区扫描（约110px 平台操作条区域内出现 button/a/input 等可交互元素即判失败回传，平台自身 __ww 前缀元素除外；左右无文字标签、中央仅极短状态文字由生成提示词约束）
+			+ 45s 内部超时/80s 外层兜底（离屏 WebView 未挂窗时 Chromium 按后台节流定时器至约1次/秒，24帧需25~35s）；宿主以 700ms 间隔轮询 window.__wwSmokeResult 直至终态（跑满帧或出现错误），onPageFinished 不触发时也有定时兜底轮询；
 			画面空白检测（白屏杀手锏）：跑满帧后所有 canvas 均无内容（空白 canvas 的 PNG dataURL <3KB）且页面无可读文本 → 判"playability-blank-screen"失败回炉——杀掉"运行不报错但啥都没渲染"的假通过；
-			可玩性自检轮（对标 DSH/ZaiAgent 的自检-增强流程）：沙箱首次通过后不立即交付，注入一轮"对照【可玩性要求】逐条自查修复"再验收（每回合一次）；
-			能成功运行（跑满帧且零错误文本且画面非空白）即放行；失败则以沙箱报错文本作为观察回传驱动修复；
+			可玩性自检轮（对标 DSH/ZaiAgent 的自检-增强流程）：沙箱通过后不立即交付，逐轮注入"对照【可玩性要求】自查修复"再验收——
+			轮数随用户预期轮次预算（确认门滑条 expectedLoops）分档：≤2 快速档跳过自检（最短路径交付）、3~10 均衡档两轮
+			（第一轮内容完整性：清单系统真实落地/体验闭环/难度递进/数值反馈；第二轮体验与平台合规：顶部保留区规则/触控尺寸/画面美感与反馈）、
+			≥11 精品档追加第三轮深度打磨（数值平衡/视觉层次/音效层次/风格统一）；
+			每轮完成后重新过校验+沙箱验收，当前档位全部轮次消费完才交付；
+			轮次预算同时经 GamePrompt.loopBudgetPrompt 注入生成上下文（快速=最简一步到位 / 均衡=类型标配完整 / 精品=内容更丰富+打磨项）；
+			能成功运行（跑满帧且零错误文本且画面非空白且顶部保留区无可交互元素）即放行；失败则以沙箱报错文本作为观察回传驱动修复；
 			无任何 runner 可用（JVM 单测等）时跳过沙箱不阻塞；
 			静态解析校验（Rhino 语法/no-undef/jsoup HTML 配对）已全部移除——解析器与 Chromium 存在语法代差，
 			class/可选链/空值合并/spread/for-of/箭头默认参数等合法写法会被误判（实测 15 样本误判 7 个），
@@ -308,25 +319,31 @@ Agent 日志（辅助调试材料，前端不展示）：
 - ui/Container.kt：rememberContainer() 从 LocalContext 取全局 AppContainer。
 
 
-VIEWPORT_PRELUDE（视口修复 + 游戏内设置面板）：
+VIEWPORT_PRELUDE（视口修复 + 平台设置桥接）：
 - 用 window.__wwViewportFixApplied 防重复执行；
 - 视口修复：取 window.innerHeight || documentElement.clientHeight，把
   <html>/<body> 的 height/minHeight 固定为像素高度；创建 <style id="__ww_vh_fix__">，
   遍历 document.styleSheets 中 type=1 的规则，把含 vh 的声明换算成 px 并以
   !important 追加；再遍历所有元素内联样式做同样的 vh→px 替换；
-- 设置面板：固定右上角“⚙”按钮（top:112px/right:12px，z-index 99990）→
-  全屏半透明 overlay（z-index 99999）→“游戏设置”面板：
-  音量 range（0–100）、“重新游戏”（调用全局 restart()，失败转 console.error
-  “[游戏错误] 重新游戏失败: …”）、“继续游戏”（关闭面板）；
+- 设置面板已上移平台顶栏：顶栏右侧“⚙ 设置”入口（替代原“保存”按钮）由原生 GameScreen 渲染，
+  游戏页内不再注入任何设置按钮/面板；页面侧仅暴露两个接口供原生面板经 evaluateJavascript 调用：
+  window.__wwSetVolume(v)（0–1）与 window.__wwSetPaused(bool)。
+  原生“游戏设置”面板（AlertDialog）内容：音量滑条（实时 __wwSetVolume）、
+  “重新游戏”（evaluateJavascript 调全局 restart()，失败转 console.error
+  “[游戏错误] 重新游戏失败: …”）、“保存游戏”（仅草稿模式显示，转原有的标题确认保存流程）、
+  “继续游戏”（关闭面板）；
 - 暂停机制：包装 window.requestAnimationFrame/cancelAnimationFrame，
-  __wwPaused=true 时持续重排下一帧而不回调游戏逻辑；打开设置面板即暂停，关闭恢复；
-- 音量机制：默认 __wwVolume=0.8；包装 window.AudioContext/webkitAudioContext
+  __wwPaused=true 时持续重排下一帧而不回调游戏逻辑；原生设置面板打开即
+  __wwSetPaused(true) 暂停，关闭/继续游戏恢复；
+- 音量机制：默认 __wwVolume=0.8，__wwSetVolume 钳制 0–1.5（原生滑条 0–150%，
+  允许对游戏自身偏小的音效做适度放大；参考模板 game_template.html 的音效振幅为 0.15）；
+  包装 window.AudioContext/webkitAudioContext
   构造函数，为每个新 AudioContext 创建主 GainNode（__wwMasterGain），并 patch
   AudioNode.prototype.connect，把连接到 ctx.destination 的节点统一改接到主
   GainNode；__wwSetVolume 遍历已登记 Context 设置 gain.value；
 - 自动清理：隐藏游戏自带的“重新开始/重开/重玩/再来一局/restart”按钮
-  （display:none 并打 __wwLegacyRestartHidden 标记，不隐藏平台设置按钮）；
-  MutationObserver 监听 DOM 变化以重新执行按钮清理和面板安装；
+  （display:none 并打 __wwLegacyRestartHidden 标记）；
+  MutationObserver 监听 DOM 变化以重新执行按钮清理；
 - 触发时机：DOMContentLoaded（或 readyState 非 loading 时立即执行）+ setTimeout 0
   兜底 + resize/orientationchange 重新计算。
 

@@ -8,6 +8,9 @@ package com.gamewishingwell.agent
  * 2. 注入 JS 错误捕获器，把 window.onerror / unhandledrejection 转发到 console.error，
  *    这样 WebView 的 onConsoleMessage 能收到运行时报错（含行号），
  *    用户才能看到"游戏运行出错"覆盖层并一键让 AI 修复。
+ * 3. 平台设置桥接：音量（window.__wwSetVolume，默认 0.8，钳制 0–1.5）与暂停
+ *    （window.__wwSetPaused）暴露给原生顶栏"设置"面板调用；游戏页内不注入任何
+ *    设置按钮/面板 UI，仅隐藏游戏自带的重开类按钮避免与平台"重新游戏"重复。
  *
  * 只影响 WebView 里渲染的副本，磁盘上保存的原始 HTML 保持不动。
  */
@@ -52,7 +55,6 @@ object HtmlEnhancer {
 
       var __wwVolume = 0.8;
       var __wwPaused = false;
-      var __wwSettingsOpen = false;
       var __wwRafSeq = 1;
       var __wwRafMap = {};
       var __wwRealRaf = window.requestAnimationFrame && window.requestAnimationFrame.bind(window);
@@ -129,7 +131,8 @@ object HtmlEnhancer {
       }
 
       function __wwSetVolume(v) {
-        __wwVolume = Math.max(0, Math.min(1, Number(v) || 0));
+        // 上限 1.5：允许对游戏自身偏小的音效做适度放大（原生滑条 0–150%）。
+        __wwVolume = Math.max(0, Math.min(1.5, Number(v) || 0));
         for (var i = 0; i < __wwAudioContexts.length; i++) {
           var ctx = __wwAudioContexts[i];
           if (ctx && ctx.__wwMasterGain) {
@@ -137,6 +140,11 @@ object HtmlEnhancer {
           }
         }
       }
+
+      // 平台顶栏"设置"面板的页面侧接口（原生 GameScreen 经 evaluateJavascript 调用）：
+      // 音量与暂停都由原生面板驱动，页面内不再注入任何设置按钮或面板。
+      window.__wwSetVolume = __wwSetVolume;
+      window.__wwSetPaused = function(p) { __wwPaused = !!p; };
 
       function applyViewportFix() {
         var h = window.innerHeight || document.documentElement.clientHeight || 0;
@@ -199,10 +207,10 @@ object HtmlEnhancer {
           }
         }
 
-        installGameSettings();
+        hideLegacyRestartButtons();
         if (window.MutationObserver && !window.__wwSettingsObserver && root) {
           try {
-            window.__wwSettingsObserver = new MutationObserver(installGameSettings);
+            window.__wwSettingsObserver = new MutationObserver(hideLegacyRestartButtons);
             window.__wwSettingsObserver.observe(root, { childList: true, subtree: true });
           } catch (e) { window.__wwSettingsObserver = null; }
         }
@@ -212,121 +220,12 @@ object HtmlEnhancer {
         var nodes = document.querySelectorAll('button, [role="button"]');
         for (var i = 0; i < nodes.length; i++) {
           var el = nodes[i];
-          if (el.id === '__ww_game_settings_btn') continue;
           var text = (el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.value || '');
           if (/(?:重新开始|重开|重玩|再来一局|restart)/i.test(text)) {
             el.style.display = 'none';
             el.__wwLegacyRestartHidden = true;
           }
         }
-      }
-
-      function installGameSettings() {
-        hideLegacyRestartButtons();
-        var body = document.body;
-        if (!body) return;
-        if (document.getElementById('__ww_game_settings_btn')) return;
-
-        var btn = document.createElement('button');
-        btn.id = '__ww_game_settings_btn';
-        btn.type = 'button';
-        btn.setAttribute('aria-label', '设置');
-        btn.textContent = '⚙';
-        btn.style.cssText = 'position:fixed;top:112px;right:12px;width:40px;height:40px;padding:0;margin:0;border:none;border-radius:10px;background:rgba(20,22,34,0.82);color:#ffffff;font-size:20px;line-height:40px;text-align:center;z-index:99990;box-shadow:0 4px 12px rgba(0,0,0,0.35);';
-        btn.addEventListener('click', function(e) {
-          e.preventDefault();
-          e.stopPropagation();
-          openGameSettings();
-        });
-        body.appendChild(btn);
-
-        var overlay = document.createElement('div');
-        overlay.id = '__ww_game_settings_overlay';
-        overlay.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;background:rgba(0,0,0,0.58);display:none;align-items:center;justify-content:center;z-index:99999;';
-        overlay.addEventListener('click', function(e) {
-          if (e.target === overlay) closeGameSettings();
-        });
-
-        var panel = document.createElement('div');
-        panel.style.cssText = 'width:82%;max-width:340px;background:#1c2130;color:#f5f7ff;border-radius:16px;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,0.45);font-family:system-ui,sans-serif;';
-
-        var title = document.createElement('div');
-        title.textContent = '游戏设置';
-        title.style.cssText = 'font-size:18px;font-weight:700;text-align:center;margin-bottom:14px;';
-
-        var volRow = document.createElement('div');
-        volRow.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
-        var volLabel = document.createElement('span');
-        volLabel.textContent = '音量';
-        volLabel.style.cssText = 'font-size:14px;';
-        var volValue = document.createElement('span');
-        volValue.textContent = Math.round(__wwVolume * 100) + '%';
-        volValue.style.cssText = 'font-size:13px;opacity:0.85;';
-        volRow.appendChild(volLabel);
-        volRow.appendChild(volValue);
-
-        var slider = document.createElement('input');
-        slider.type = 'range';
-        slider.min = '0';
-        slider.max = '100';
-        slider.value = String(Math.round(__wwVolume * 100));
-        slider.style.cssText = 'width:100%;height:28px;margin:2px 0 14px;';
-        slider.addEventListener('input', function() {
-          var v = Number(slider.value) || 0;
-          volValue.textContent = v + '%';
-          __wwSetVolume(v / 100);
-        });
-
-        var actions = document.createElement('div');
-        actions.style.cssText = 'display:flex;gap:10px;margin-top:4px;';
-
-        var restartBtn = document.createElement('button');
-        restartBtn.type = 'button';
-        restartBtn.textContent = '重新游戏';
-        restartBtn.style.cssText = 'flex:1;height:40px;border:none;border-radius:10px;background:#4f7cff;color:#ffffff;font-size:14px;font-weight:700;';
-        restartBtn.addEventListener('click', function(e) {
-          e.stopPropagation();
-          closeGameSettings();
-          try {
-            if (typeof window.restart === 'function') window.restart();
-          } catch (err) {
-            try { console.error('[游戏错误] 重新游戏失败: ' + err.message); } catch (e2) {}
-          }
-        });
-
-        var resumeBtn = document.createElement('button');
-        resumeBtn.type = 'button';
-        resumeBtn.textContent = '继续游戏';
-        resumeBtn.style.cssText = 'flex:1;height:40px;border:none;border-radius:10px;background:#343b52;color:#ffffff;font-size:14px;font-weight:700;';
-        resumeBtn.addEventListener('click', function(e) {
-          e.stopPropagation();
-          closeGameSettings();
-        });
-
-        actions.appendChild(restartBtn);
-        actions.appendChild(resumeBtn);
-        panel.appendChild(title);
-        panel.appendChild(volRow);
-        panel.appendChild(slider);
-        panel.appendChild(actions);
-        overlay.appendChild(panel);
-        body.appendChild(overlay);
-      }
-
-      function openGameSettings() {
-        if (__wwSettingsOpen) return;
-        __wwSettingsOpen = true;
-        __wwPaused = true;
-        var overlay = document.getElementById('__ww_game_settings_overlay');
-        if (overlay) overlay.style.display = 'flex';
-      }
-
-      function closeGameSettings() {
-        if (!__wwSettingsOpen) return;
-        __wwSettingsOpen = false;
-        __wwPaused = false;
-        var overlay = document.getElementById('__ww_game_settings_overlay');
-        if (overlay) overlay.style.display = 'none';
       }
 
       if (document.readyState === 'loading') {

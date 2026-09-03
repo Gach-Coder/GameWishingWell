@@ -105,7 +105,7 @@ function beep(f){
     var o = actx.createOscillator(), g = actx.createGain();
     o.frequency.value = f; o.type = 'square';
     o.connect(g); g.connect(actx.destination);
-    g.gain.setValueAtTime(0.06, actx.currentTime);
+    g.gain.setValueAtTime(0.15, actx.currentTime);
     g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.12);
     o.start(); o.stop(actx.currentTime + 0.13);
   } catch(e){}

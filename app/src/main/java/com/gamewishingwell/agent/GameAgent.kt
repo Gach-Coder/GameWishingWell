@@ -65,6 +65,8 @@ data class GameSession(
     /** 每通过校验的版本快照（可回滚），记录文件名与内容哈希。 */
     val snapshots: List<String> = emptyList(),
     val schemaVersion: Int = 2,
+    /** 用户预期的 Agent Loop 轮数（确认门滑条 1~100，默认 5）：驱动轮次预算提示词与自检轮数分档。 */
+    val expectedLoops: Int = 5,
     /** 仅用于兼容旧会话；简化流程不再运行两段式质量自检，因此新状态中保持 null。 */
     val qualityVerdict: QualityVerdict? = null
 ) {
@@ -283,9 +285,10 @@ class GameAgent(
      * 剔除（无 LLM 调用），但不视作玩家明确排除——不进任何“禁止实现”清单，
      * 后续文本点名该系统会自动恢复到范围。
      */
-    suspend fun confirmIntent(uncheckedModules: Set<String> = emptySet()) {
+    suspend fun confirmIntent(uncheckedModules: Set<String> = emptySet(), expectedLoops: Int = 5) {
         val pending = _session.value.pendingConfirmation ?: return
         if (_session.value.isGenerating) return
+        val safeLoops = expectedLoops.coerceIn(1, 100)
 
         // 决策层：以确认门共享的同一份 Game Schema JSON 为输入，把已确认的
         // 策划草案定稿为最终 DesignPlan；明确排除的系统/方案继续硬性生效。
@@ -307,7 +310,7 @@ class GameAgent(
         // 不因页面重组（remember 重置）恢复成默认全选。
         val pendingKey = IntentConfirmation.cardContent(pending)
         val lockedContent = IntentConfirmation.cardContent(
-            pending.copy(uncheckedModules = uncheckedModules.sorted().distinct())
+            pending.copy(uncheckedModules = uncheckedModules.sorted().distinct(), expectedLoops = safeLoops)
         )
         val base = session.copy(
             messages = session.messages.map { msg ->
@@ -320,10 +323,11 @@ class GameAgent(
             pendingConfirmation = null,
             gameSchema = schema,
             designPlan = finalPlan,
+            expectedLoops = safeLoops,
             qualityVerdict = null
         )
         _session.value = base
-        alog("confirm: unchecked=[${uncheckedModules.joinToString(",")}] systems=${schema.gameSystems.joinToString(",")}")
+        alog("confirm: unchecked=[${uncheckedModules.joinToString(",")}] systems=${schema.gameSystems.joinToString(",")} expectedLoops=$safeLoops")
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
                 generateFromIntent(pending.userRequest, schema, _session.value.currentHtml, finalPlan)
@@ -579,13 +583,16 @@ class GameAgent(
             } else {
                 instruction
             }
+            // 修正回合重建卡片时继承用户已拨动的轮次预算（否则滑条会被重置回默认 5）。
             val confirmation = RecognitionEngine.buildConfirmation(
                 userRequest = effectiveRequest,
                 schema = schema,
                 draftPlan = draftPlan,
                 isNewGame = recognition.isNewGame,
                 revised = priorConfirmation != null
-            )
+            ).let { built ->
+                priorConfirmation?.let { prior -> built.copy(expectedLoops = prior.expectedLoops) } ?: built
+            }
             // 确认卡作为消息写入聊天流：确认/重组后卡片始终保留在对话中，
             // 仅最后一张与 pendingConfirmation 匹配的卡片可交互，其余只读回显。
             val next = _session.value.copy(
@@ -978,8 +985,10 @@ class GameAgent(
         var stubborn: Map<String, Int> = emptyMap()
         var idleRounds = 0
         var nudgesLeft = 3
-        // 可玩性自检轮：沙箱首次通过后先对照清单自查修复一轮（每回合一次）。
-        var selfReviewed = false
+        // 可玩性自检轮随轮次预算分档（确认门滑条）：≤2 快速档跳过自检、
+        // 3~10 均衡档两轮、≥11 精品档追加深度打磨轮；每轮自检后重新走校验+沙箱验收。
+        val expectedLoops = _session.value.expectedLoops.coerceIn(1, 100)
+        val selfReviews = ArrayDeque(GamePrompt.selfReviewPrompts(expectedLoops))
         // 连续"既无工具调用也无代码输出"的轮数：≥2 判定模型不会 function calling，
         // 工具模式提示词禁止正文出代码会把它锁死——整体降级到兼容回环。
         var toollessRounds = 0
@@ -993,9 +1002,9 @@ class GameAgent(
             currentCoroutineContext().ensureActive()
             val module = moduleForRound(plan, round)
             val genStage = if (firstGeneration) {
-                "代码生成中（工具模式）：正在生成「$module」· 第 $round 轮"
+                "代码生成中（工具模式）：正在生成「$module」· 第 $round 轮（预期约 $expectedLoops 轮）"
             } else {
-                "代码修改中（工具模式）：正在处理「$module」· 第 $round 轮"
+                "代码修改中（工具模式）：正在处理「$module」· 第 $round 轮（预期约 $expectedLoops 轮）"
             }
             _session.value = _session.value.copy(agentStage = genStage, streamingText = null)
 
@@ -1085,53 +1094,49 @@ class GameAgent(
                                 val smokeErrors = (smoke.errors + listOfNotNull(smoke.message?.takeIf { it == "smoke-timeout" }))
                                     .filter { it.isNotBlank() }
                                     .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
-                                if (smokeErrors.isEmpty()) {
-                                    // 超时且无任何真实错误：慢环境时序问题（模拟器 WebView 定时器慢 3~5 倍），
-                                    // 不是游戏缺陷——按通过交付，绝不作为可修错误回传（模型无从修起，只会空转）。
-                                    alog("sandbox timeout WITHOUT errors -> ACCEPTED (slow env, frames=${smoke.framesRun})")
-                                    return GenOutcome.Accepted(content, resp.text, round, report)
+                                // 超时且无任何真实错误：慢环境时序问题（模拟器 WebView 定时器慢 3~5 倍），
+                                // 不是游戏缺陷——按通过处理（落入下方自检轮/交付流程），绝不作为可修错误回传（模型无从修起，只会空转）。
+                                if (smokeErrors.isEmpty()) alog("sandbox timeout WITHOUT errors -> treat as pass (slow env, frames=${smoke.framesRun})")
+                                if (smokeErrors.isNotEmpty()) {
+                                    val normalized = ErrorSignature.normalize("冒烟测试失败:" + smokeErrors.joinToString(";"))
+                                    val known = RetryBookkeeping.record(_session.value.knownErrors, ErrorCategory.USER_RUNTIME, normalized)
+                                    saveGlobalErrorSignatures(known)
+                                    // 写入 lastError：冒烟类熔断后的重试轮才有具体问题可修，
+                                    // 否则重试轮上下文看不到任何遗留问题（rolling summary 是旧的"通过"）。
+                                    _session.value = _session.value.copy(
+                                        knownErrors = known,
+                                        lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
+                                        knownIssues = smokeErrors.take(5)
+                                    )
+                                    stubborn = StubbornErrorTracker.update(
+                                        stubborn,
+                                        smokeErrors.map { StubbornErrorTracker.issueSignature("sandbox", it) }.toSet()
+                                    )
+                                    val worst = StubbornErrorTracker.worst(stubborn)
+                                    val maxRepeat = worst?.second ?: 0
+                                    val stubbornDetail = worst?.let { (topSig, _) ->
+                                        smokeErrors.firstOrNull { StubbornErrorTracker.issueSignature("smoke", it) == topSig }
+                                    }
+                                    appendEscalation(messages, maxRepeat, "沙箱运行", stubbornDetail)
+                                    messages += ChatMessage(
+                                        "user",
+                                        "基础校验已通过，但冒烟测试未通过（确定性 tick ${smoke.framesRun} 帧）：" +
+                                            smokeErrors.take(5).joinToString("；") +
+                                            "\n请用 editfile 修复；沙箱跑通前不要结束。"
+                                    )
+                                    continue
                                 }
-                                val normalized = ErrorSignature.normalize("冒烟测试失败:" + smokeErrors.joinToString(";"))
-                                val known = RetryBookkeeping.record(_session.value.knownErrors, ErrorCategory.USER_RUNTIME, normalized)
-                                saveGlobalErrorSignatures(known)
-                                // 写入 lastError：冒烟类熔断后的重试轮才有具体问题可修，
-                                // 否则重试轮上下文看不到任何遗留问题（rolling summary 是旧的"通过"）。
-                                _session.value = _session.value.copy(
-                                    knownErrors = known,
-                                    lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
-                                    knownIssues = smokeErrors.take(5)
-                                )
-                                stubborn = StubbornErrorTracker.update(
-                                    stubborn,
-                                    smokeErrors.map { StubbornErrorTracker.issueSignature("sandbox", it) }.toSet()
-                                )
-                                val worst = StubbornErrorTracker.worst(stubborn)
-                                val maxRepeat = worst?.second ?: 0
-                                val stubbornDetail = worst?.let { (topSig, _) ->
-                                    smokeErrors.firstOrNull { StubbornErrorTracker.issueSignature("smoke", it) == topSig }
-                                }
-                                appendEscalation(messages, maxRepeat, "沙箱运行", stubbornDetail)
-                                messages += ChatMessage(
-                                    "user",
-                                    "基础校验已通过，但冒烟测试未通过（确定性 tick ${smoke.framesRun} 帧）：" +
-                                        smokeErrors.take(5).joinToString("；") +
-                                        "\n请用 editfile 修复；沙箱跑通前不要结束。"
-                                )
+                            }
+                            // 沙箱通过（或慢环境超时无错误按通过）：先消费可玩性自检轮
+                            // （内容完整性→体验与平台合规），每轮自检后重新走校验+沙箱验收。
+                            val review = selfReviews.removeFirstOrNull()
+                            if (review != null) {
+                                alog("self-review round: ${review.first} (rounds so far=$round)")
+                                _session.value = _session.value.copy(agentStage = review.first)
+                                messages += ChatMessage("user", review.second)
                                 continue
                             }
                             alog("ACCEPTED(tool): rounds=$round bytes=${content.toByteArray(Charsets.UTF_8).size} warnings=${report.warnings.size}")
-                            if (!selfReviewed) {
-                                selfReviewed = true
-                                alog("self-review round: playability checklist")
-                                _session.value = _session.value.copy(agentStage = "校验中：可玩性自检")
-                                messages += ChatMessage(
-                                    "user",
-                                    "沙箱运行已通过。请对照【可玩性要求】逐条自查这款游戏，" +
-                                        "用 editfile/appendfile 修复所有缺口（完整体验闭环/数值反馈/难度递进/触控体验/默认参数/画面完整），" +
-                                        "全部满足后再声明完成。"
-                                )
-                                continue
-                            }
                             return GenOutcome.Accepted(content, resp.text, round, report)
                         }
                         if (nudgesLeft <= 0) {
@@ -1262,7 +1267,8 @@ class GameAgent(
     ): GenOutcome {
         var workingHtml = existingHtml
         var feedback = ""
-        var legacySelfReviewed = false
+        // 兼容模式与工具模式共用同一组可玩性自检轮提示（随轮次预算分档），全部消费完才交付。
+        val legacyReviews = ArrayDeque(GamePrompt.selfReviewPrompts(_session.value.expectedLoops.coerceIn(1, 100)))
         var round = 1
         var lastReport = GameValidator.validate(firstCandidate)
         _session.value = _session.value.copy(currentHtml = firstCandidate)
@@ -1273,29 +1279,43 @@ class GameAgent(
                 feedback = "输出与当前版本完全一致。请在保持未要求部分不变的前提下，输出包含本次修改的完整 HTML。"
                 workingHtml = firstCandidate
             } else {
-            // 静态校验通过也要过沙箱冒烟才能交付。
+            // 静态校验通过也要过沙箱冒烟才能交付（通过后同样先消费可玩性自检轮）。
             val smoke = runSmokeTest(firstCandidate)
             if (smoke == null || smoke.passed) {
-                alog("ACCEPTED(legacy-first): bytes=${firstCandidate.toByteArray(Charsets.UTF_8).size}")
-                return GenOutcome.Accepted(firstCandidate, "", round, lastReport)
-            }
-            if (smoke.message == "sandbox-infra") {
+                val review = legacyReviews.removeFirstOrNull()
+                if (review == null) {
+                    alog("ACCEPTED(legacy-first): bytes=${firstCandidate.toByteArray(Charsets.UTF_8).size}")
+                    return GenOutcome.Accepted(firstCandidate, "", round, lastReport)
+                }
+                alog("self-review round (legacy-first): ${review.first}")
+                feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
+                _session.value = _session.value.copy(agentStage = review.first)
+            } else if (smoke.message == "sandbox-infra") {
                 failTurn(_session.value, USER_MSG_SANDBOX_ENV, internalDetail = "兼容模式沙箱设施异常（首个候选），未交付")
                 return GenOutcome.Failed
+            } else {
+                val smokeErrors = (smoke.errors + listOfNotNull(smoke.message?.takeIf { it == "smoke-timeout" }))
+                    .filter { it.isNotBlank() }
+                    .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
+                if (smokeErrors.isEmpty()) {
+                    // 慢环境超时无真实错误：按通过处理，同样先消费自检轮。
+                    val review = legacyReviews.removeFirstOrNull()
+                    if (review == null) {
+                        alog("legacy sandbox timeout WITHOUT errors -> ACCEPTED (slow env)")
+                        return GenOutcome.Accepted(firstCandidate, "", round, lastReport)
+                    }
+                    alog("self-review round (legacy-timeout-pass): ${review.first}")
+                    feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
+                    _session.value = _session.value.copy(agentStage = review.first)
+                } else {
+                    _session.value = _session.value.copy(
+                        lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
+                        knownIssues = smokeErrors.take(5)
+                    )
+                    feedback = "沙箱运行未通过（确定性 tick ${smoke.framesRun} 帧）：" +
+                        smokeErrors.take(5).joinToString("；") + "。请修复后重新输出完整 HTML。"
+                }
             }
-            val smokeErrors = (smoke.errors + listOfNotNull(smoke.message?.takeIf { it == "smoke-timeout" }))
-                .filter { it.isNotBlank() }
-                .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
-            if (smokeErrors.isEmpty()) {
-                alog("legacy sandbox timeout WITHOUT errors -> ACCEPTED (slow env)")
-                return GenOutcome.Accepted(firstCandidate, "", round, lastReport)
-            }
-            _session.value = _session.value.copy(
-                lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
-                knownIssues = smokeErrors.take(5)
-            )
-            feedback = "沙箱运行未通过（确定性 tick ${smoke.framesRun} 帧）：" +
-                smokeErrors.take(5).joinToString("；") + "。请修复后重新输出完整 HTML。"
             }
         } else {
             recordKnownErrors(lastReport)
@@ -1379,8 +1399,17 @@ class GameAgent(
                     .filter { it.isNotBlank() }
                     .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
                 if (smokeErrors.isEmpty()) {
-                    alog("legacy sandbox timeout WITHOUT errors -> ACCEPTED (slow env)")
-                    return GenOutcome.Accepted(candidate, "", round, lastReport)
+                    // 慢环境超时无真实错误：按通过处理，同样先消费自检轮。
+                    val timeoutReview = legacyReviews.removeFirstOrNull()
+                    if (timeoutReview == null) {
+                        alog("legacy sandbox timeout WITHOUT errors -> ACCEPTED (slow env)")
+                        return GenOutcome.Accepted(candidate, "", round, lastReport)
+                    }
+                    alog("self-review round (legacy-timeout-pass): ${timeoutReview.first}")
+                    feedback = timeoutReview.second + "\n请输出修复或确认后的完整 HTML。"
+                    workingHtml = candidate
+                    _session.value = _session.value.copy(agentStage = timeoutReview.first)
+                    continue
                 }
                 feedback = "基础校验已通过，但冒烟测试未通过（确定性 tick ${smoke.framesRun} 帧）：" +
                     smokeErrors.take(5).joinToString("；") + "。请修复后重新输出完整 HTML。"
@@ -1393,15 +1422,15 @@ class GameAgent(
                 continue
             }
 
-            alog("ACCEPTED(legacy): rounds=$round bytes=${candidate.toByteArray(Charsets.UTF_8).size}")
-            if (!legacySelfReviewed) {
-                legacySelfReviewed = true
-                alog("self-review round (legacy): playability checklist")
-                feedback = "沙箱运行已通过。请对照【可玩性要求】逐条自查，输出修复所有缺口后的完整 HTML（完整体验闭环/数值反馈/难度递进/触控体验/默认参数/画面完整）。"
+            val review = legacyReviews.removeFirstOrNull()
+            if (review != null) {
+                alog("self-review round (legacy): ${review.first}")
+                feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
                 workingHtml = candidate
-                _session.value = _session.value.copy(agentStage = "校验中：可玩性自检")
+                _session.value = _session.value.copy(agentStage = review.first)
                 continue
             }
+            alog("ACCEPTED(legacy): rounds=$round bytes=${candidate.toByteArray(Charsets.UTF_8).size}")
             return GenOutcome.Accepted(candidate, "", round, lastReport)
         }
     }
@@ -1431,6 +1460,8 @@ class GameAgent(
         }
         append("用户指令：$instruction\n\n")
         append(GamePrompt.planContext(plan))
+        append("\n\n")
+        append(GamePrompt.loopBudgetPrompt(_session.value.expectedLoops))
         append("\n\n")
         append(GamePrompt.toolWorkflowPrompt(firstGeneration))
         append("\n\n")
@@ -1712,6 +1743,8 @@ class GameAgent(
         val body = buildString {
             append("用户指令：$instruction\n\n")
             append(GamePrompt.planContext(plan))
+            append("\n\n")
+            append(GamePrompt.loopBudgetPrompt(_session.value.expectedLoops))
             val leftovers = leftoverIssues()
             if (leftovers.isNotBlank()) {
                 append("\n【上一轮遗留问题（未解决，本轮最优先处理）】\n$leftovers\n")

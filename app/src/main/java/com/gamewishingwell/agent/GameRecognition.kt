@@ -47,10 +47,12 @@ data class IntentConfirmation(
     /** true 表示本卡片由确认门的文本修正触发重组生成（区别于首次识别）。 */
     val revised: Boolean = false,
     /**
-     * 确认时玩家取消勾选的 module：只随卡片消息持久化用于历史卡回显，
+     * 玩家取消勾选的 module：只随卡片消息持久化用于历史卡回显，
      * 不注入任何提示词，也不进入排除清单。
      */
-    val uncheckedModules: List<String> = emptyList()
+    val uncheckedModules: List<String> = emptyList(),
+    /** 用户预期的 Agent Loop 轮数（卡片滑条 1~100，默认 5）；确认后写入会话驱动生成策略档位。 */
+    val expectedLoops: Int = 5
 ) {
     /** 确认门实际共享的 Game Schema JSON（兼容旧版 intent 字段）。 */
     val schema: GameSchema get() = gameSchema ?: intent?.toGameSchema() ?: GameSchema()

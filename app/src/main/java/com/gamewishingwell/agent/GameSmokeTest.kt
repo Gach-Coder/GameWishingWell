@@ -41,15 +41,20 @@ object NoopSmokeTestRunner : SmokeTestRunner {
 
 /**
  * 沙箱校验探针：把 requestAnimationFrame 改成确定性 tick 队列，DOMContentLoaded 后
- * 同步跑满最多 [MAX_FRAMES] 帧；任何帧内异常、全局异常（含事件回调）与 console
- * error 都会被捕获；派发一次合成 touchstart 扩大交互路径覆盖；localStorage 替换为
- * 内存 stub，避免沙箱 iframe 的 opaque origin 抛 SecurityError 造成环境性误报；
+ * 跑满最多 [MAX_FRAMES] 帧（每帧 50ms 游戏时间，覆盖开始交互后的早期玩法而不只是首帧渲染）；
+ * 任何帧内异常、全局异常（含事件回调）与 console error 都会被捕获；
+ * 合成交互在多点位（中心/底部/左右下侧）派发 touchstart/touchend/click 并做一次拖动，
+ * 开始后与跑帧中段各一轮；localStorage 替换为内存 stub，避免沙箱跨源异常；
+ * 跑满帧后做白屏检测与顶部保留区扫描（平台操作条区域内出现可交互元素即失败）；
  * 同时设置超时兜底，防止定时器失控。
  *
  * 沙箱是运行正确性的唯一校验来源：passed = 跑满 tick 且无任何错误文本。
  */
 object SmokeTestProbe {
-    const val MAX_FRAMES = 8
+    /** 确定性 tick 帧数：每帧 50ms 游戏时间，共约 1.2s——覆盖出怪、数值变动、状态切换等早期玩法。 */
+    const val MAX_FRAMES = 24
+    /** 平台顶部保留区高度（px）：区域内出现可交互元素即判失败（会被平台操作条遮挡）。 */
+    const val RESERVED_TOP_PX = 110
     private const val MARKER = "__wwSmokeInstalled"
 
     fun inject(html: String): String {
@@ -97,45 +102,81 @@ object SmokeTestProbe {
               function pump(){
                 if (ticked >= ${MAX_FRAMES}) {
                   blankCheck();
+                  reservedAreaCheck();
                   window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: ticked, errors: window.__wwSmokeResult.errors};
                   if (timer) { clearTimeout(timer); timer = null; }
                   return;
                 }
                 ticked++;
-                var now = ticked * 16.7;
+                var now = ticked * 50; // 每帧 50ms 游戏时间（dt 恰为健壮性契约的钳制上限）
                 var batch = window.__wwSmokePending.splice(0, window.__wwSmokePending.length);
                 for (var i = 0; i < batch.length; i++) {
                   try { batch[i](now); }
                   catch (e) { window.__wwSmokeResult.errors.push(String(e && e.message || e)); }
                 }
+                if (ticked === ${MAX_FRAMES / 2}) { pokeTouch(); } // 中段再交互一轮：让游戏进入运行态后的处理器也得到执行
                 if (window.__wwSmokePending.length > 0) {
                   timer = setTimeout(pump, 0);
                 } else {
                   timer = setTimeout(pump, 40);
                 }
               }
-              // 合成交互：在画布中心派发带坐标的 touchstart 与 click——多数游戏的
-              // "开始"按钮在中心，带坐标的点击才能让游戏真正进入运行态（供画面检测采样）。
+              // 合成交互：多点位派发 touchstart/touchend 与 click（中心/底部中央/左右下侧，
+              // 命中 elementFromPoint 处的真实元素），再做一次滑动（touchstart→touchmove→touchend）
+              // 覆盖虚拟摇杆/拖动路径；开始后与跑帧中段各派发一轮，让游戏真正进入运行态。
               function pokeTouch(){
                 try {
-                  var target = document.querySelector('canvas') || document.body;
-                  var rect = (target.getBoundingClientRect && target.getBoundingClientRect()) || {width: window.innerWidth, height: window.innerHeight};
-                  var x = (rect.width || window.innerWidth) / 2;
-                  var y = (rect.height || window.innerHeight) / 2;
-                  var ev = null;
-                  try {
-                    var t = new Touch({identifier: 1, target: target, clientX: x, clientY: y});
-                    ev = new TouchEvent('touchstart', {bubbles:true, cancelable:true, touches:[t], targetTouches:[t], changedTouches:[t]});
-                  } catch (e1) {
-                    try { ev = new TouchEvent('touchstart', {bubbles:true, cancelable:true}); }
-                    catch (e2) { ev = document.createEvent('Event'); ev.initEvent('touchstart', true, true); }
-                  }
-                  target.dispatchEvent(ev);
+                  var fallback = document.querySelector('canvas') || document.body;
+                  var vw = window.innerWidth || 360, vh = window.innerHeight || 640;
+                  pokePoint(fallback, vw / 2, vh / 2);
+                  pokePoint(fallback, vw / 2, vh - 90);
+                  pokePoint(fallback, vw * 0.25, vh * 0.7);
+                  pokePoint(fallback, vw * 0.75, vh * 0.7);
+                  dragTouch(fallback, vw / 2, vh * 0.6, vw / 2 + 60, vh * 0.6 - 60);
+                } catch (e) {
+                  window.__wwSmokeResult.errors.push('touch-dispatch:' + String(e && e.message || e));
+                }
+              }
+              function hitTarget(x, y, fallback){
+                try { return document.elementFromPoint(x, y) || fallback; } catch (e) { return fallback; }
+              }
+              function mkTouch(target, x, y){
+                try { return new Touch({identifier: 1, target: target, clientX: x, clientY: y}); }
+                catch (e) { return null; }
+              }
+              function mkTouchEvent(name, t){
+                try {
+                  if (t) return new TouchEvent(name, {bubbles:true, cancelable:true, touches:[t], targetTouches:[t], changedTouches:[t]});
+                  return new TouchEvent(name, {bubbles:true, cancelable:true});
+                } catch (e1) {
+                  try { var ev = document.createEvent('Event'); ev.initEvent(name, true, true); return ev; }
+                  catch (e2) { return null; }
+                }
+              }
+              function pokePoint(fallback, x, y){
+                try {
+                  var target = hitTarget(x, y, fallback);
+                  var t = mkTouch(target, x, y);
+                  var ts = mkTouchEvent('touchstart', t);
+                  if (ts) target.dispatchEvent(ts);
                   var click = document.createEvent('MouseEvents');
                   click.initMouseEvent('click', true, true, window, 1, x, y, x, y, false, false, false, false, 0, null);
                   target.dispatchEvent(click);
+                  var te = mkTouchEvent('touchend', t);
+                  if (te) target.dispatchEvent(te);
                 } catch (e) {
                   window.__wwSmokeResult.errors.push('touch-dispatch:' + String(e && e.message || e));
+                }
+              }
+              function dragTouch(fallback, x0, y0, x1, y1){
+                try {
+                  var target = hitTarget(x0, y0, fallback);
+                  var t0 = mkTouch(target, x0, y0), t1 = mkTouch(target, x1, y1);
+                  var a = mkTouchEvent('touchstart', t0); if (a) target.dispatchEvent(a);
+                  var m = mkTouchEvent('touchmove', t1); if (m) target.dispatchEvent(m);
+                  var b = mkTouchEvent('touchend', t1); if (b) target.dispatchEvent(b);
+                } catch (e) {
+                  window.__wwSmokeResult.errors.push('touch-drag:' + String(e && e.message || e));
                 }
               }
               // 画面空白检测：跑满帧后所有 canvas 均无内容且页面无可读文本 = 白屏假通过。
@@ -156,6 +197,31 @@ object SmokeTestProbe {
                   }
                 } catch (e) {}
               }
+              // 顶部保留区执法（平台契约）：约 ${RESERVED_TOP_PX}px 平台操作条区域（左返回/右设置）内
+              // 出现任何可交互元素即失败——会被平台顶栏遮挡而无法点击，报错文本直接可执行
+              // （提示移入安全区）。文字标签仅在中央允许、无法静态判定，由生成提示词约束。
+              function reservedAreaCheck(){
+                try {
+                  var bad = [];
+                  var els = document.querySelectorAll('button,a,[role="button"],input,select,textarea,[onclick]');
+                  for (var i = 0; i < els.length; i++) {
+                    var el = els[i];
+                    if (el.id && String(el.id).indexOf('__ww') === 0) continue;
+                    var r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    var st = null;
+                    try { st = window.getComputedStyle(el); } catch (e0) {}
+                    if (st && (st.display === 'none' || st.visibility === 'hidden' || st.pointerEvents === 'none')) continue;
+                    if (r.top < ${RESERVED_TOP_PX}) {
+                      var label = ((el.innerText || el.value || el.getAttribute('aria-label') || el.tagName || '') + '').trim().slice(0, 16);
+                      bad.push(el.tagName.toLowerCase() + (label ? '(' + label + ')' : '') + '@top' + Math.round(r.top));
+                    }
+                  }
+                  if (bad.length) {
+                    window.__wwSmokeResult.errors.push('top-reserved-area: 顶部约${RESERVED_TOP_PX}px 平台保留区内出现可交互元素（会被平台操作条遮挡无法点击）：' + bad.slice(0, 3).join(' | ') + '；请将这些元素整体移到安全区（top 约 120px 以下）');
+                  }
+                } catch (e) {}
+              }
               function start(){
                 if (document.readyState !== 'loading') { setTimeout(pump, 10); setTimeout(pokeTouch, 60); }
                 else { window.addEventListener('DOMContentLoaded', function(){ setTimeout(pump, 10); setTimeout(pokeTouch, 60); }); }
@@ -165,7 +231,7 @@ object SmokeTestProbe {
                 if (ticked < ${MAX_FRAMES}) {
                   window.__wwSmokeResult = {passed:false, framesRun:ticked, errors:window.__wwSmokeResult.errors.concat(['smoke-timeout'])};
                 }
-              }, 15000);
+              }, 45000);
             })();
             </script>
         """.trimIndent()
@@ -330,8 +396,8 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
     }
 
     private companion object {
-        // 外层兜底超时：模拟器/低端机 WebView 慢，给足余量；仅防挂起。
-        const val TIMEOUT_MS = 30_000L
+        // 外层兜底超时：模拟器/低端机 WebView 慢（离屏节流定时器至约1次/秒，24 帧需 25~35s），给足余量；仅防挂起。
+        const val TIMEOUT_MS = 80_000L
         const val FIRST_POLL_DELAY_MS = 1_200L
         const val POLL_INTERVAL_MS = 700L
     }

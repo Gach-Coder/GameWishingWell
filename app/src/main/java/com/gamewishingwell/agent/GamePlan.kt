@@ -570,7 +570,7 @@ object PlanningEngine {
     /**
      * 策划层的排除清单：只包含玩家在文本里明确排除的系统（如“不要商店经济”）。
      * 勾选机制是纯加法：design_schema.systems 即本轮要实现的范围，范围之外的
-     * 系统不做任何禁止——模型按用户原话与最简可玩原则自行取舍；
+     * 系统不做任何禁止——模型按用户原话与类型标配的完整可玩版本自行取舍；
      * 取消勾选 ≠ 禁止实现（后续文本点名该系统自动恢复）。
      */
     private fun buildExcludedSystems(schema: GameSchema): List<String> =

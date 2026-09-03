@@ -49,9 +49,10 @@ class ChatViewModel(
         viewModelScope.launch { agent.fixWithError(error) }
     }
 
-    /** 确认门入口；[uncheckedModules] 为卡片上取消勾选、玩家不希望实现的系统。 */
-    fun confirmIntent(uncheckedModules: Set<String> = emptySet()) {
-        viewModelScope.launch { agent.confirmIntent(uncheckedModules) }
+    /** 确认门入口；[uncheckedModules] 为卡片上取消勾选、玩家不希望实现的系统；
+     *  [expectedLoops] 为玩家预期的 Agent Loop 轮数（1~100，默认 5）。 */
+    fun confirmIntent(uncheckedModules: Set<String> = emptySet(), expectedLoops: Int = 5) {
+        viewModelScope.launch { agent.confirmIntent(uncheckedModules, expectedLoops) }
     }
 
     fun saveAs(title: String, onDone: (GameMeta?) -> Unit) {

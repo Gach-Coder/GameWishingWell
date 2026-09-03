@@ -22,12 +22,15 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -73,7 +76,21 @@ fun GameScreen(
     var webView by remember { mutableStateOf<WebView?>(null) }
     var loadedHtml by remember { mutableStateOf<String?>(null) }
     var showSaveDialog by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var volume by remember { mutableStateOf(0.8f) }
     var loadDone by remember { mutableStateOf(false) }
+
+    // 游戏设置面板（顶栏右侧入口）：打开时暂停游戏（rAF 挂起），关闭恢复。
+    val closeSettings: () -> Unit = {
+        showSettings = false
+        webView?.evaluateJavascript("window.__wwSetPaused && window.__wwSetPaused(false)", null)
+    }
+    val restartGame: () -> Unit = {
+        webView?.evaluateJavascript(
+            "(function(){try{if(typeof window.restart==='function'){window.restart();}else{console.error('[游戏错误] 重新游戏失败: 未找到 restart()');}}catch(err){console.error('[游戏错误] 重新游戏失败: ' + err.message);}})()",
+            null
+        )
+    }
 
     LaunchedEffect(Unit) { vm.load(source, gameId); loadDone = true }
 
@@ -162,10 +179,11 @@ fun GameScreen(
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.weight(1f)
                 )
-                if (source == "draft") {
-                    TextButton(onClick = { showSaveDialog = true }) {
-                        Text("保存", color = Color.White)
-                    }
+                IconButton(onClick = {
+                    webView?.evaluateJavascript("window.__wwSetPaused && window.__wwSetPaused(true)", null)
+                    showSettings = true
+                }) {
+                    Icon(Icons.Filled.Settings, contentDescription = "设置", tint = Color.White)
                 }
             }
         }
@@ -207,6 +225,55 @@ fun GameScreen(
                 }
             }
         }
+    }
+
+    if (showSettings) {
+        AlertDialog(
+            onDismissRequest = closeSettings,
+            title = { Text("游戏设置") },
+            text = {
+                Column {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("音量")
+                        Text("${(volume * 100).toInt()}%")
+                    }
+                    Slider(
+                        value = volume,
+                        onValueChange = {
+                            volume = it
+                            webView?.evaluateJavascript("window.__wwSetVolume && window.__wwSetVolume($it)", null)
+                        },
+                        valueRange = 0f..1.5f
+                    )
+                    Spacer(Modifier.size(4.dp))
+                    Text(
+                        "重新游戏会重置本局进度；保存仅对未入库的草稿开放。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (source == "draft") {
+                        OutlinedButton(onClick = {
+                            closeSettings()
+                            showSaveDialog = true
+                        }) { Text("保存游戏") }
+                    }
+                    Button(onClick = {
+                        restartGame()
+                        closeSettings()
+                    }) { Text("重新游戏") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = closeSettings) { Text("继续游戏") }
+            }
+        )
     }
 
     if (showSaveDialog) {

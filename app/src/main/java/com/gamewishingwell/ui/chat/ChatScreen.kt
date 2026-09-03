@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -33,11 +34,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -49,7 +52,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
@@ -155,7 +161,7 @@ fun ChatScreen(
                             IntentConfirmationCard(
                                 confirmation = card,
                                 enabled = index == enabledCardIndex && !session.isGenerating,
-                                onConfirm = { unchecked -> vm.confirmIntent(unchecked) }
+                                onConfirm = { unchecked, expectedLoops -> vm.confirmIntent(unchecked, expectedLoops) }
                             )
                         } else {
                             MessageBubble(msg)
@@ -246,17 +252,29 @@ private fun TypingBubble(stage: String) {
     }
 }
 
+/** Agent Loop 轮数挡位：滑条只在这些值之间跳动（索引 0..15 ↔ 轮数双向映射）。 */
+private val LoopStops = listOf(1, 2, 3, 4, 5, 8, 10, 12, 15, 20, 25, 30, 40, 50, 75, 100)
+
 @Composable
 private fun IntentConfirmationCard(
     confirmation: IntentConfirmation,
     enabled: Boolean,
-    onConfirm: (Set<String>) -> Unit
+    onConfirm: (Set<String>, Int) -> Unit
 ) {
     // 勾选状态默认全选；确认时锁定进卡片消息（uncheckedModules），历史卡重显不复位。
     val checkedModules = remember(confirmation) {
         mutableStateMapOf<String, Boolean>().apply {
             confirmation.modules.forEach { put(it.module, it.module !in confirmation.uncheckedModules) }
         }
+    }
+    // 用户预期的 Agent Loop 轮数（挡位式，默认取卡片持久值就近上靠）：驱动质量/成本档位。
+    // 状态存滑条索引（Float，0..15），挡位值经 LoopStops 映射。
+    var loopIndex by remember(confirmation) {
+        mutableStateOf(
+            LoopStops.indexOfFirst { it >= confirmation.expectedLoops }
+                .let { if (it < 0) LoopStops.lastIndex else it }
+                .toFloat()
+        )
     }
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer,
@@ -309,6 +327,48 @@ private fun IntentConfirmationCard(
                         }
                     }
                 }
+                // 全选开关（置于最后一项下方）：一键全选 / 全不选所有系统；半选表示当前部分勾选。
+                // 全不选＝裸需求模式（不套用预设系统清单，以用户原话为准），下方给出一行提示。
+                val allSelected = confirmation.modules.all { checkedModules[it.module] == true }
+                val noneSelected = confirmation.modules.none { checkedModules[it.module] == true }
+                val allToggleState = when {
+                    allSelected -> ToggleableState.On
+                    noneSelected -> ToggleableState.Off
+                    else -> ToggleableState.Indeterminate
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .toggleable(
+                            value = allSelected,
+                            role = Role.Checkbox,
+                            enabled = enabled,
+                            onValueChange = { selectAll ->
+                                confirmation.modules.forEach { checkedModules[it.module] = selectAll }
+                            }
+                        )
+                        .padding(top = 4.dp)
+                ) {
+                    TriStateCheckbox(
+                        state = allToggleState,
+                        onClick = null,
+                        enabled = enabled
+                    )
+                    Text(
+                        "全选",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(start = 4.dp)
+                    )
+                }
+                if (noneSelected) {
+                    Text(
+                        "当前全部未勾选：将不套用预设系统清单，完全以你的原话为准，由 AI 自行判断需要哪些系统。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f),
+                        modifier = Modifier.padding(start = 12.dp, top = 2.dp)
+                    )
+                }
             } else if (confirmation.systemExplanations.isNotEmpty()) {
                 // 旧会话兼容：无结构化 module 数据时退化为纯文本回显
                 Spacer(Modifier.size(6.dp))
@@ -325,6 +385,41 @@ private fun IntentConfirmationCard(
                     )
                 }
             }
+            // 轮次预算滑条（挡位式）：用户预期的 Agent Loop 轮数，确认后写入会话
+            // 并驱动生成策略档位（快速/均衡/精品）。
+            val loops = LoopStops[loopIndex.roundToInt()]
+            val tierLabel = when {
+                loops <= 2 -> "快速：最简一步到位，无自检轮"
+                loops <= 10 -> "均衡：类型标配完整实现，两轮自检"
+                else -> "精品：内容更丰富＋打磨，三轮自检"
+            }
+            Spacer(Modifier.size(10.dp))
+            Text(
+                "生成预算：Agent Loop 轮数（越大越重视质量，耗时与消耗也越大）",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+            )
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "$loops 轮",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    tierLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+                )
+            }
+            Slider(
+                value = loopIndex,
+                onValueChange = { loopIndex = it.roundToInt().toFloat() },
+                valueRange = 0f..LoopStops.lastIndex.toFloat(),
+                steps = LoopStops.size - 2,
+                enabled = enabled
+            )
             if (confirmation.designAssumptions.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
@@ -350,7 +445,7 @@ private fun IntentConfirmationCard(
             }
             Spacer(Modifier.size(10.dp))
             Button(
-                onClick = { onConfirm(checkedModules.filterValues { !it }.keys) },
+                onClick = { onConfirm(checkedModules.filterValues { !it }.keys, LoopStops[loopIndex.roundToInt()]) },
                 enabled = enabled,
                 modifier = Modifier.fillMaxWidth()
             ) {
