@@ -36,8 +36,8 @@ class ChatViewModel(
     }
 
     fun regenerate() {
-        lastInstruction?.let {
-            viewModelScope.launch { agent.sendUserMessage(it) }
+        lastInstruction?.let { instr ->
+            viewModelScope.launch { agent.regenerate(instr) }
         }
     }
 

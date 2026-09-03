@@ -107,15 +107,3 @@ class GamePlanTest {
     }
 
 }
-
-class QualityGateTest {
-    @Test
-    fun `静态错误不得翻案`() {
-        val plan = PlanningEngine.build(IntentEngine.infer("做一个打地鼠游戏", null))
-        val html = "<html><body><canvas id='g'></canvas><script>var x = ;</script></body></html>"
-        val report = GameValidator.validate(html)
-        val verdict = QualityGate.evaluate(report, plan, html)
-        assertTrue(!verdict.pass)
-        assertTrue(verdict.fails.any { it.item.contains("校验报错") })
-    }
-}

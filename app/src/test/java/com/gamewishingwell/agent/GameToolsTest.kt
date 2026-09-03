@@ -43,15 +43,21 @@ class GameToolsTest {
     }
 
     @Test
-    fun `writefile 对已存在文件默认拒绝并提示 editfile`() = runBlocking {
+    fun `writefile 可覆盖已存在文件且版本递增`() = runBlocking {
         val (ws, dir) = newWorkspace()
         val executor = GameToolExecutor(ws)
         executor.execute(call(GameTools.WRITE_FILE, """{"content":"v1"}"""))
         val out = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
-        assertFalse(out.ok)
-        assertFalse(out.mutated)
-        assertTrue(out.observation.contains("editfile"))
-        assertEquals("v1", ws.read("index.html"))
+        // 一般 Agent 惯例：Write 支持新建与整量覆盖，不做策略门禁
+        assertTrue(out.ok)
+        assertTrue(out.mutated)
+        assertEquals("v2", ws.read("index.html"))
+        assertTrue(out.observation.contains("v2"))
+        // 内容一致时不产生变更
+        val same = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
+        assertTrue(same.ok)
+        assertFalse(same.mutated)
+        assertTrue(same.observation.contains("完全一致"))
         dir.deleteRecursively()
         Unit
     }
@@ -174,13 +180,21 @@ class GameToolsTest {
     }
 
     @Test
-    fun `参数 JSON 截断时给出分步写入提示`() = runBlocking {
+    fun `appendfile 在文件末尾追加内容`() = runBlocking {
         val (ws, dir) = newWorkspace()
         val executor = GameToolExecutor(ws)
-        val out = executor.execute(call(GameTools.WRITE_FILE, """{"content":"<html truncated"""))
-        assertFalse(out.ok)
-        assertTrue(out.observation.contains("分步写入"))
+        ws.writeInitial("index.html", "<html><body>")
+        val out = executor.execute(call(GameTools.APPEND_FILE, """{"content":"<script>var a = 1;</script>"}"""))
+        assertTrue(out.ok)
+        assertTrue(out.mutated)
+        assertTrue(out.observation.contains("已追加 1 行"))
+        assertEquals("<html><body>\n<script>var a = 1;</script>", ws.read("index.html"))
+        // 二次追加继续累积，无行数限制
+        val again = executor.execute(call(GameTools.APPEND_FILE, """{"content":"\n<script>var b = 2;</script>"}"""))
+        assertTrue(again.ok)
+        assertTrue(ws.read("index.html")!!.contains("var b = 2;"))
         dir.deleteRecursively()
         Unit
     }
+
 }

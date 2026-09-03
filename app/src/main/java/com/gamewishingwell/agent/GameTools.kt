@@ -16,6 +16,7 @@ object GameTools {
     const val READ_FILE = "readfile"
     const val WRITE_FILE = "writefile"
     const val EDIT_FILE = "editfile"
+    const val APPEND_FILE = "appendfile"
 
     private const val PATH_DESC = "工作区内的相对路径，本项目单文件固定为 index.html"
 
@@ -32,12 +33,17 @@ object GameTools {
         ),
         ToolSpec(
             name = WRITE_FILE,
-            description = "全量写入一个文件。仅限首次生成；文件已存在时必须显式传 overwrite=true（仅结构性重构时允许），常规修改必须改用 editfile。写入后系统自动运行基础校验并在结果中回传报告。",
-            parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"完整文件内容"},"overwrite":{"type":"boolean","description":"文件已存在时是否允许全量替换，默认 false"}},"required":["content"]}"""
+            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段。写入后系统自动检查产品契约并在结果中回传。",
+            parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"完整文件内容"}},"required":["content"]}"""
+        ),
+        ToolSpec(
+            name = APPEND_FILE,
+            description = "在文件末尾追加一段内容。适合新增代码段/模块；追加后系统自动检查产品契约并在结果中回传。",
+            parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"要追加到文件末尾的内容"}},"required":["content"]}"""
         ),
         ToolSpec(
             name = EDIT_FILE,
-            description = "对已有文件做字符串精确替换（增量修改，保持其余内容不变）。old_string 必须与文件原文完全一致；出现多处时需提供更长上下文使其唯一，或传 replace_all=true。写入后系统自动运行基础校验并在结果中回传报告。",
+            description = "对已有文件做字符串精确替换（增量修改，保持其余内容不变）。old_string 必须与文件原文完全一致；出现多处时需提供更长上下文使其唯一，或传 replace_all=true。写入后系统自动检查产品契约并在结果中回传。",
             parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"old_string":{"type":"string","description":"要替换的原文片段，必须逐字符匹配"},"new_string":{"type":"string","description":"替换后的内容"},"replace_all":{"type":"boolean","description":"old_string 多处出现时是否全部替换，默认 false"}},"required":["old_string","new_string"]}"""
         )
     )
@@ -75,9 +81,7 @@ class GameToolExecutor(
         } catch (e: Exception) {
             return outcome(
                 call, ok = false,
-                observation = "参数不是合法 JSON 对象：${e.message}\n" +
-                    "常见原因是整文件内容超出单次输出长度被截断。请改为分步写入：" +
-                    "先 writefile 写入精简骨架（HTML+CSS+核心循环），再用 editfile 逐段追加模块。"
+                observation = "参数不是合法 JSON 对象：${e.message}"
             )
         }
         return try {
@@ -85,6 +89,7 @@ class GameToolExecutor(
                 GameTools.LIST_FILES -> listFiles(call)
                 GameTools.READ_FILE -> readFile(call, args)
                 GameTools.WRITE_FILE -> writeFile(call, args)
+                GameTools.APPEND_FILE -> appendFile(call, args)
                 GameTools.EDIT_FILE -> editFile(call, args)
                 else -> outcome(call, ok = false, observation = "未知工具：${call.name}（可用：${GameTools.specs().joinToString { it.name }}）")
             }
@@ -124,24 +129,34 @@ class GameToolExecutor(
         val path = args.optString("path") ?: GameFileWorkspaceEntryPoint.DEFAULT
         val content = args.optString("content")
             ?: return outcome(call, ok = false, observation = "缺少必填参数 content（完整文件内容）")
-        val overwrite = args.optBool("overwrite") ?: false
         val existing = workspace.read(path)
-        if (existing != null && !overwrite) {
-            return outcome(
-                call, ok = false,
-                observation = "文件 $path 已存在（v${versionOf(path)}）。常规修改请改用 editfile 做增量替换；" +
-                    "只有结构性重构才允许传 overwrite=true 全量替换。"
-            )
-        }
         if (existing != null && existing == content) {
             return outcome(call, ok = true, observation = "写入内容与当前版本完全一致，未产生变更。")
         }
+        // 一般 Agent 惯例：Write 新建或整量覆盖均可（版本化写入保底可回滚），
+        // 用 Write 还是 Edit 由模型按任务自行权衡，执行层不做策略门禁。
         val saved = if (existing == null) {
             workspace.writeInitial(path, content)
         } else {
             workspace.writeUpdated(path, content)
         } ?: return outcome(call, ok = false, observation = "写入失败：$path（沙箱路径非法或哈希校验未通过）")
         return mutatedOutcome(call, path, content, saved.version)
+    }
+
+    /** 在文件末尾追加内容。 */
+    private suspend fun appendFile(call: ToolCallData, args: JsonObject): ToolOutcome {
+        val path = args.optString("path") ?: GameFileWorkspaceEntryPoint.DEFAULT
+        val content = args.optString("content")
+            ?: return outcome(call, ok = false, observation = "缺少必填参数 content（要追加的内容）")
+        if (content.isBlank()) {
+            return outcome(call, ok = false, observation = "追加内容为空。")
+        }
+        val existing = workspace.read(path)
+            ?: return outcome(call, ok = false, observation = "文件不存在：$path。请先用 writefile 创建文件。")
+        val updated = if (existing.endsWith("\n") || existing.isEmpty()) existing + content else existing + "\n" + content
+        val saved = workspace.writeUpdated(path, updated)
+            ?: return outcome(call, ok = false, observation = "写入失败：$path（沙箱路径非法或哈希校验未通过）")
+        return mutatedOutcome(call, path, updated, saved.version, appended = content.lines().size)
     }
 
     private suspend fun editFile(call: ToolCallData, args: JsonObject): ToolOutcome {
@@ -183,20 +198,21 @@ class GameToolExecutor(
     private fun versionOf(path: String): Int =
         workspace.manifest().files.firstOrNull { it.path == path }?.version ?: 0
 
-    /** 变更类工具的成功返回：附上自动基础校验报告（观察）；editfile 额外附修改点上下文片段。 */
+    /** 变更类工具的成功返回：附上自动契约检查（观察）；editfile 额外附修改点上下文片段。 */
     private fun mutatedOutcome(
         call: ToolCallData,
         path: String,
         content: String,
         version: Int,
         replaced: Int? = null,
-        newString: String? = null
+        newString: String? = null,
+        appended: Int? = null
     ): ToolOutcome {
         val report = validate(content)
-        val head = if (replaced != null) {
-            "已替换 $replaced 处并写入 $path（v$version，${content.length} 字符）。"
-        } else {
-            "已写入 $path（v$version，${content.length} 字符）。"
+        val head = when {
+            appended != null -> "已追加 $appended 行并写入 $path（v$version，现共 ${content.lines().size} 行）。"
+            replaced != null -> "已替换 $replaced 处并写入 $path（v$version，${content.length} 字符）。"
+            else -> "已写入 $path（v$version，${content.length} 字符）。"
         }
         val contextBlock = if (newString != null) editContextSnippet(content, newString) else null
         val observation = head + (contextBlock ?: "") + formatValidation(report)

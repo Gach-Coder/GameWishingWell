@@ -23,6 +23,9 @@
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
    DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 自定义，
    支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”。
+   页面最下方显示 版本号 + 软件编译时间（BUILD_TIME，构建时写入 BuildConfig）——
+   用于确认设备上运行的构建版本（Android Studio Apply Changes 热更新不刷新系统安装时间，
+   不能靠"应用信息"的安装时间判断版本新旧）。
    （注：Deepseek模型为deepseek-v4-flash和deepseek-v4-pro,已弃用deepseek-chat）
 
 核心思路：游戏不是编译出来的，而是 AI 生成的文本 = 可运行产物（HTML 文件），
@@ -90,29 +93,59 @@ Agent处理message流程如下：
 		按 template_class（画面维度×画面方向×主类型）选取特征矩阵（系统×默认参数），只做"选系统+覆盖参数"，不自由发明
 	→ Prompt：根据用户最后确认的完整信息组成游戏内容提示文本加入system 提示词（工具模式：文件内容一律经工具写入，回复正文不出现代码）+ 上下文最小化：
 		首次生成放参考模板；迭代放 rolling summary（"最新内容请通过 readfile 获取"），其余靠工具按需取
-	→ Agent Loop：（硬上限防死循环：工具模式总轮次40 / 兼容模式15 / 同一错误签名连续10 / 连续24轮无文件修改，任一超限即如实失败终止并保留中间版本；网络层连接30s/读5min/写60s超时防蜂窝NAT死连接）
-		主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/editfile，沙箱严格限游戏工作区目录）
+	→ Agent Loop：（bug 修复轮数不设上限，多轮属正常；仅无进展与运行验证环境异常两类非修复性退出；网络层连接30s/读5min/写60s超时防蜂窝NAT死连接）
+	主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/appendfile/editfile，沙箱严格限游戏工作区目录）
+	写入策略（一般 Agent 惯例：工具能力全开，选择权在模型，系统不做策略门禁）：
+		writefile=整量写入（新建或彻底重写均可，版本化写入保底可回滚）；editfile=精确替换（常规修改首选：改动最小、最快、不回归未要求部分）；
+		appendfile=末尾追加（新增代码段，无行数限制）；用哪个由模型按任务自行权衡，执行层一律放行
+		无截断机制：不捕获/不处理 finish_reason 截断信号，不注入截断相关引导——模型输出由 max_tokens 预设与"最简可玩"体量控制自然约束
 			→ 模型发起 tool call → 宿主经 GameFileWorkspace 执行（版本化文件+指针切换+同会话加锁+hash防并发覆盖；
 			  修改用 old_string 逐字符精确替换且要求唯一（或 replace_all），全量重写仅限首次生成或 overwrite=true 结构性重构）
-			→ 每次写入后宿主自动跑基础校验器，结构化报告作为"观察"附在 tool_result 回传（校验是观察不是门，模型自己决定怎么修）
-			→ 模型不再发起工具调用即自然终止；修改轮验收要求最终内容哈希≠种子哈希（防"不做任何修改就宣称完成"的假成功）
+			→ 每次写入后宿主自动检查产品契约（外部资源/eval 禁令，无解析器代差），报告作为"观察"附在 tool_result 回传
+			→ 模型不再发起工具调用即自然终止；验收 = 产品契约通过 + 修改轮内容哈希≠种子哈希（防"空口完成"）+ 沙箱运行通过
 			→ 每次写入即刻发布中间版本到会话，中断后玩家可立即试玩
 		交付约束：交给用户前必须通过基础校验（0 error）与沙箱冒烟测试（同 WebView 内核确定性 tick 跑通），不存在"带错交付"
-		防死循环与交付约束：不做"带错交付"（交给用户前必须通过基础校验0 error与沙箱冒烟），但设有硬上限——
-			同一错误签名连续3次注入"换思路"提示、连续6次起强制"重写问题模块/换实现"（同签名次数写入阶段条供用户判断是否卡死）；
-			同一错误签名连续10次、总轮次40（工具模式）/15（兼容模式）、连续24轮无文件修改，任一触发即如实失败终止并保留最新中间版本（可试玩，属主动止损而非交付）；
-			熔断签名语义：按"单条错误"追踪（签名=类别+错误消息原文，保留变量名等标识符、不含行号），同一条错误连续N轮未被修掉才计数；
-			错误集合的其它变化（修好一条/新增一条）不清零顽固项的连续计数——聚合式整集合比较会把"修好A新增B、C始终没修"误判为进展而漏熔断，标识符归一化会把不同变量的同类错误合并误熔断，均已规避
-			用户停止键可随时中断（中断后保留中间版本可试玩，属用户主动选择）
-			冒烟测试失败但无任何错误信息（探针结果不可读等设施问题）视为测试设施异常，跳过冒烟不阻塞交付——探针运行在 srcdoc iframe 内，结果经 contentWindow 读取
+	防死循环与交付约束：不做"带错交付"（交给用户前必须沙箱运行通过）——
+		bug 修复轮数不设上限（多轮修复属正常现象，同错误 3/6 次仅注入"换思路/重写模块"提示，不终止）；
+		仅两类非修复性退出熔断：无进展（连续24轮无任何文件修改 / 连续多轮无工具产出）与运行验证环境异常；
+		用户停止键可随时中断（中断后保留中间版本可试玩，属用户主动选择）
+			沙箱失败但无任何错误文本（探针结果不可读等设施问题）视为测试设施异常，以"运行验证环境异常"退出不交付——探针运行在 srcdoc iframe 内，结果经 contentWindow 读取
+			超时语义：探针内部超时 6s/外层兜底 20s（模拟器/低端机 WebView 定时器慢 3~5 倍）；"超时且无任何真实错误文本"= 慢环境时序问题而非游戏缺陷，
+			按通过交付并记决策日志——绝不作为可修错误回传（模型无从修起，只会无限空转）；超时伴随真实错误时只回传真实错误
+	确认门与 Agent Loop 的关系（通用 Agent 流程，参考 DSH/ZaiAgent 形态）：
+		卡片勾选与否只影响 prompt 构建（design_schema 内容），不影响后续 Agent Loop 流程——
+		有勾选：勾选系统进入 design_schema 作为实现清单；无勾选（裸需求模式）：不套用预设系统清单，以用户原话为准；
+		两种情况进入同一个 Agent Loop：生成完整游戏 → 沙箱运行 → 报错文本回传修复 → 循环直至沙箱通过交付
 		协议层：OpenAI 兼容 delta.tool_calls 按 index 流式聚合（arguments 分片拼接）；Anthropic tool_use content block
 			解析与 tool_result 回填（连续工具结果合并进同一 user 消息满足角色交替）；
-			网关不支持 function calling（4xx 提及 tool/function）时去掉 tools 重试，模型首轮在正文直接输出整份 HTML 时
-			自动降级为"全量重写→抽取→校验→文本反馈"回环（每轮重建 prompt 不累积历史，保留为兼容模式）
-		生成代码契约：无 eval、无动态require、浏览器全局白名单、声明前置；
-		校验用现成解析器（Rhino AST 做 acorn 同等的语法检查+no-undef 作用域链 + jsoup 做 htmlparser2 同等 HTML 配对 + 资源自包含检查），不自写 HTML 配对/作用域检查
-		→ 基本校验(可正确运行测试)
-			语法和基本逻辑校验，得到可运行的功能基本正确的游戏，校验成功后退出Agent Loop。
+			网关不支持 function calling（4xx 提及 tool/function）时去掉 tools 重试；
+			工具失效降级：连续 2 轮既无工具调用也无代码输出（模型不支持/未启用 function calling，如实测 glm-5.3-flash）
+			→ 整体降级为兼容回环——工具模式提示词禁止正文输出代码，会把这类模型锁死成"只能干聊"；
+			兼容回环入口带 seedHash 防假修改闸：输出与种子完全一致时拒绝，要求输出包含修改的新版本
+		校验体系（沙箱唯一裁决）：运行正确性的唯一校验来源是沙箱——同内核 WebView 直载探针注入后的游戏 HTML
+			（不用 iframe/srcdoc——实测模拟器上 iframe 加载/结果读取链路不可靠，历史累计 200+ 次超时，且 srcdoc 的 opaque origin 引发跨源异常）；
+			探针跑帧捕获异常 + 全局 error 监听（含事件回调）+ console error 采集 + 画布中心带坐标的 touchstart/click 派发（让"开始"类交互真实触发）
+			+ localStorage 内存 stub + 15s 内部超时/30s 外层兜底（离屏 WebView 未挂窗时 Chromium 按后台节流定时器至约1次/秒，8帧需8~12s）；宿主以 700ms 间隔轮询 window.__wwSmokeResult 直至终态（跑满帧或出现错误），onPageFinished 不触发时也有定时兜底轮询；
+			画面空白检测（白屏杀手锏）：跑满帧后所有 canvas 均无内容（空白 canvas 的 PNG dataURL <3KB）且页面无可读文本 → 判"playability-blank-screen"失败回炉——杀掉"运行不报错但啥都没渲染"的假通过；
+			可玩性自检轮（对标 DSH/ZaiAgent 的自检-增强流程）：沙箱首次通过后不立即交付，注入一轮"对照【可玩性要求】逐条自查修复"再验收（每回合一次）；
+			能成功运行（跑满帧且零错误文本且画面非空白）即放行；失败则以沙箱报错文本作为观察回传驱动修复；
+			无任何 runner 可用（JVM 单测等）时跳过沙箱不阻塞；
+			静态解析校验（Rhino 语法/no-undef/jsoup HTML 配对）已全部移除——解析器与 Chromium 存在语法代差，
+			class/可选链/空值合并/spread/for-of/箭头默认参数等合法写法会被误判（实测 15 样本误判 7 个），
+			模型照假报错去修只会烧轮次；语法错误的捕获交给沙箱（Chromium 自身即最好的解析器，SyntaxError 会出现在 console error）
+			仅保留轻量产品契约检查（GameValidator ~60行，纯正则/标签枚举，无代差）：自包含（禁外部 CDN/本地资源引用，离线可玩承诺）
+			与安全禁令（eval/new Function/动态 require/import()）
+		校验与交付五条保证：
+			① 沙箱模拟用户环境：与真实游戏页（GameScreen）一致的 WebView 配置（JS/domStorage/wideViewport/overview）
+			   + 视口 360×640（innerWidth/Height 非 0）+ JS 弹窗自动确认（alert/confirm/prompt 不挂起）+ HtmlEnhancer 同样注入
+			② 沙箱运行成功才交付：设施异常（结果不可读/执行异常）也一律不交付，以"运行验证环境异常"理由退出；
+			   仅 JVM 单测（无 runner）跳过沙箱
+			③ 沙箱失败报错文本进入后续 prompt：本轮作为 user 消息回填驱动修复；lastError+knownIssues(前5条)写入会话，
+			   重试轮经遗留问题注入可见全部主要报错
+			④ bug 修复轮数不设上限：多轮修复属正常现象，同错误 3/6 次仅注入升级提示不终止
+			⑤ Agent Loop 任何退出都有用户可见理由（零技术细节）：制作完成（可游玩）/ 网络或服务异常（检查网络与配置）/
+			   运行验证环境异常（可重试/重启应用）/ 无法推进（连续无文件修改或无工具产出，建议换模型）/ 用户中断；
+			   技术详情仅写决策日志
 	→ HTML+CSS+JS game
 		game_generated = True
 	→（用户进入游戏测试和游玩）
@@ -195,7 +228,7 @@ GameWishingWell/
       │  │  │  ├─ GameTemplateSystems.kt # 对标模板的具体系统实现/验收边界（LLM 策划的种子与回退）
       │  │  │  ├─ GamePlan.kt            # 策划层：LLM 逐系统阐述具体实现、P0/P1/P2、验收清单
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
-      │  │  │  ├─ GameValidator.kt       # JS 语法(acorn 同等) + HTML 配对 + no-undef 等结构化校验
+	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令）；运行校验由沙箱承担
       │  │  │  ├─ GameSmokeTest.kt       # WebView 隔离 iframe 确定性 tick 冒烟测试
       │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入 / 行级 patch
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
@@ -240,6 +273,16 @@ GameWishingWell/
 
 六、模块与关键文件说明
 ------------------------------------------------------------
+
+Agent 日志（辅助调试材料，前端不展示）：
+- AgentLog（agent/AgentLog.kt）把 Agent Loop 运行细节写入应用私有目录
+  filesDir/agent/logs/agent.log（单文件 2MB 轮转，保留 agent.log.1~3），WishwellApplication 启动时 init；
+- 记录内容：回合开始/意图结果/路由决策、每轮 LLM 响应（文本长度+工具调用列表）、
+  每个工具调用的执行结果与观察头部（300字）、契约错误全文、沙箱结果（passed/帧数/错误全文）、
+  升级提示、交付成功（轮数/字节数）、失败原因（含 UI 纪律禁止展示的错误原文——仅限本地文件）、
+  用户停止；scope 区分 draft / game-N 会话；
+- 获取方式：adb pull /data/data/com.gamewishingwell/files/agent/logs/（debug 包可直读）；
+  写入 best-effort，任何日志异常不影响 Agent Loop。
 
 5.1 根工程配置
 - settings.gradle.kts：

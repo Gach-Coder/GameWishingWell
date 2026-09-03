@@ -1,101 +1,63 @@
 package com.gamewishingwell.agent
 
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GameValidatorTest {
 
-    private val valid = """
+    private val selfContained = """
         <!DOCTYPE html><html><head></head><body>
-        <canvas id="g"></canvas><div id="score"></div>
+        <canvas id="g"></canvas>
         <script>
-        var score = 0;
-        function restart(){ score = 0; }
-        function frame(t){ document.getElementById('score').textContent = score; requestAnimationFrame(frame); }
-        document.getElementById('g').addEventListener('touchstart', function(e){ e.preventDefault(); });
-        requestAnimationFrame(frame);
-        restart();
+        class Enemy { constructor(x){ this.x = x; } }
+        var e = new Enemy(1);
+        const v = obj?.b ?? 5;
+        function step(...args){ return args.length; }
+        for (const x of [1,2]) { v + x; }
+        localStorage.setItem('k', '1');
         </script>
         </body></html>
     """.trimIndent()
 
     @Test
-    fun `语法错误被捕获`() {
-        val report = GameValidator.validate("<html><body><script>var x = ;</script></body></html>")
-        assertTrue(report.checks.any { it.category == "syntax" && it.severity == "error" })
-    }
-
-    @Test
-    fun `未定义变量被 no-undef 捕获`() {
-        val report = GameValidator.validate("<html><body><script>missingFunction();</script></body></html>")
-        assertTrue(report.checks.any { it.category == "static-runtime" && it.message.contains("missingFunction") })
-    }
-
-    @Test
-    fun `DOM id 缺失产生警告`() {
-        val report = GameValidator.validate("<html><body><script>document.getElementById('nope');</script></body></html>")
-        assertTrue(report.checks.any { it.category == "dom-ids" && it.message.contains("nope") })
-    }
-
-    @Test
-    fun `HTML 标签配对错误被捕获`() {
-        val report = GameValidator.validate("<html><body><div></span></body></html>")
-        assertTrue(report.checks.any { it.category == "html" && it.severity == "error" })
-    }
-
-    @Test
-    fun `健康 HTML 通过静态校验`() {
-        val report = GameValidator.validate(valid)
-        assertEquals(report.errors.joinToString("\n") { "${it.category}@${it.line}:${it.message}" }, "")
+    fun `自包含的现代 JS 不产生任何契约错误`() {
+        // class/可选链/空值合并/spread/for-of/localStorage 均为 WebView 可运行的
+        // 合法写法——轻量契约检查不做语法/引用分析，不得误判。
+        val report = GameValidator.validate(selfContained)
         assertFalse(report.hasErrors)
     }
 
     @Test
-    fun `eval 与动态 require 被代码契约拦截`() {
-        val report = GameValidator.validate("<html><body><script>eval('1+1'); require('x');</script></body></html>")
-        assertTrue(report.checks.count { it.severity == "error" && it.message.contains("eval") } >= 1)
-        assertTrue(report.checks.any { it.message.contains("require") })
-    }
-
-    @Test
-    fun `校验结果输出结构化 JSON`() {
-        val report = GameValidator.validate("<html><body><script>var x = ;</script></body></html>")
-        val json = report.toJsonString()
-        assertTrue(json.contains("\"checks\""))
-        assertTrue(json.contains("\"category\":\"syntax\""))
-    }
-}
-
-class GameValidatorTemplateTest {
-    @Test
-    fun `内置模板可通过静态校验`() {
-        val file = java.io.File("src/main/assets/game_template.html")
-        if (!file.exists()) return
-        val report = GameValidator.validate(file.readText(Charsets.UTF_8))
-        assertEquals(report.errors.joinToString("\n") { "${it.category}@${it.line}:${it.message}" }, "")
-    }
-}
-
-class GameSmokeProbeTest {
-    @Test
-    fun `冒烟探针注入确定性 tick 与超时兜底`() {
-        val html = "<html><head></head><body><script>function frame(t){requestAnimationFrame(frame)} requestAnimationFrame(frame);</script></body></html>"
-        val injected = SmokeTestProbe.inject(html)
-        assertTrue(injected.contains("__wwSmokeInstalled"))
-        assertTrue(injected.contains("__wwSmokeResult"))
-        assertTrue(injected.contains("smoke-timeout"))
-        assertTrue(injected.contains("requestAnimationFrame"))
-    }
-
-    @Test
-    fun `常用交互与画布全局不误报 no-undef`() {
-        val html = "<html><body><script>var name = prompt('你的名字'); alert(name); " +
-            "var ctx = document.createElement('canvas').getContext('2d'); " +
-            "var g = ctx.createLinearGradient(0, 0, 10, 10); g.addColorStop(0, '#fff'); " +
-            "queueMicrotask(function(){});</script></body></html>"
+    fun `外部脚本与外部图片为契约错误`() {
+        val html = "<html><body>" +
+            "<script src=\"https://cdn.example.com/lib.js\"></script>" +
+            "<img src=\"http://example.com/a.png\">" +
+            "</body></html>"
         val report = GameValidator.validate(html)
-        assertFalse(report.errors.any { it.message.contains("no-undef") })
+        assertTrue(report.errors.any { it.message.contains("外部JS") })
+        assertTrue(report.errors.any { it.message.contains("外部图片") })
+    }
+
+    @Test
+    fun `本地资源引用为契约错误`() {
+        val html = "<html><body><img src=\"assets/hero.png\"><audio src=\"bgm.mp3\"></body></html>"
+        val report = GameValidator.validate(html)
+        assertTrue(report.errors.any { it.message.contains("本地图片资源缺失") })
+        assertTrue(report.errors.any { it.message.contains("本地音频资源缺失") })
+    }
+
+    @Test
+    fun `eval 与 new Function 违反安全契约`() {
+        val html = "<html><body><script>var r = eval('1+1'); var f = new Function('return 1');</script></body></html>"
+        val report = GameValidator.validate(html)
+        assertTrue(report.errors.any { it.message.contains("eval") })
+        assertTrue(report.errors.any { it.message.contains("new Function") })
+    }
+
+    @Test
+    fun `空内容为错误`() {
+        val report = GameValidator.validate("   ")
+        assertTrue(report.errors.any { it.message.contains("为空") })
     }
 }

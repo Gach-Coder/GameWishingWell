@@ -253,6 +253,15 @@ fun SettingsScreen() {
             }
 
             Spacer(Modifier.height(24.dp))
+
+            Text(
+                "许愿井 v${com.gamewishingwell.BuildConfig.VERSION_NAME} · 软件编译时间 ${com.gamewishingwell.BuildConfig.BUILD_TIME}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+
+            Spacer(Modifier.height(12.dp))
         }
     }
 }
