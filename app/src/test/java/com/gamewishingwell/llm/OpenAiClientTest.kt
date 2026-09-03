@@ -1,6 +1,7 @@
 package com.gamewishingwell.llm
 
 import com.gamewishingwell.data.ChatMessage
+import com.gamewishingwell.data.ToolCallData
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
@@ -208,8 +209,42 @@ class OpenAiClientTest {
 
         val body = server.takeRequest().body.readUtf8()
         assertTrue(body.contains("\"tools\":["))
+        // 线格式契约：每个工具定义必须带 "type":"function"（曾因 encodeDefaults=false 被静默丢弃，
+        // 导致严格网关 4xx→去掉 tools 重试→永远降级兼容模式）
+        assertTrue(body.contains("\"type\":\"function\""))
         assertTrue(body.contains("\"name\":\"editfile\""))
         assertTrue(body.contains("\"parameters\":{\"type\":\"object\"}"))
+
+        server.shutdown()
+    }
+
+    @Test
+    fun `assistant 工具调用历史回传线格式完整`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\ndata: [DONE]\n\n")
+        )
+        server.start()
+
+        client(server).streamChat(
+            listOf(
+                ChatMessage("user", "hi"),
+                ChatMessage(
+                    "assistant", "",
+                    toolCalls = listOf(ToolCallData(id = "call_1", name = "writefile", arguments = "{}"))
+                ),
+                ChatMessage(ChatMessage.ROLE_TOOL, "写入成功", toolCallId = "call_1")
+            ),
+            onDelta = {},
+            onDone = {}
+        )
+
+        val body = server.takeRequest().body.readUtf8()
+        // 历史 assistant.tool_calls 同样必须带 "type":"function"，工具结果必须带 tool_call_id
+        assertTrue(body.contains("\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\""))
+        assertTrue(body.contains("\"tool_call_id\":\"call_1\""))
 
         server.shutdown()
     }

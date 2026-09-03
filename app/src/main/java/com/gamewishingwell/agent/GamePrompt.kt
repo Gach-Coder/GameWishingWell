@@ -28,6 +28,12 @@ object GamePrompt {
         5. 使用常见浏览器 API，避免最新语法（保持 ES2017 以内），确保 Android WebView 兼容。不得使用 async/await/Promise（异步错误难以捕获且兼容性差）。
         6. 提供全局函数 restart() 用于重开游戏，必须完整重置所有游戏状态，可被反复调用而不出错。
         7. 界面默认使用中文。
+        8. 【可观测性契约（硬性）】提供全局函数 window.__wwDebugState = function(){ return {...}; }，返回当前游戏状态快照：
+           { state: 运行阶段（menu/playing/over 等非空字符串）, score: 核心得分数值（无则省略）,
+             entities: [{ type: 实体类别（enemy/bullet/item 等）, hp: 生命值（有此概念的实体必填）, x: 0, y: 0 }],
+             player: { hp: 玩家生命值, x: 0, y: 0 }（无玩家概念可省略） }。
+           entities 只放当前存活实体：死亡实体必须当帧从数组移除，不得残留 hp<0 的条目；所有数值字段必须是有限数字（禁止 NaN/Infinity）。
+           沙箱会在运行后调用它做自动不变量检查——负血量实体未移除、数值异常、实体无限增长、重开不重置都会被判失败并要求修复。
     """.trimIndent() + "\n\n" + hardRules()
 
     private fun hardRules(): String = """
@@ -174,38 +180,63 @@ $seedSystems
 
     /**
      * 可玩性自检轮提示词（沙箱通过后逐轮注入，全部消费完才交付）。
-     * 轮数随用户预期轮次预算分档：≤2 快速档不注入（最短路径交付）；
-     * 3~10 均衡档两轮（内容完整性、体验与平台合规）；≥11 精品档追加第三轮深度打磨。
+     * 轮数随用户预期轮次预算与回合类型分档，使”最少轮数”不超出用户预期：
+     * 生成轮——≤2 快速档无自检（最短路径交付）、3~4 一轮（内容完整性）、
+     * 5~10 两轮（内容完整性、体验与平台合规）、≥11 精品档追加第三轮深度打磨；
+     * 修复轮（[fixTurn]）——改动范围小，≤2 无自检、其余仅一轮回归自检
+     * （验证修复达成诉求且未破坏既有内容），不再走完整多轮自检：开销与任务大小成比例。
      * 返回 (阶段标签, 提示文本) 列表。
      */
-    fun selfReviewPrompts(expectedLoops: Int = 5): List<Pair<String, String>> {
+    fun selfReviewPrompts(expectedLoops: Int = 5, fixTurn: Boolean = false): List<Pair<String, String>> {
         val n = expectedLoops.coerceIn(1, 100)
-        if (n <= 2) return emptyList()
-        val standard = listOf(
-            "校验中：可玩性自检（内容完整性）" to """
-                沙箱运行已通过。请对照 design_schema 与【可玩性要求】逐条自查内容完整性：
-                清单内每个系统是否真实实现且玩家可感知（而非占位、空壳或单一元素机械重复）；
-                开始→进行→胜负→重开闭环是否完整；难度是否递进；核心数值反馈是否可见。
-                有缺口必须用 editfile/appendfile 补齐后再声明完成；
-                若逐条确认全部达标，声明完成并在总结中按清单简述各项达标情况（每条一行）。
-            """.trimIndent(),
-            "校验中：可玩性自检（体验与平台合规）" to """
-                请自查体验与平台合规并修复所有问题：
-                顶部约 110px 平台保留区整条不得有任何按钮或可交互元素（沙箱会自动检测）；
-                左右两侧不得放任何文字标签，仅中央小块可放“第x关”类极短状态文字；
-                触控目标是否 ≥44px 且不遮挡视线；画面配色是否有基本美感与区分度；
-                关键操作是否有即时反馈（有 WebAudio 音效更佳）。
-                修复完成后声明完成；若确认全部达标，在总结中简述各项达标情况。
-            """.trimIndent()
-        )
-        if (n <= 10) return standard
-        return standard + ("校验中：可玩性自检（深度打磨）" to """
+        val contentReview = "校验中：可玩性自检（内容完整性）" to """
+            沙箱运行已通过。请对照 design_schema 与【可玩性要求】逐条自查内容完整性：
+            清单内每个系统是否真实实现且玩家可感知（而非占位、空壳或单一元素机械重复）；
+            开始→进行→胜负→重开闭环是否完整；难度是否递进；核心数值反馈是否可见。
+            有缺口必须用 editfile/appendfile 补齐后再声明完成；
+            若逐条确认全部达标，声明完成并在总结中按清单简述各项达标情况（每条一行）。
+        """.trimIndent()
+        val complianceReview = "校验中：可玩性自检（体验与平台合规）" to """
+            请自查体验与平台合规并修复所有问题：
+            顶部约 110px 平台保留区整条不得有任何按钮或可交互元素（沙箱会自动检测）；
+            左右两侧不得放任何文字标签，仅中央小块可放「第x关」类极短状态文字；
+            触控目标是否 ≥44px 且不遮挡视线；画面配色是否有基本美感与区分度；
+            关键操作是否有即时反馈（有 WebAudio 音效更佳）。
+            修复完成后声明完成；若确认全部达标，在总结中简述各项达标情况。
+        """.trimIndent()
+        val polishReview = "校验中：可玩性自检（深度打磨）" to """
             请做最后一轮深度打磨并修复：
             数值平衡（前期宽松后期紧张，普通玩家可通关）；视觉层次（背景/单位/UI/特效区分明显）；
             音效反馈有层次（不同事件不同音色，WebAudio 振幅可取 0.15 左右）；
             文案与配色风格统一；无明显卡顿或交互死角。完成后声明完成并简述打磨项。
-        """.trimIndent())
+        """.trimIndent()
+        val regressionReview = "校验中：回归自检（修复未破坏既有内容）" to """
+            本次是修复/调整回合。请回归自查：
+            玩家本轮诉求是否已逐条解决；
+            修复没有破坏既有功能——对照 design_schema 抽查核心系统仍完整（可开局、可重开、核心数值反馈仍在），
+            修复涉及的边界情形（触发条件、异常路径）已覆盖。有缺口用 editfile 修复后再声明完成。
+        """.trimIndent()
+        if (fixTurn) return if (n <= 2) emptyList() else listOf(regressionReview)
+        return when {
+            n <= 2 -> emptyList()
+            n <= 4 -> listOf(contentReview)
+            n <= 10 -> listOf(contentReview, complianceReview)
+            else -> listOf(contentReview, complianceReview, polishReview)
+        }
     }
+
+    /**
+     * 精品档轮次预算未用足时的增强指令（Agent Loop 一次性注入）：
+     * 要求实质性扩充与打磨，堵住"零修改直通自检→提前收尾"的敷衍路径。
+     */
+    fun budgetUnderUsePrompt(expectedLoops: Int, roundsSoFar: Int): String = """
+        【轮次预算复核】用户预期约 $expectedLoops 轮（精品档），当前仅进行 $roundsSoFar 轮即通过了基础校验与沙箱。
+        请不要就此收尾——对照【轮次预算】精品档要求做实质性改进后再声明完成：
+        1. 内容量扩充：对照 design_schema 逐系统加深（更多单位/敌人种类、波次或关卡、成长线）；
+        2. 打磨项落地：视觉细节与层次、关键操作反馈动效、WebAudio 音效分层；
+        3. 体验长板：开局引导清晰、数值反馈即时、难度曲线平滑。
+        用 editfile/appendfile 落实改进后再次声明完成；确实无改进空间时，在总结中逐条说明已达标的理由。
+    """.trimIndent()
 
     /**
      * 用户预期轮次预算 → 生成策略引导（质量/成本平衡，注入工具模式与兼容模式上下文）。
@@ -242,7 +273,7 @@ $seedSystems
         excluded_systems（仅含用户明确说“不要”的系统）与 excluded_approaches 是硬性排除范围，不得实现或引入。
         复杂系统（AI、商店、技能、关卡等）先在 JS 中隔离成独立函数/模块并优先自检，不得与核心循环交叉污染。
         基础校验通过后即交付玩家试玩，不要在游戏内添加自动测试代码、测试按钮或调试面板；运行错误由玩家回传后再修复。
-        输出前确认：无 eval、无外部资源、restart() 存在、触控可玩、声明前置、顶部保留区无按钮且左右无文字标签。
+        输出前确认：无 eval、无外部资源、restart() 存在、__wwDebugState 快照存在、触控可玩、声明前置、顶部保留区无按钮且左右无文字标签。
     """.trimIndent()
 
     /**

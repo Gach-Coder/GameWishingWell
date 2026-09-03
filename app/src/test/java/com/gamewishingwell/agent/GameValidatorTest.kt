@@ -16,6 +16,7 @@ class GameValidatorTest {
         function step(...args){ return args.length; }
         for (const x of [1,2]) { v + x; }
         localStorage.setItem('k', '1');
+        window.__wwDebugState = function(){ return { state: 'playing', entities: [] }; };
         </script>
         </body></html>
     """.trimIndent()
@@ -59,5 +60,21 @@ class GameValidatorTest {
     fun `空内容为错误`() {
         val report = GameValidator.validate("   ")
         assertTrue(report.errors.any { it.message.contains("为空") })
+    }
+
+    @Test
+    fun `缺少可观测性契约报错`() {
+        val html = "<html><body><canvas id=\"g\"></canvas><script>var x=1;</script></body></html>"
+        val report = GameValidator.validate(html)
+        assertTrue(report.errors.any { it.category == "observability" && it.message.contains("__wwDebugState") })
+    }
+
+    @Test
+    fun `包含可观测性契约不因此报错`() {
+        val html = "<html><body><canvas id=\"g\"></canvas><script>" +
+            "window.__wwDebugState=function(){return{state:'playing',entities:[]}};var x=1;" +
+            "</script></body></html>"
+        val report = GameValidator.validate(html)
+        assertFalse(report.errors.any { it.category == "observability" })
     }
 }

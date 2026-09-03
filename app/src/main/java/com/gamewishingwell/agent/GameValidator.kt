@@ -118,6 +118,17 @@ object GameValidator {
             )
         }
 
+        // 可观测性契约：必须暴露 window.__wwDebugState() 供沙箱做不变量断言
+        //（负血量实体未移除 / NaN 数值 / 实体泄漏等"不抛错但明显不对"的低级 bug）。
+        if (!html.contains("__wwDebugState")) {
+            checks += ValidationIssue(
+                "observability", FILE_INDEX_HTML, 1,
+                "缺少可观测性契约：必须提供全局函数 window.__wwDebugState = function(){...}，" +
+                    "返回 { state, score, entities:[{type,hp,x,y}], player:{...} } 状态快照（沙箱据此做自动不变量检查）",
+                "error"
+            )
+        }
+
         return ValidationReport(checks.distinctBy { "${it.category}|${it.message}" })
     }
 }

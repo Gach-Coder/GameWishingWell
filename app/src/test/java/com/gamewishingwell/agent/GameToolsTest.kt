@@ -19,7 +19,7 @@ class GameToolsTest {
         return GameFileWorkspace(dir) to dir
     }
 
-    private val validHtml = "<!DOCTYPE html><html><body><script>var score = 0;</script></body></html>"
+    private val validHtml = "<!DOCTYPE html><html><body><script>window.__wwDebugState=function(){return{state:'playing'}};var score = 0;</script></body></html>"
 
     private fun call(name: String, argsJson: String) =
         ToolCallData(id = "c1", name = name, arguments = argsJson)

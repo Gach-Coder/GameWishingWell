@@ -32,7 +32,7 @@ class GameValidatorSyntaxBatteryTest {
     @Test
     fun `现代JS写法不产生任何契约错误`() {
         snippets.forEachIndexed { idx, js ->
-            val report = GameValidator.validate("<html><body><script>$js</script></body></html>")
+            val report = GameValidator.validate("<html><body><script>window.__wwDebugState=function(){};$js</script></body></html>")
             assertTrue(
                 "样本#$idx 被误判: ${report.errors.joinToString(";") { it.message }}",
                 report.errors.isEmpty()

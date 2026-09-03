@@ -249,7 +249,7 @@ class GameAgent(
      * 独立协程中执行用户回合；调用方协程被取消（例如用户切走页面）时，
      * agentScope 中的任务继续运行，保证“生成任务在全局 GameAgent 中继续”。
      */
-    suspend fun sendUserMessage(text: String) {
+    suspend fun sendUserMessage(text: String, expectedLoops: Int? = null) {
         val current = _session.value
         if (current.isGenerating) return
         val trimmed = text.trim()
@@ -257,9 +257,10 @@ class GameAgent(
 
         // 确认门期间输入框发来的任何文字都是“补充/修正”，不会当作确认语句；
         // 进入决策层的唯一入口是界面上的确认按钮（confirmIntent）。
-        // 修正回合期间保留当前确认卡：重组后的新摘要会覆盖它，
-        // 修正失败/中断时上一版方案仍然可见、可确认。
-        val priorConfirmation = current.pendingConfirmation
+        // 修正回合重建卡片时继承用户当前拨动的轮次预算挡位（否则滑条被重置回上一张卡的持久值）。
+        val priorConfirmation = current.pendingConfirmation?.let { p ->
+            expectedLoops?.let { p.copy(expectedLoops = it.coerceIn(1, 100)) } ?: p
+        }
         val last = current.messages.lastOrNull()
         val duplicate = last != null && last.isUser && last.content == trimmed
 
@@ -840,8 +841,12 @@ class GameAgent(
             val report: ValidationReport
         ) : GenOutcome()
 
-        /** 模型/网关不支持工具（首轮直接在正文给出整份代码）：降级为旧全量重写回环。 */
-        data class LegacyFallback(val firstHtml: String) : GenOutcome()
+        /**
+         * 模型/网关不支持工具（首轮直接在正文给出整份代码）：降级为旧全量重写回环。
+         * [roundsConsumed] 为工具模式已消耗的 LLM 轮次——兼容回环从这里续数，
+         * 保证最终"共 N 轮"与实际 LLM 调用次数对齐（首个候选是这些轮次的产物）。
+         */
+        data class LegacyFallback(val firstHtml: String, val roundsConsumed: Int) : GenOutcome()
 
         /** 已通过 failTurn 通知用户，本轮结束。 */
         object Failed : GenOutcome()
@@ -901,12 +906,15 @@ class GameAgent(
             instruction = instruction,
             plan = plan,
             firstGeneration = existingHtml.isNullOrBlank(),
-            seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) }
+            seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
+            fixTurn = isFixTurn
         )
         if (outcome is GenOutcome.LegacyFallback) {
             outcome = runLegacyRewriteLoop(
                 llm, instruction, plan, existingHtml, outcome.firstHtml,
-                seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) }
+                seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
+                startRound = outcome.roundsConsumed,
+                fixTurn = isFixTurn
             )
         }
         val accepted = when (outcome) {
@@ -971,7 +979,9 @@ class GameAgent(
         instruction: String,
         plan: DesignPlan,
         firstGeneration: Boolean,
-        seedHash: String? = null
+        seedHash: String? = null,
+        /** 修复轮（运行报错回传/修复快车道）：自检降为一轮回归检查，且不参与预算复核。 */
+        fixTurn: Boolean = false
     ): GenOutcome {
         val customSystem = settingsRepository.settings.value.systemPrompt.trim()
         val messages = mutableListOf(
@@ -985,10 +995,12 @@ class GameAgent(
         var stubborn: Map<String, Int> = emptyMap()
         var idleRounds = 0
         var nudgesLeft = 3
-        // 可玩性自检轮随轮次预算分档（确认门滑条）：≤2 快速档跳过自检、
-        // 3~10 均衡档两轮、≥11 精品档追加深度打磨轮；每轮自检后重新走校验+沙箱验收。
+        // 可玩性自检轮随轮次预算与回合类型分档：生成轮 ≤2 无自检、3~4 一轮、5~10 两轮、
+        // ≥11 追加深度打磨；修复轮仅一轮回归自检（≤2 无）。每轮自检后重新走校验+沙箱验收。
         val expectedLoops = _session.value.expectedLoops.coerceIn(1, 100)
-        val selfReviews = ArrayDeque(GamePrompt.selfReviewPrompts(expectedLoops))
+        val selfReviews = ArrayDeque(GamePrompt.selfReviewPrompts(expectedLoops, fixTurn))
+        // 精品档轮次预算未用足半数时的一次性增强指令（防"零修改直通"敷衍交付；只注入一次防死循环）。
+        var budgetNudged = false
         // 连续"既无工具调用也无代码输出"的轮数：≥2 判定模型不会 function calling，
         // 工具模式提示词禁止正文出代码会把它锁死——整体降级到兼容回环。
         var toollessRounds = 0
@@ -1032,12 +1044,12 @@ class GameAgent(
                 // 模型是唯一可用通路（首次制作正是靠它成功的）。
                 if (!mutatedOnce && toollessRounds >= 2) {
                     alog("route: legacy fallback (tool-less model, $toollessRounds rounds no tools)")
-                    return GenOutcome.LegacyFallback(current ?: directHtml ?: "")
+                    return GenOutcome.LegacyFallback(current ?: directHtml ?: "", round)
                 }
                 if (!mutatedOnce && current == null) {
                     if (directHtml != null) {
                         alog("route: legacy fallback (text html, no tools)")
-                        return GenOutcome.LegacyFallback(directHtml)
+                        return GenOutcome.LegacyFallback(directHtml, round)
                     }
                     if (nudgesLeft <= 0) {
                         failTurn(
@@ -1134,6 +1146,16 @@ class GameAgent(
                                 alog("self-review round: ${review.first} (rounds so far=$round)")
                                 _session.value = _session.value.copy(agentStage = review.first)
                                 messages += ChatMessage("user", review.second)
+                                continue
+                            }
+                            // 精品档预算复核：轮次用不足半数且从未注入过增强指令时，
+                            // 要求实质性扩充与打磨而非就此收尾（一次性，之后照常交付）。
+                            // 仅生成轮触发：修复轮诉求是"最小改动修好"，不应被要求扩内容。
+                            if (!fixTurn && !budgetNudged && expectedLoops >= 11 && round < (expectedLoops + 1) / 2) {
+                                budgetNudged = true
+                                alog("budget under-use nudge: expected=$expectedLoops rounds=$round")
+                                _session.value = _session.value.copy(agentStage = "校验中：轮次预算复核（精品档增强）")
+                                messages += ChatMessage("user", GamePrompt.budgetUnderUsePrompt(expectedLoops, round))
                                 continue
                             }
                             alog("ACCEPTED(tool): rounds=$round bytes=${content.toByteArray(Charsets.UTF_8).size} warnings=${report.warnings.size}")
@@ -1263,14 +1285,37 @@ class GameAgent(
         plan: DesignPlan,
         existingHtml: String?,
         firstCandidate: String,
-        seedHash: String? = null
+        seedHash: String? = null,
+        /** 工具模式降级前已消耗的轮次：兼容回环续数，保证总轮数与 LLM 调用次数对齐。 */
+        startRound: Int = 1,
+        /** 修复轮：自检降为一轮回归检查，且不参与预算复核（与工具模式同规则）。 */
+        fixTurn: Boolean = false
     ): GenOutcome {
         var workingHtml = existingHtml
         var feedback = ""
-        // 兼容模式与工具模式共用同一组可玩性自检轮提示（随轮次预算分档），全部消费完才交付。
-        val legacyReviews = ArrayDeque(GamePrompt.selfReviewPrompts(_session.value.expectedLoops.coerceIn(1, 100)))
-        var round = 1
+        // 兼容模式与工具模式共用同一组可玩性自检轮提示（随轮次预算与回合类型分档），全部消费完才交付。
+        val legacyReviews = ArrayDeque(GamePrompt.selfReviewPrompts(_session.value.expectedLoops.coerceIn(1, 100), fixTurn))
+        var round = startRound
         var lastReport = GameValidator.validate(firstCandidate)
+        // 精品档轮次预算复核（与工具模式同款，一次性）：兼容模式同样堵"零修改直通自检"的敷衍交付。
+        var legacyBudgetNudged = false
+        /**
+         * 交付判定：预算未用足（实际轮次不足预期半数）且未注入过增强指令时，注入"实质扩充+打磨"
+         * 指令并返回 null（调用方继续循环落实）；否则返回 Accepted 由调用方交付。
+         */
+        fun deliverOrNudge(html: String, reason: String, currentRound: Int): GenOutcome? {
+            val expected = _session.value.expectedLoops.coerceIn(1, 100)
+            if (!fixTurn && !legacyBudgetNudged && expected >= 11 && currentRound < (expected + 1) / 2) {
+                legacyBudgetNudged = true
+                alog("budget under-use nudge (legacy/$reason): expected=$expected rounds=$currentRound")
+                _session.value = _session.value.copy(agentStage = "校验中：轮次预算复核（精品档增强）")
+                feedback = GamePrompt.budgetUnderUsePrompt(expected, currentRound) + "\n请输出增强后的完整 HTML。"
+                workingHtml = html
+                return null
+            }
+            alog("ACCEPTED($reason): rounds=$currentRound bytes=${html.toByteArray(Charsets.UTF_8).size}")
+            return GenOutcome.Accepted(html, "", currentRound, lastReport)
+        }
         _session.value = _session.value.copy(currentHtml = firstCandidate)
         if (!lastReport.hasErrors) {
             // 防假修改闸：工具失效降级进来时 firstCandidate 可能就是种子原文——
@@ -1284,12 +1329,12 @@ class GameAgent(
             if (smoke == null || smoke.passed) {
                 val review = legacyReviews.removeFirstOrNull()
                 if (review == null) {
-                    alog("ACCEPTED(legacy-first): bytes=${firstCandidate.toByteArray(Charsets.UTF_8).size}")
-                    return GenOutcome.Accepted(firstCandidate, "", round, lastReport)
+                    deliverOrNudge(firstCandidate, "legacy-first", round)?.let { return it }
+                } else {
+                    alog("self-review round (legacy-first): ${review.first}")
+                    feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
+                    _session.value = _session.value.copy(agentStage = review.first)
                 }
-                alog("self-review round (legacy-first): ${review.first}")
-                feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
-                _session.value = _session.value.copy(agentStage = review.first)
             } else if (smoke.message == "sandbox-infra") {
                 failTurn(_session.value, USER_MSG_SANDBOX_ENV, internalDetail = "兼容模式沙箱设施异常（首个候选），未交付")
                 return GenOutcome.Failed
@@ -1301,12 +1346,12 @@ class GameAgent(
                     // 慢环境超时无真实错误：按通过处理，同样先消费自检轮。
                     val review = legacyReviews.removeFirstOrNull()
                     if (review == null) {
-                        alog("legacy sandbox timeout WITHOUT errors -> ACCEPTED (slow env)")
-                        return GenOutcome.Accepted(firstCandidate, "", round, lastReport)
+                        deliverOrNudge(firstCandidate, "legacy-timeout-pass-first", round)?.let { return it }
+                    } else {
+                        alog("self-review round (legacy-timeout-pass): ${review.first}")
+                        feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
+                        _session.value = _session.value.copy(agentStage = review.first)
                     }
-                    alog("self-review round (legacy-timeout-pass): ${review.first}")
-                    feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
-                    _session.value = _session.value.copy(agentStage = review.first)
                 } else {
                     _session.value = _session.value.copy(
                         lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
@@ -1333,9 +1378,9 @@ class GameAgent(
             currentCoroutineContext().ensureActive()
             val module = moduleForRound(plan, round)
             val genStage = if (existingHtml.isNullOrBlank()) {
-                "代码生成中：正在生成「$module」系统模块（兼容模式）"
+                "代码生成中：正在生成「$module」系统模块（兼容模式）· 第 $round 轮"
             } else {
-                "代码修改中：正在处理「$module」系统模块（兼容模式）"
+                "代码修改中：正在处理「$module」系统模块（兼容模式）· 第 $round 轮"
             }
             _session.value = _session.value.copy(agentStage = genStage, streamingText = null)
 
@@ -1401,14 +1446,14 @@ class GameAgent(
                 if (smokeErrors.isEmpty()) {
                     // 慢环境超时无真实错误：按通过处理，同样先消费自检轮。
                     val timeoutReview = legacyReviews.removeFirstOrNull()
-                    if (timeoutReview == null) {
-                        alog("legacy sandbox timeout WITHOUT errors -> ACCEPTED (slow env)")
-                        return GenOutcome.Accepted(candidate, "", round, lastReport)
+                    if (timeoutReview != null) {
+                        alog("self-review round (legacy-timeout-pass): ${timeoutReview.first}")
+                        feedback = timeoutReview.second + "\n请输出修复或确认后的完整 HTML。"
+                        workingHtml = candidate
+                        _session.value = _session.value.copy(agentStage = timeoutReview.first)
+                        continue
                     }
-                    alog("self-review round (legacy-timeout-pass): ${timeoutReview.first}")
-                    feedback = timeoutReview.second + "\n请输出修复或确认后的完整 HTML。"
-                    workingHtml = candidate
-                    _session.value = _session.value.copy(agentStage = timeoutReview.first)
+                    deliverOrNudge(candidate, "legacy-timeout-pass", round)?.let { return it }
                     continue
                 }
                 feedback = "基础校验已通过，但冒烟测试未通过（确定性 tick ${smoke.framesRun} 帧）：" +
@@ -1430,8 +1475,7 @@ class GameAgent(
                 _session.value = _session.value.copy(agentStage = review.first)
                 continue
             }
-            alog("ACCEPTED(legacy): rounds=$round bytes=${candidate.toByteArray(Charsets.UTF_8).size}")
-            return GenOutcome.Accepted(candidate, "", round, lastReport)
+            deliverOrNudge(candidate, "legacy", round)?.let { return it }
         }
     }
 
@@ -1538,7 +1582,8 @@ class GameAgent(
         currentCoroutineContext().ensureActive()
         _session.value = _session.value.copy(agentStage = "冒烟测试中：正在沙箱验证游戏可运行")
         return try {
-            val result = runner.run(html)
+            // 精品档（expectedLoops≥11）用 deep 模式：真实调用 restart() 完整重开后复跑半程帧。
+            val result = runner.run(html, deep = _session.value.expectedLoops >= 11)
             if (!result.passed && result.errors.isEmpty() && result.message != "smoke-timeout") {
                 android.util.Log.w("GameAgent", "沙箱结果不可读：${result.message}")
                 sandboxInfraResult()

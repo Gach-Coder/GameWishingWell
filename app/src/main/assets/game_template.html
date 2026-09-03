@@ -97,6 +97,16 @@ function restart(){
   document.getElementById('score').textContent = '0';
 }
 
+// —— 可观测性契约：沙箱据此做自动不变量检查（负血量/NaN/实体泄漏/重开残留）——
+window.__wwDebugState = function(){
+  return {
+    state: over ? 'over' : 'playing',
+    score: score,
+    entities: balls.map(function(b){ return { type: 'ball', x: Math.round(b.x), y: Math.round(b.y) }; }),
+    player: { x: Math.round(px), y: Math.round(py) }
+  };
+};
+
 // —— WebAudio 简易音效（振荡器，无外部资源）——
 var actx = null;
 function beep(f){

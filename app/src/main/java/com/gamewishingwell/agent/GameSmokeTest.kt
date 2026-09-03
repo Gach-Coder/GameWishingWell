@@ -22,8 +22,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
 interface SmokeTestRunner {
-    /** 只在静态校验全部通过后调用。 */
-    suspend fun run(html: String): SmokeTestResult
+    /**
+     * 只在静态校验全部通过后调用。[deep] 为精品档（expectedLoops≥11）深度模式：
+     * 额外真实调用 restart() 完整重开并复跑半程帧，验证重开契约。
+     */
+    suspend fun run(html: String, deep: Boolean = false): SmokeTestResult
 }
 
 @kotlinx.serialization.Serializable
@@ -35,7 +38,7 @@ data class SmokeTestResult(
 )
 
 object NoopSmokeTestRunner : SmokeTestRunner {
-    override suspend fun run(html: String): SmokeTestResult =
+    override suspend fun run(html: String, deep: Boolean): SmokeTestResult =
         SmokeTestResult(passed = true, message = "noop-smoke-runner")
 }
 
@@ -45,7 +48,8 @@ object NoopSmokeTestRunner : SmokeTestRunner {
  * 任何帧内异常、全局异常（含事件回调）与 console error 都会被捕获；
  * 合成交互在多点位（中心/底部/左右下侧）派发 touchstart/touchend/click 并做一次拖动，
  * 开始后与跑帧中段各一轮；localStorage 替换为内存 stub，避免沙箱跨源异常；
- * 跑满帧后做白屏检测与顶部保留区扫描（平台操作条区域内出现可交互元素即失败）；
+ * 跑满帧后做白屏检测、顶部保留区扫描（平台操作条区域内出现可交互元素即失败）
+ * 与可观测性不变量断言（调用 __wwDebugState() 检查负血量实体/NaN 数值/实体泄漏）；
  * 同时设置超时兜底，防止定时器失控。
  *
  * 沙箱是运行正确性的唯一校验来源：passed = 跑满 tick 且无任何错误文本。
@@ -57,7 +61,7 @@ object SmokeTestProbe {
     const val RESERVED_TOP_PX = 110
     private const val MARKER = "__wwSmokeInstalled"
 
-    fun inject(html: String): String {
+    fun inject(html: String, deep: Boolean = false): String {
         if (html.contains(MARKER)) return html
         val script = """
             <script>
@@ -92,6 +96,11 @@ object SmokeTestProbe {
               var realCaf = window.cancelAnimationFrame && window.cancelAnimationFrame.bind(window);
               var ticked = 0;
               var timer = null;
+              var __finalized = false; // 终态防覆盖：deep 复跑会重置 ticked，超时回调不得覆盖已通过结果
+              // deep（精品档）：restart() 真实重开后复跑半程帧，验证"完整重开"契约。
+              var __deep = ${if (deep) "true" else "false"};
+              var phase = 1;   // 1=首次运行 2=restart 后复跑
+              var limit = ${MAX_FRAMES};
               window.requestAnimationFrame = function(cb){
                 if (ticked < ${MAX_FRAMES}) { window.__wwSmokePending.push(cb); return window.__wwSmokePending.length; }
                 return realRaf ? realRaf(cb) : 0;
@@ -99,11 +108,104 @@ object SmokeTestProbe {
               window.cancelAnimationFrame = function(id){
                 if (realCaf) { try { realCaf(id); } catch(e) {} }
               };
+              // restart() 契约：全档检查存在性（生成契约要求全局 restart()）；
+              // deep 档真实调用一次，捕获"重开才暴露"的运行错误。
+              function restartPresenceCheck(){
+                try {
+                  if (typeof window.restart !== 'function') {
+                    window.__wwSmokeResult.errors.push('restart-missing: 未找到全局 restart() 函数（契约要求提供完整重开）');
+                  }
+                } catch (e) {}
+              }
+              function exerciseRestart(){
+                try {
+                  if (typeof window.restart === 'function') { window.restart(); }
+                } catch (e) {
+                  window.__wwSmokeResult.errors.push('restart-error: 调用 restart() 抛错：' + String(e && e.message || e));
+                }
+              }
+              // 可观测性契约断言：调用游戏提供的 __wwDebugState() 快照做通用不变量检查，
+              // 杀"不抛错但明显不对"的低级逻辑 bug：负血量实体未移除、NaN/Infinity 数值、
+              // 实体数组无限增长（泄漏）、restart 后状态残留（afterRestart 时检查）。
+              function debugStateCheck(afterRestart){
+                try {
+                  var fn = window.__wwDebugState;
+                  if (typeof fn !== 'function') {
+                    window.__wwSmokeResult.errors.push('debug-state-missing: 未找到 window.__wwDebugState()（可观测性契约：必须提供调试状态快照函数）');
+                    return;
+                  }
+                  var s = null;
+                  try { s = fn(); }
+                  catch (e) {
+                    window.__wwSmokeResult.errors.push('debug-state-error: __wwDebugState() 抛错：' + String(e && e.message || e));
+                    return;
+                  }
+                  if (!s || typeof s !== 'object') {
+                    window.__wwSmokeResult.errors.push('debug-state-invalid: __wwDebugState() 必须返回状态对象（当前为 ' + (s === null ? 'null' : typeof s) + '）');
+                    return;
+                  }
+                  var problems = [];
+                  var ents = s.entities;
+                  if (ents !== undefined && ents !== null) {
+                    if (Object.prototype.toString.call(ents) !== '[object Array]') {
+                      problems.push('debug-state-invalid: entities 必须是数组');
+                    } else {
+                      if (ents.length > 500) {
+                        problems.push('invariant-entity-leak: 活动实体 ' + ents.length + ' 个，疑似死亡/离场实体未从数组移除（entities 只保留存活实体）');
+                      }
+                      var negHp = '';
+                      for (var i = 0; i < ents.length; i++) {
+                        var e = ents[i];
+                        if (!e || typeof e !== 'object') continue;
+                        if (typeof e.hp === 'number' && !isFinite(e.hp)) {
+                          problems.push('invariant-non-finite: 实体(type=' + (e.type || 'unknown') + ') 的 hp 为 NaN/Infinity，数值计算异常');
+                        } else if (typeof e.hp === 'number' && e.hp < 0) {
+                          negHp = negHp || ('type=' + (e.type || 'unknown') + ' hp=' + e.hp);
+                        }
+                      }
+                      if (negHp) {
+                        problems.push('invariant-negative-hp: 存在 hp<0 的实体（' + negHp + '）：死亡判定应使用 hp<=0 且当帧从 entities 移除');
+                      }
+                    }
+                  }
+                  var groups = [s];
+                  if (s.player && typeof s.player === 'object') groups.push(s.player);
+                  for (var g = 0; g < groups.length; g++) {
+                    var o = groups[g];
+                    for (var k in o) {
+                      if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
+                      if (typeof o[k] === 'number' && !isFinite(o[k])) {
+                        problems.push('invariant-non-finite: ' + k + ' 为 NaN/Infinity，数值计算异常');
+                      }
+                    }
+                  }
+                  if (afterRestart && typeof s.state === 'string' && s.state === 'over') {
+                    problems.push('restart-state-residue: restart() 后 state 仍为 over，游戏状态未完整重置');
+                  }
+                  for (var p = 0; p < problems.length && p < 5; p++) {
+                    window.__wwSmokeResult.errors.push(problems[p]);
+                  }
+                } catch (e) { /* 检查器自身异常不作游戏失败 */ }
+              }
               function pump(){
-                if (ticked >= ${MAX_FRAMES}) {
-                  blankCheck();
-                  reservedAreaCheck();
-                  window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: ticked, errors: window.__wwSmokeResult.errors};
+                if (ticked >= limit) {
+                  if (phase === 1) {
+                    restartPresenceCheck();
+                    blankCheck();
+                    reservedAreaCheck();
+                    debugStateCheck(false);
+                    if (__deep) {
+                      phase = 2; ticked = 0; limit = Math.floor(${MAX_FRAMES} / 2);
+                      exerciseRestart();
+                      timer = setTimeout(pump, 40);
+                      return;
+                    }
+                  } else {
+                    blankCheck();
+                    debugStateCheck(true);
+                  }
+                  __finalized = true;
+                  window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: (phase === 2 ? ${MAX_FRAMES} + ticked : ticked), errors: window.__wwSmokeResult.errors};
                   if (timer) { clearTimeout(timer); timer = null; }
                   return;
                 }
@@ -114,7 +216,7 @@ object SmokeTestProbe {
                   try { batch[i](now); }
                   catch (e) { window.__wwSmokeResult.errors.push(String(e && e.message || e)); }
                 }
-                if (ticked === ${MAX_FRAMES / 2}) { pokeTouch(); } // 中段再交互一轮：让游戏进入运行态后的处理器也得到执行
+                if (phase === 1 && ticked === ${MAX_FRAMES / 2}) { pokeTouch(); } // 中段再交互一轮：让游戏进入运行态后的处理器也得到执行
                 if (window.__wwSmokePending.length > 0) {
                   timer = setTimeout(pump, 0);
                 } else {
@@ -228,10 +330,10 @@ object SmokeTestProbe {
               }
               start();
               setTimeout(function(){
-                if (ticked < ${MAX_FRAMES}) {
+                if (!__finalized) {
                   window.__wwSmokeResult = {passed:false, framesRun:ticked, errors:window.__wwSmokeResult.errors.concat(['smoke-timeout'])};
                 }
-              }, 45000);
+              }, ${if (deep) 60000 else 45000});
             })();
             </script>
         """.trimIndent()
@@ -257,9 +359,10 @@ object SmokeTestProbe {
 class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner {
 
     @SuppressLint("SetJavaScriptEnabled")
-    override suspend fun run(html: String): SmokeTestResult {
-        val prepared = HtmlEnhancer.inject(SmokeTestProbe.inject(html))
-        return withTimeoutOrNull(TIMEOUT_MS) {
+    override suspend fun run(html: String, deep: Boolean): SmokeTestResult {
+        val prepared = HtmlEnhancer.inject(SmokeTestProbe.inject(html, deep))
+        val timeoutMs = if (deep) DEEP_TIMEOUT_MS else TIMEOUT_MS
+        return withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { cont ->
                 val main = Handler(Looper.getMainLooper())
                 lateinit var webView: WebView
@@ -365,7 +468,7 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                     main.postDelayed(::poll, FIRST_POLL_DELAY_MS + 2500)
                     view.loadDataWithBaseURL(null, prepared, "text/html", "UTF-8", null)
                 }
-                main.postDelayed(timeout, TIMEOUT_MS)
+                main.postDelayed(timeout, timeoutMs)
 
                 cont.invokeOnCancellation {
                     main.post { runCatching { webView.destroy() } }
@@ -398,6 +501,8 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
     private companion object {
         // 外层兜底超时：模拟器/低端机 WebView 慢（离屏节流定时器至约1次/秒，24 帧需 25~35s），给足余量；仅防挂起。
         const val TIMEOUT_MS = 80_000L
+        // deep（精品档）额外跑 restart() 复跑半程（合计约 36 tick），预算相应加宽。
+        const val DEEP_TIMEOUT_MS = 110_000L
         const val FIRST_POLL_DELAY_MS = 1_200L
         const val POLL_INTERVAL_MS = 700L
     }

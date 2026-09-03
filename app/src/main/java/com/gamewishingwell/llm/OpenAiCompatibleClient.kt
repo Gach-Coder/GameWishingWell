@@ -181,17 +181,20 @@ class OpenAiCompatibleClient(
         }
     }
 
-    /** OpenAI 线格式消息：assistant 携带 tool_calls 数组，工具结果走 role="tool" + tool_call_id。 */
+    /** OpenAI 线格式消息：assistant 携带 tool_calls 数组，工具结果走 role="tool" + tool_call_id。
+     *  注意：type 字段不能带默认值——默认 Json 配置 encodeDefaults=false，
+     *  带默认值的字段不会写入请求体，缺 "type":"function" 会被严格网关 4xx 拒绝或被静默忽略（工具调用全失效）。 */
     private fun ChatMessage.toWire(): OpenAiMessage = OpenAiMessage(
         role = if (role == "tool") "tool" else role,
         content = content.ifBlank { if (toolCalls.isNotEmpty() || role == "tool") null else content },
         tool_calls = toolCalls.takeIf { it.isNotEmpty() }?.map { tc ->
-            OpenAiToolCall(id = tc.id, function = OpenAiFunctionCall(name = tc.name, arguments = tc.arguments))
+            OpenAiToolCall(id = tc.id, type = "function", function = OpenAiFunctionCall(name = tc.name, arguments = tc.arguments))
         },
         tool_call_id = toolCallId
     )
 
     private fun ToolSpec.toWire(): OpenAiToolDef = OpenAiToolDef(
+        type = "function",
         function = OpenAiFunctionSpec(
             name = name,
             description = description,
@@ -220,7 +223,7 @@ class OpenAiCompatibleClient(
     @Serializable
     private data class OpenAiToolCall(
         val id: String,
-        val type: String = "function",
+        val type: String,
         val function: OpenAiFunctionCall
     )
 
@@ -232,7 +235,7 @@ class OpenAiCompatibleClient(
 
     @Serializable
     private data class OpenAiToolDef(
-        val type: String = "function",
+        val type: String,
         val function: OpenAiFunctionSpec
     )
 

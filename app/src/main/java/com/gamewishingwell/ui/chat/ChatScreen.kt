@@ -92,6 +92,9 @@ fun ChatScreen(
 
     var input by remember { mutableStateOf("") }
     var showSaveDialog by remember { mutableStateOf(false) }
+    // 确认卡轮次预算的屏幕级持有：修正回合重建卡片时不丢失用户已拨动的挡位；
+    // 新的首张确认卡（非重组）出现时清空，避免跨局残留。
+    var pendingLoops by remember { mutableStateOf<Int?>(null) }
     val listState = rememberLazyListState()
 
     // 列表总条目数 = 消息（含确认卡） + 生成中占位 + 错误卡片占位
@@ -120,6 +123,9 @@ fun ChatScreen(
         // imePadding 作用在“消息区 + 操作区 + 输入区”整体上：
         // 键盘展开时三者一起向上移动，输入框始终保持在键盘上方。
         Column(Modifier.padding(padding).fillMaxSize().imePadding()) {
+            LaunchedEffect(session.pendingConfirmation) {
+                if (session.pendingConfirmation?.revised == false) pendingLoops = null
+            }
             LazyColumn(
                 state = listState,
                 modifier = Modifier.weight(1f),
@@ -161,6 +167,8 @@ fun ChatScreen(
                             IntentConfirmationCard(
                                 confirmation = card,
                                 enabled = index == enabledCardIndex && !session.isGenerating,
+                                loops = if (index == enabledCardIndex) pendingLoops ?: card.expectedLoops else card.expectedLoops,
+                                onLoopsChange = { pendingLoops = it },
                                 onConfirm = { unchecked, expectedLoops -> vm.confirmIntent(unchecked, expectedLoops) }
                             )
                         } else {
@@ -186,7 +194,8 @@ fun ChatScreen(
                 placeholder = inputPlaceholder,
                 onValueChange = { input = it },
                 onSend = {
-                    vm.send(input.trim())
+                    // 确认卡待确认期间发送文本＝修正：携带当前轮次预算挡位，重建卡不丢失用户选择。
+                    vm.send(input.trim(), session.pendingConfirmation?.let { pendingLoops })
                     input = ""
                 },
                 onStop = { vm.stopGeneration() }
@@ -259,22 +268,16 @@ private val LoopStops = listOf(1, 2, 3, 4, 5, 8, 10, 12, 15, 20, 25, 30, 40, 50,
 private fun IntentConfirmationCard(
     confirmation: IntentConfirmation,
     enabled: Boolean,
+    loops: Int,
+    onLoopsChange: (Int) -> Unit,
     onConfirm: (Set<String>, Int) -> Unit
 ) {
     // 勾选状态默认全选；确认时锁定进卡片消息（uncheckedModules），历史卡重显不复位。
+    // 轮次预算 loops 由调用方（ChatScreen）持有：修正回合重建卡片不丢失用户已拨动的挡位。
     val checkedModules = remember(confirmation) {
         mutableStateMapOf<String, Boolean>().apply {
             confirmation.modules.forEach { put(it.module, it.module !in confirmation.uncheckedModules) }
         }
-    }
-    // 用户预期的 Agent Loop 轮数（挡位式，默认取卡片持久值就近上靠）：驱动质量/成本档位。
-    // 状态存滑条索引（Float，0..15），挡位值经 LoopStops 映射。
-    var loopIndex by remember(confirmation) {
-        mutableStateOf(
-            LoopStops.indexOfFirst { it >= confirmation.expectedLoops }
-                .let { if (it < 0) LoopStops.lastIndex else it }
-                .toFloat()
-        )
     }
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer,
@@ -387,9 +390,9 @@ private fun IntentConfirmationCard(
             }
             // 轮次预算滑条（挡位式）：用户预期的 Agent Loop 轮数，确认后写入会话
             // 并驱动生成策略档位（快速/均衡/精品）。
-            val loops = LoopStops[loopIndex.roundToInt()]
             val tierLabel = when {
                 loops <= 2 -> "快速：最简一步到位，无自检轮"
+                loops <= 4 -> "轻量：完整实现，一轮自检"
                 loops <= 10 -> "均衡：类型标配完整实现，两轮自检"
                 else -> "精品：内容更丰富＋打磨，三轮自检"
             }
@@ -414,8 +417,10 @@ private fun IntentConfirmationCard(
                 )
             }
             Slider(
-                value = loopIndex,
-                onValueChange = { loopIndex = it.roundToInt().toFloat() },
+                value = LoopStops.indexOfFirst { it >= loops }
+                    .let { if (it < 0) LoopStops.lastIndex else it }
+                    .toFloat(),
+                onValueChange = { onLoopsChange(LoopStops[it.roundToInt()]) },
                 valueRange = 0f..LoopStops.lastIndex.toFloat(),
                 steps = LoopStops.size - 2,
                 enabled = enabled
@@ -445,7 +450,7 @@ private fun IntentConfirmationCard(
             }
             Spacer(Modifier.size(10.dp))
             Button(
-                onClick = { onConfirm(checkedModules.filterValues { !it }.keys, LoopStops[loopIndex.roundToInt()]) },
+                onClick = { onConfirm(checkedModules.filterValues { !it }.keys, loops) },
                 enabled = enabled,
                 modifier = Modifier.fillMaxWidth()
             ) {

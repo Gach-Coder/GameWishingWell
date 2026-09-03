@@ -28,11 +28,12 @@ class ChatViewModel(
         }
     }
 
-    fun send(text: String) {
+    /** 发送用户消息；确认门待确认期间 [expectedLoops] 携带当前轮次预算挡位，修正重建卡不丢失用户选择。 */
+    fun send(text: String, expectedLoops: Int? = null) {
         val trimmed = text.trim()
         if (trimmed.isBlank()) return
         lastInstruction = trimmed
-        viewModelScope.launch { agent.sendUserMessage(trimmed) }
+        viewModelScope.launch { agent.sendUserMessage(trimmed, expectedLoops) }
     }
 
     fun regenerate() {
