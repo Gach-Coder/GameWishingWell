@@ -27,6 +27,11 @@ class SettingsViewModel(
         repository.save(s)
     }
 
+    /** 思考开关即时持久化（Switch 语义：拨动即生效，无需保存按钮）。 */
+    fun setThinkingEnabled(enabled: Boolean) {
+        repository.updateThinking(enabled)
+    }
+
     fun test(s: LlmSettings) {
         viewModelScope.launch {
             _testing.value = true

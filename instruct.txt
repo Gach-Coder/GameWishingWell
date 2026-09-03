@@ -110,6 +110,12 @@ Agent处理message流程如下：
 			→ 每次写入后宿主自动检查产品契约（外部资源/eval 禁令，无解析器代差），报告作为"观察"附在 tool_result 回传
 			→ 模型不再发起工具调用即自然终止；验收 = 产品契约通过 + 修改轮内容哈希≠种子哈希（防"空口完成"）+ 沙箱运行通过 + 可玩性自检轮全部完成
 			→ 每次写入即刻发布中间版本到会话，中断后玩家可立即试玩
+	后台保活（前台服务，P0）：生成任务开始即启动 dataSync 前台服务 GenerationForegroundService——
+	切后台/息屏不中断（前台服务豁免 Doze 网络限制 + partial wakelock 防 CPU 休眠导致 SSE 停摆）；
+	通知内容为阶段进度（零技术细节纪律对通知同样成立，节流 ~1s），带"停止"动作（接 stopGeneration）；
+	服务自行观察 isGenerating 收尾（完成/失败/确认门等待/用户停止均会翻 false），Agent 侧不主动 stop
+	（避免上回合取消回调与下回合启动的竞态）；Android 15+ dataSync 6 小时上限由 onTimeout 退前台兜底（不终止生成）；
+	通知权限（Android 13+）在 MainActivity 启动时请求，拒绝仅影响通知显示、不影响后台生成；
 		交付约束：交给用户前必须通过基础校验（0 error）、沙箱冒烟测试（同 WebView 内核确定性 tick 跑通）与两轮可玩性自检（内容完整性、体验与平台合规），不存在"带错交付"
 	防死循环与交付约束：不做"带错交付"（交给用户前必须沙箱运行通过）——
 		bug 修复轮数不设上限（多轮修复属正常现象，同错误 3/6 次仅注入"换思路/重写模块"提示，不终止）；
@@ -137,7 +143,10 @@ Agent处理message流程如下：
 			  （静态校验先行检查函数存在），沙箱跑满帧后调用它做通用不变量检查——
 			  负血量实体未移除（hp<0 应当帧移除）、数值 NaN/Infinity、活动实体超 500（泄漏）、
 			  deep 重启后 state 仍为 over（重置不完整）——"不抛错但明显不对"的低级逻辑 bug 在交付前被客观拦截
-			+ 45s 内部超时/80s 外层兜底（deep 模式 60s/110s）（离屏 WebView 未挂窗时 Chromium 按后台节流定时器至约1次/秒，24帧需25~35s）；宿主以 700ms 间隔轮询 window.__wwSmokeResult 直至终态（跑满帧或出现错误），onPageFinished 不触发时也有定时兜底轮询；
+			+ 45s 内部超时/80s 外层兜底（deep 模式 60s/110s）；帧推进为宿主驱动：探针不自排程（离屏 WebView 的
+			  setTimeout 被节流至约1次/秒），宿主以 200ms 间隔轮询并每次调用 window.__wwPump() 推进一批帧
+			  （evaluateJavascript 不经定时器队列、不受节流影响），24 帧约 5s、deep 约 8s；内部超时仅作宿主失效的看门狗；
+			  onPageFinished 不触发时也有定时兜底轮询；
 			画面空白检测（白屏杀手锏）：跑满帧后所有 canvas 均无内容（空白 canvas 的 PNG dataURL <3KB）且页面无可读文本 → 判"playability-blank-screen"失败回炉——杀掉"运行不报错但啥都没渲染"的假通过；
 			可玩性自检轮（对标 DSH/ZaiAgent 的自检-增强流程）：沙箱通过后不立即交付，逐轮注入"对照【可玩性要求】自查修复"再验收——
 			轮数随用户预期轮次预算（确认门滑条 expectedLoops）与回合类型分档：
@@ -255,7 +264,8 @@ GameWishingWell/
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
       │  │  │  ├─ QualityGate.kt         # 两段式自检 verdict
       │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
-      │  │  │  └─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入
+	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入
+	      │  │  │  └─ GenerationForegroundService.kt # 生成期前台服务（dataSync）：后台保活/进度通知/停止入口/wakelock
       │  │  ├─ data/
       │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage
       │  │  │  ├─ GameRepository.kt      # 游戏库与草稿文件存储

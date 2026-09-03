@@ -189,14 +189,19 @@ fun SettingsScreen() {
                 Column(Modifier.weight(1f)) {
                     Text("模型思考能力", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "关闭后模型不输出思考内容；开启后按服务商默认行为允许模型思考输出。",
+                        "关闭后模型不输出思考内容；开启后按服务商默认行为允许模型思考输出。切换立即生效。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Switch(
                     checked = thinkingEnabled,
-                    onCheckedChange = { thinkingEnabled = it }
+                    onCheckedChange = {
+                        thinkingEnabled = it
+                        // Switch 即时持久化：拨动即写入仓库，切页/重进不再回退；
+                        // 其余字段（Key/Base URL/模型名/系统提示词）仍走"保存设置"按钮。
+                        vm.setThinkingEnabled(it)
+                    }
                 )
             }
 

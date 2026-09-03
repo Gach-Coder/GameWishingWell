@@ -163,6 +163,10 @@ class GameAgent(
     }
 
     private fun trackGenerationJob(job: Job): Job {
+        // 后台保活（前台服务）：生成任务开始即启动 dataSync 前台服务（进度通知 + 停止入口 + wakelock）；
+        // 服务自行观察 isGenerating 收尾，Agent 侧不主动 stop——避免上回合取消回调与下回合启动的
+        // 竞态把新回合的服务关掉。启动失败绝不影响生成本体。
+        runCatching { GenerationForeground.start(appContext) }
         activeGenerationJob = job
         job.invokeOnCompletion {
             if (activeGenerationJob === job) activeGenerationJob = null

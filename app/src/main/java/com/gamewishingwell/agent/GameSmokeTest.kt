@@ -43,14 +43,15 @@ object NoopSmokeTestRunner : SmokeTestRunner {
 }
 
 /**
- * 沙箱校验探针：把 requestAnimationFrame 改成确定性 tick 队列，DOMContentLoaded 后
- * 跑满最多 [MAX_FRAMES] 帧（每帧 50ms 游戏时间，覆盖开始交互后的早期玩法而不只是首帧渲染）；
+ * 沙箱校验探针：把 requestAnimationFrame 改成确定性 tick 队列，帧推进由宿主轮询驱动——
+ * 探针暴露 window.__wwPump()（每调用一次同步推进一批帧），不自排程：离屏 WebView 的
+ * setTimeout 被节流至约 1 次/秒，自排程会把 24 帧拖成 25~35 秒；宿主经 evaluateJavascript
+ * 驱动不经定时器队列，24 帧约 5 秒完成。DOMContentLoaded（游戏脚本注册 rAF）前不推进。
  * 任何帧内异常、全局异常（含事件回调）与 console error 都会被捕获；
- * 合成交互在多点位（中心/底部/左右下侧）派发 touchstart/touchend/click 并做一次拖动，
- * 开始后与跑帧中段各一轮；localStorage 替换为内存 stub，避免沙箱跨源异常；
- * 跑满帧后做白屏检测、顶部保留区扫描（平台操作条区域内出现可交互元素即失败）
- * 与可观测性不变量断言（调用 __wwDebugState() 检查负血量实体/NaN 数值/实体泄漏）；
- * 同时设置超时兜底，防止定时器失控。
+ * 多点位触控派发（touchstart/touchend/click + 一次拖动）在首帧后与跑帧中段各一轮；
+ * localStorage 替换为内存 stub；跑满帧后做白屏检测、顶部保留区扫描
+ * 与可观测性不变量断言（__wwDebugState()：负血量实体/NaN 数值/实体泄漏）；
+ * 内部超时仅作宿主失效时的看门狗。
  *
  * 沙箱是运行正确性的唯一校验来源：passed = 跑满 tick 且无任何错误文本。
  */
@@ -95,8 +96,9 @@ object SmokeTestProbe {
               var realRaf = window.requestAnimationFrame && window.requestAnimationFrame.bind(window);
               var realCaf = window.cancelAnimationFrame && window.cancelAnimationFrame.bind(window);
               var ticked = 0;
-              var timer = null;
               var __finalized = false; // 终态防覆盖：deep 复跑会重置 ticked，超时回调不得覆盖已通过结果
+              var __domReady = false;     // DOMContentLoaded（游戏脚本注册 rAF）前不推进帧
+              var __pokedInitial = false; // 首帧后的首轮交互只做一次
               // deep（精品档）：restart() 真实重开后复跑半程帧，验证"完整重开"契约。
               var __deep = ${if (deep) "true" else "false"};
               var phase = 1;   // 1=首次运行 2=restart 后复跑
@@ -187,7 +189,10 @@ object SmokeTestProbe {
                   }
                 } catch (e) { /* 检查器自身异常不作游戏失败 */ }
               }
+              // 帧推进为宿主驱动：探针不自排程（离屏 WebView 的 setTimeout 被节流至约1次/秒，
+              // 自排程会把 24 帧拖成 25~35 秒）；宿主每次轮询调用 window.__wwPump() 推进一批帧。
               function pump(){
+                if (!__domReady || __finalized) return;
                 if (ticked >= limit) {
                   if (phase === 1) {
                     restartPresenceCheck();
@@ -197,7 +202,6 @@ object SmokeTestProbe {
                     if (__deep) {
                       phase = 2; ticked = 0; limit = Math.floor(${MAX_FRAMES} / 2);
                       exerciseRestart();
-                      timer = setTimeout(pump, 40);
                       return;
                     }
                   } else {
@@ -206,7 +210,6 @@ object SmokeTestProbe {
                   }
                   __finalized = true;
                   window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: (phase === 2 ? ${MAX_FRAMES} + ticked : ticked), errors: window.__wwSmokeResult.errors};
-                  if (timer) { clearTimeout(timer); timer = null; }
                   return;
                 }
                 ticked++;
@@ -216,13 +219,14 @@ object SmokeTestProbe {
                   try { batch[i](now); }
                   catch (e) { window.__wwSmokeResult.errors.push(String(e && e.message || e)); }
                 }
-                if (phase === 1 && ticked === ${MAX_FRAMES / 2}) { pokeTouch(); } // 中段再交互一轮：让游戏进入运行态后的处理器也得到执行
-                if (window.__wwSmokePending.length > 0) {
-                  timer = setTimeout(pump, 0);
-                } else {
-                  timer = setTimeout(pump, 40);
+                if (phase === 1 && !__pokedInitial) {
+                  __pokedInitial = true;
+                  pokeTouch(); // 首帧后立即交互：触发"开始"类按钮让游戏真正进入运行态
+                } else if (phase === 1 && ticked === ${MAX_FRAMES / 2}) {
+                  pokeTouch(); // 中段再交互一轮：运行态后的处理器也得到执行
                 }
               }
+              window.__wwPump = pump;
               // 合成交互：多点位派发 touchstart/touchend 与 click（中心/底部中央/左右下侧，
               // 命中 elementFromPoint 处的真实元素），再做一次滑动（touchstart→touchmove→touchend）
               // 覆盖虚拟摇杆/拖动路径；开始后与跑帧中段各派发一轮，让游戏真正进入运行态。
@@ -325,10 +329,11 @@ object SmokeTestProbe {
                 } catch (e) {}
               }
               function start(){
-                if (document.readyState !== 'loading') { setTimeout(pump, 10); setTimeout(pokeTouch, 60); }
-                else { window.addEventListener('DOMContentLoaded', function(){ setTimeout(pump, 10); setTimeout(pokeTouch, 60); }); }
+                if (document.readyState !== 'loading') { __domReady = true; }
+                else { window.addEventListener('DOMContentLoaded', function(){ __domReady = true; }); }
               }
               start();
+              // 看门狗：仅当宿主驱动异常停止时兜底判超时（正常路径宿主推进在数秒内完成）。
               setTimeout(function(){
                 if (!__finalized) {
                   window.__wwSmokeResult = {passed:false, framesRun:ticked, errors:window.__wwSmokeResult.errors.concat(['smoke-timeout'])};
@@ -390,7 +395,10 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                 fun poll() {
                     if (finished) return
                     polls++
-                    val js = "(function(){try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],done:(r&&r.framesRun>=${SmokeTestProbe.MAX_FRAMES})||(r&&r.errors&&r.errors.length>0)});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true});}})()"
+                    // 每次轮询顺手驱动一帧批次（宿主驱动帧推进：evaluateJavascript 不经定时器队列，
+                    // 不受离屏 WebView 后台节流影响），再读取探针终态。
+                    val js = "(function(){try{if(window.__wwPump){window.__wwPump();}}catch(pumpErr){}" +
+                        "try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],done:(r&&r.framesRun>=${SmokeTestProbe.MAX_FRAMES})||(r&&r.errors&&r.errors.length>0)});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true});}})()"
                     webView.evaluateJavascript(js) { value ->
                         val parsed = parseProbeResult(value, emptyList())
                         // done=探针已有终态（跑满帧或出现错误）；未终态则继续轮询
@@ -499,11 +507,13 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
     }
 
     private companion object {
-        // 外层兜底超时：模拟器/低端机 WebView 慢（离屏节流定时器至约1次/秒，24 帧需 25~35s），给足余量；仅防挂起。
+        // 外层兜底超时：仅防挂起（宿主驱动下正常路径数秒完成）。
         const val TIMEOUT_MS = 80_000L
-        // deep（精品档）额外跑 restart() 复跑半程（合计约 36 tick），预算相应加宽。
+        // deep（精品档）额外跑 restart() 复跑半程（合计约 36 批次）。
         const val DEEP_TIMEOUT_MS = 110_000L
         const val FIRST_POLL_DELAY_MS = 1_200L
-        const val POLL_INTERVAL_MS = 700L
+        // 冒烟期轮询兼帧驱动：每次轮询调用 __wwPump() 推进一批帧；
+        // 200ms/批下 24 帧 ≈ 5s、deep ≈ 8s，不再受离屏 WebView 定时器节流（约1次/秒）拖慢。
+        const val POLL_INTERVAL_MS = 200L
     }
 }

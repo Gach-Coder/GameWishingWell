@@ -57,6 +57,15 @@ class SettingsRepository(context: Context) {
         _settings.value = normalized
     }
 
+    /**
+     * 仅更新思考开关（设置页 Switch 即时生效）：不连带保存其他未提交的表单草稿
+     *（API Key/Base URL/模型名等仍走"保存设置"按钮），切页/重进不再被还原。
+     */
+    fun updateThinking(enabled: Boolean) {
+        secure.putString("thinking_enabled", enabled.toString())
+        _settings.value = _settings.value.copy(thinkingEnabled = enabled)
+    }
+
     fun isConfigured(): Boolean {
         val s = _settings.value
         return s.apiKey.isNotBlank() && s.baseUrl.isNotBlank() && s.model.isNotBlank()
