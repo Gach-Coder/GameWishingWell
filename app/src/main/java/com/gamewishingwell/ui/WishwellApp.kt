@@ -20,6 +20,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.gamewishingwell.ui.chat.ChatScreen
+import com.gamewishingwell.ui.files.FileBrowserScreen
 import com.gamewishingwell.ui.game.GameScreen
 import com.gamewishingwell.ui.home.HomeScreen
 import com.gamewishingwell.ui.settings.SettingsScreen
@@ -73,7 +74,8 @@ fun WishwellApp() {
                     onOpenGame = { id -> navController.navigate("game?source=game&gameId=$id") },
                     onEditGame = { id -> navController.navigate("chat?gameId=$id") },
                     onNewChat = { navController.navigate("chat") },
-                    onContinueDraft = { navController.navigate("chat?draft=true") }
+                    onContinueDraft = { navController.navigate("chat?draft=true") },
+                    onOpenFiles = { id -> navController.navigate("files?gameId=$id") }
                 )
             }
             composable(
@@ -124,6 +126,18 @@ fun WishwellApp() {
                         }
                     },
                     onHome = { navController.popBackStack("home", false) }
+                )
+            }
+            composable(
+                route = "files?gameId={gameId}",
+                arguments = listOf(
+                    navArgument("gameId") { type = NavType.LongType; defaultValue = -1L }
+                )
+            ) { entry ->
+                val gameId = entry.arguments?.getLong("gameId") ?: -1L
+                FileBrowserScreen(
+                    gameId = gameId,
+                    onBack = { navController.popBackStack() }
                 )
             }
             composable("settings") {

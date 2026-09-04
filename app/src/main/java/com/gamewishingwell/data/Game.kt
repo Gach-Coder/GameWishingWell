@@ -17,6 +17,16 @@ data class GameIndex(
     val games: List<GameMeta> = emptyList()
 )
 
+/** 文件可视系统条目：游戏存储文件夹内一个文件/子目录的概要信息（仅展示，不打开）。 */
+data class GameFileEntry(
+    val name: String,
+    val isDirectory: Boolean,
+    val sizeBytes: Long,
+    /** 目录内的直接子项数（文件恒为 0）。 */
+    val childCount: Int = 0,
+    val lastModified: Long
+)
+
 /** 一次工具调用请求：id 与参数原样字符串由协议层产出，执行层自行解析参数 JSON。 */
 @Serializable
 data class ToolCallData(

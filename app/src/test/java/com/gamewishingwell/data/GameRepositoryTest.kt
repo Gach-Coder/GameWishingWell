@@ -35,4 +35,31 @@ class GameRepositoryTest {
         }
         dir.deleteRecursively()
     }
+
+    @Test
+    fun `文件可视系统列出游戏文件夹一级条目`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            val meta = repo.saveGame("打地鼠", "描述", "<html>v1</html>", listOf(ChatMessage("user", "做一个游戏")))
+            repo.updateGameHtml(meta.id, "<html>v2</html>", listOf(ChatMessage("user", "做一个游戏")))
+
+            val entries = repo.listGameFiles(meta.id)
+            val names = entries.map { it.name }
+            // 版本化写入产出的既有文件全部可见
+            assertTrue("index.html" in names)
+            assertTrue("session.json" in names)
+            assertTrue(".versions" in names)
+            val html = entries.first { it.name == "index.html" }
+            assertTrue(!html.isDirectory && html.sizeBytes > 0 && html.lastModified > 0)
+            // 目录排前，且携带子项计数
+            val versions = entries.first { it.isDirectory }
+            assertEquals(".versions", versions.name)
+            assertTrue(versions.childCount >= 1)
+            assertTrue(entries.first().isDirectory)
+            // 不存在的游戏返回空
+            assertTrue(repo.listGameFiles(99999L).isEmpty())
+        }
+        dir.deleteRecursively()
+    }
 }

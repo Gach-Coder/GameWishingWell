@@ -8,8 +8,13 @@
 一个安卓端“游戏创作 Agent”平台，底部三个 Tab：我的游戏、创作、设置。
 
 1. “我的游戏（首页）”展示用户已经制作好的游戏，点击即可立即游玩；
-   每张游戏卡片显示：游戏名、用户描述、更新时间，支持：重命名、继续对话编辑、删除，
+   每张游戏卡片显示：游戏名、用户描述、更新时间，支持：重命名、继续对话编辑、删除、文件夹，
    有未保存草稿时显示“继续上次创作”入口。
+   文件可视系统（只读概览，不提供打开文件功能）：游戏卡菜单“文件夹”进入 FileBrowserScreen，
+   像资源管理器一样展示该游戏存储文件夹（filesDir/games/<id>）一级条目——
+   名称、类型（文件夹/HTML 网页/JSON 数据/SHA-256 校验/版本标记/文本，.versions 标为版本归档文件夹）、
+   大小（目录显示子项数）、修改日期（yyyy-MM-dd HH:mm）；子目录在前、其余按名称排序；
+   数据来自 GameRepository.listGameFiles（GameFileEntry），页面无底部导航、返回即回首页。
 2. “创作”页面可以用自然语言描述游戏（如“做一个打地鼠小游戏”），
    AI 即时生成 Android WebView 平台运行的单人游戏(HTML+CSS+JavaScript)，LLM SSE 流式输出（打字机效果）。
 	- 交互形态类似豆包/元宝的对话 Agent：左侧 AI、右侧用户，生成中显示实时流。
@@ -376,9 +381,11 @@ GameWishingWell/
       │  │     ├─ home/HomeScreen.kt        # 我的游戏页
       │  │     ├─ chat/ChatScreen.kt        # 创作/编辑对话页
       │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复）
+      │  │     ├─ files/FileBrowserScreen.kt # 文件可视系统：游戏文件夹只读概览（名称/类型/大小/修改日期）
       │  │     ├─ settings/SettingsScreen.kt # 设置页
       │  │     └─ viewmodels/
       │  │        ├─ HomeViewModel.kt
+      │  │        ├─ FileBrowserViewModel.kt # 文件夹条目加载
       │  │        ├─ ChatViewModel.kt
       │  │        ├─ GameViewModel.kt
       │  │        └─ SettingsViewModel.kt

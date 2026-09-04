@@ -58,6 +58,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.gamewishingwell.data.GameMeta
+import com.gamewishingwell.ui.files.WwFolderIcon
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.HomeViewModel
 import java.text.SimpleDateFormat
@@ -70,7 +71,8 @@ fun HomeScreen(
     onOpenGame: (Long) -> Unit,
     onEditGame: (Long) -> Unit,
     onNewChat: () -> Unit,
-    onContinueDraft: () -> Unit
+    onContinueDraft: () -> Unit,
+    onOpenFiles: (Long) -> Unit
 ) {
     val container = rememberContainer()
     val vm: HomeViewModel = viewModel(
@@ -160,7 +162,8 @@ fun HomeScreen(
                             onClick = { onOpenGame(meta.id) },
                             onEdit = { onEditGame(meta.id) },
                             onDelete = { vm.deleteGame(meta.id) },
-                            onRename = { vm.renameGame(meta.id, it) }
+                            onRename = { vm.renameGame(meta.id, it) },
+                            onFiles = { onOpenFiles(meta.id) }
                         )
                     }
                 }
@@ -209,7 +212,8 @@ private fun GameCard(
     onClick: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
-    onRename: (String) -> Unit
+    onRename: (String) -> Unit,
+    onFiles: () -> Unit
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -256,6 +260,11 @@ private fun GameCard(
                         text = { Text("重命名") },
                         leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
                         onClick = { menuOpen = false; renameOpen = true }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("文件夹") },
+                        leadingIcon = { Icon(WwFolderIcon, contentDescription = null) },
+                        onClick = { menuOpen = false; onFiles() }
                     )
                     DropdownMenuItem(
                         text = { Text("删除") },

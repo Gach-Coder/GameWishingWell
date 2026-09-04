@@ -185,6 +185,27 @@ class GameRepository(private val context: Context) {
         }
     }
 
+    /**
+     * 文件可视系统：列出游戏存储文件夹（games/<id>）的一级条目——
+     * 子目录在前、其余按名称排序；只读概要信息，不提供打开能力。
+     */
+    suspend fun listGameFiles(gameId: Long): List<GameFileEntry> = withContext(Dispatchers.IO) {
+        val dir = File(gamesDir, gameId.toString())
+        if (!dir.isDirectory) return@withContext emptyList()
+        dir.listFiles()
+            ?.map { f ->
+                GameFileEntry(
+                    name = f.name,
+                    isDirectory = f.isDirectory,
+                    sizeBytes = if (f.isFile) f.length() else 0L,
+                    childCount = if (f.isDirectory) f.listFiles()?.size ?: 0 else 0,
+                    lastModified = f.lastModified()
+                )
+            }
+            ?.sortedWith(compareByDescending<GameFileEntry> { it.isDirectory }.thenBy { it.name })
+            ?: emptyList()
+    }
+
     // ---------- 草稿 ----------
 
     suspend fun saveDraft(html: String, session: List<ChatMessage>) {
