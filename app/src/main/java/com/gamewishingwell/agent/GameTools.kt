@@ -18,7 +18,10 @@ object GameTools {
     const val EDIT_FILE = "editfile"
     const val APPEND_FILE = "appendfile"
 
-    private const val PATH_DESC = "工作区内的相对路径，本项目单文件固定为 index.html"
+    private const val PATH_DESC = "工作区内的相对路径：index.html（游戏本体）或 scenarios.json（功能断言，均衡/精品档）"
+
+    /** 切片自适应阈值：不超过该行数的文件，切片请求一律整读返回。 */
+    const val WHOLE_READ_MAX_LINES = 1200
 
     fun specs(): List<ToolSpec> = listOf(
         ToolSpec(
@@ -28,12 +31,12 @@ object GameTools {
         ),
         ToolSpec(
             name = READ_FILE,
-            description = "读取工作区内一个文件的内容。修改前如上下文中没有最新内容，先调用它；大文件可用 start_line/end_line 只读需要的区段。",
+            description = "读取工作区内一个文件的内容。本项目文件通常千行以内——不带行号参数直接整读即可，不要切片（切片省下的一点上下文远抵不过多花一整轮往返）。只有确需超大文件局部时才用 start_line/end_line，且需要多个区段时应在同一轮响应里并行发起多个 readfile。",
             parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"start_line":{"type":"integer","description":"起始行号（从 1 计），可选"},"end_line":{"type":"integer","description":"结束行号（含），可选"}},"required":[]}"""
         ),
         ToolSpec(
             name = WRITE_FILE,
-            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段。写入后系统自动检查产品契约并在结果中回传。",
+            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用，可写 index.html（游戏本体）或 scenarios.json（功能断言）。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段。写入后系统自动检查产品契约/断言格式并在结果中回传。",
             parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"完整文件内容"}},"required":["content"]}"""
         ),
         ToolSpec(
@@ -55,14 +58,16 @@ data class ToolOutcome(
     val name: String,
     /** 工具调用本身执行成功（参数合法且动作完成）。 */
     val ok: Boolean,
-    /** 是否改变了工作区文件内容。 */
+    /** 是否改变了入口文件（index.html）内容——发布 currentHtml 与读结果过期的依据。 */
     val mutated: Boolean,
     /** 变更后的入口文件全文；mutated=false 时为 null。 */
     val html: String?,
-    /** 变更后内容的基础校验报告；mutated=false 时为 null。 */
+    /** 变更后入口内容的基础校验报告；mutated=false 时为 null。 */
     val report: ValidationReport?,
     /** 回填给模型的观察文本。 */
-    val observation: String
+    val observation: String,
+    /** 是否产生了任何工作区写入（含 scenarios.json 等非入口文件）：驱动空转计数。 */
+    val workspaceTouched: Boolean = mutated
 )
 
 /**
@@ -117,6 +122,15 @@ class GameToolExecutor(
         val lines = content.lines()
         val startLine = (args.optInt("start_line") ?: 1).coerceIn(1, lines.size)
         val endLine = (args.optInt("end_line") ?: lines.size).coerceIn(startLine, lines.size)
+        // 切片自适应：小文件（千行级）的切片请求直接整读——实测修复轮 60~70% 的
+        // 轮次耗在切片重读上（每片一次 LLM 往返），整读一次拿到全貌反而更省；
+        // 真正的大文件（精品档长文）保留切片能力。
+        if (lines.size <= GameTools.WHOLE_READ_MAX_LINES && (startLine > 1 || endLine < lines.size)) {
+            return outcome(
+                call, ok = true,
+                observation = "文件 $path 共 ${lines.size} 行（不大，已直接返回全文；后续修改请基于此内容，无需再切片读取）：\n$content"
+            )
+        }
         return if (startLine == 1 && endLine == lines.size) {
             outcome(call, ok = true, observation = "文件 $path 内容如下（共 ${lines.size} 行）：\n$content")
         } else {
@@ -198,7 +212,11 @@ class GameToolExecutor(
     private fun versionOf(path: String): Int =
         workspace.manifest().files.firstOrNull { it.path == path }?.version ?: 0
 
-    /** 变更类工具的成功返回：附上自动契约检查（观察）；editfile 额外附修改点上下文片段。 */
+    /**
+     * 变更类工具的成功返回：附上自动契约检查（观察）；editfile 额外附修改点上下文片段。
+     * 按路径分流：入口文件（index.html）走 HTML 契约校验并作为 currentHtml 发布依据；
+     * scenarios.json（功能断言）解析校验后只作工作区触碰，不发布、不跑 HTML 校验。
+     */
     private fun mutatedOutcome(
         call: ToolCallData,
         path: String,
@@ -208,6 +226,24 @@ class GameToolExecutor(
         newString: String? = null,
         appended: Int? = null
     ): ToolOutcome {
+        if (path == GameScenarios.FILE) {
+            val (checkOk, checkText) = GameScenarios.checkObservation(content)
+            val head = when {
+                appended != null -> "已追加 $appended 行并写入 $path（v$version）。"
+                replaced != null -> "已替换 $replaced 处并写入 $path（v$version）。"
+                else -> "已写入 $path（v$version，${content.length} 字符）。"
+            }
+            return ToolOutcome(
+                callId = call.id,
+                name = call.name,
+                ok = checkOk,
+                mutated = false,
+                html = null,
+                report = null,
+                observation = head + "\n" + checkText,
+                workspaceTouched = true
+            )
+        }
         val report = validate(content)
         val head = when {
             appended != null -> "已追加 $appended 行并写入 $path（v$version，现共 ${content.lines().size} 行）。"

@@ -51,8 +51,8 @@ data class IntentConfirmation(
      * 不注入任何提示词，也不进入排除清单。
      */
     val uncheckedModules: List<String> = emptyList(),
-    /** 用户预期的 Agent Loop 轮数（卡片滑条 1~100，默认 5）；确认后写入会话驱动生成策略档位。 */
-    val expectedLoops: Int = 5
+    /** 质量档位（卡片四挡 fast/light/balanced/premium，默认均衡）；确认后写入会话驱动生成策略。 */
+    val qualityTier: String = "balanced"
 ) {
     /** 确认门实际共享的 Game Schema JSON（兼容旧版 intent 字段）。 */
     val schema: GameSchema get() = gameSchema ?: intent?.toGameSchema() ?: GameSchema()

@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -47,6 +48,7 @@ class GenerationForegroundService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     @Volatile
     private var observing = false
@@ -149,11 +151,17 @@ class GenerationForegroundService : Service() {
         wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gamewishingwell:generation")
             .apply { runCatching { acquire(WAKELOCK_TIMEOUT_MS) } }
+        // WifiLock：后台运行时保持 Wi-Fi 无线电高性能模式，降低长流式请求被网卡省电中断的概率。
+        wifiLock = (getSystemService(WIFI_SERVICE) as WifiManager)
+            .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "gamewishingwell:generation")
+            .apply { runCatching { acquire() } }
     }
 
     private fun stopForegroundAndSelf() {
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
+        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+        wifiLock = null
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -166,6 +174,8 @@ class GenerationForegroundService : Service() {
     override fun onDestroy() {
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
+        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
+        wifiLock = null
         scope.cancel()
         super.onDestroy()
     }

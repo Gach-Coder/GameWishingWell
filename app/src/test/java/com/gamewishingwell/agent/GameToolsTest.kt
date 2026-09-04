@@ -25,6 +25,23 @@ class GameToolsTest {
         ToolCallData(id = "c1", name = name, arguments = argsJson)
 
     @Test
+    fun `readfile 小文件切片请求直接整读`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 多行小文件：切片请求（2-3 行）被整读覆盖，省掉切片重读的轮次。
+        ws.writeInitial("index.html", "l1\nl2\nl3\nl4\nl5")
+        val out = executor.execute(
+            call(GameTools.READ_FILE, """{"path":"index.html","start_line":2,"end_line":3}""")
+        )
+        assertTrue(out.ok)
+        assertTrue(out.observation.contains("已直接返回全文"))
+        assertTrue(out.observation.contains("l1"))
+        assertTrue(out.observation.contains("l5"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
     fun `首次 writefile 写入并自动校验`() = runBlocking {
         val (ws, dir) = newWorkspace()
         val executor = GameToolExecutor(ws)
@@ -147,16 +164,18 @@ class GameToolsTest {
     fun `readfile 支持行区间`() = runBlocking {
         val (ws, dir) = newWorkspace()
         val executor = GameToolExecutor(ws)
-        ws.writeInitial("index.html", "l1\nl2\nl3\nl4\nl5")
+        // 大文件（超整读阈值）才保留真正的切片语义。
+        val big = (1..GameTools.WHOLE_READ_MAX_LINES + 5).joinToString("\n") { "l$it" }
+        ws.writeInitial("index.html", big)
         val full = executor.execute(call(GameTools.READ_FILE, "{}"))
-        assertTrue(full.observation.contains("共 5 行"))
+        assertTrue(full.observation.contains("共 ${GameTools.WHOLE_READ_MAX_LINES + 5} 行"))
         assertTrue(full.observation.contains("l1"))
         val slice = executor.execute(call(GameTools.READ_FILE, """{"start_line":2,"end_line":3}"""))
         assertTrue(slice.ok)
-        assertTrue(slice.observation.contains("第 2-3 行（共 5 行）"))
+        assertTrue(slice.observation.contains("第 2-3 行"))
         assertTrue(slice.observation.contains("l2"))
         assertTrue(slice.observation.contains("l3"))
-        assertFalse(slice.observation.contains("l5"))
+        assertFalse(slice.observation.contains("l${GameTools.WHOLE_READ_MAX_LINES + 5}\n"))
         dir.deleteRecursively()
         Unit
     }

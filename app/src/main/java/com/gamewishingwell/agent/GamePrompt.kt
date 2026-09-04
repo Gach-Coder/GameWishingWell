@@ -2,6 +2,33 @@ package com.gamewishingwell.agent
 
 import android.content.Context
 
+/** 质量档位（确认门四挡）：驱动生成提示词、自检轮数、沙箱深度与防敷衍增强。 */
+object QualityTier {
+    const val FAST = "fast"
+    const val LIGHT = "light"
+    const val BALANCED = "balanced"
+    const val PREMIUM = "premium"
+    val ALL = listOf(FAST, LIGHT, BALANCED, PREMIUM)
+
+    fun normalize(tier: String?): String =
+        if (tier != null && tier in ALL) tier else BALANCED
+
+    fun label(tier: String): String = when (normalize(tier)) {
+        FAST -> "快速"
+        LIGHT -> "轻量"
+        BALANCED -> "均衡"
+        else -> "精品"
+    }
+
+    /** 确认卡上的一句话描述（与产品定义一致）。 */
+    fun description(tier: String): String = when (normalize(tier)) {
+        FAST -> "最快速度直出产品，不做任何测试"
+        LIGHT -> "一轮测试保证能运行成功"
+        BALANCED -> "保证运行成功＋检查基本功能正确"
+        else -> "保证运行成功＋检查基本功能正确＋功能更丰富"
+    }
+}
+
 object GamePrompt {
 
     /**
@@ -33,7 +60,9 @@ object GamePrompt {
              entities: [{ type: 实体类别（enemy/bullet/item 等）, hp: 生命值（有此概念的实体必填）, x: 0, y: 0 }],
              player: { hp: 玩家生命值, x: 0, y: 0 }（无玩家概念可省略） }。
            entities 只放当前存活实体：死亡实体必须当帧从数组移除，不得残留 hp<0 的条目；所有数值字段必须是有限数字（禁止 NaN/Infinity）。
-           沙箱会在运行后调用它做自动不变量检查——负血量实体未移除、数值异常、实体无限增长、重开不重置都会被判失败并要求修复。
+           快照保持精简且字段命名稳定：以顶层标量与计数为主（score/state/player.hp/entities.length 等），
+           游戏特有数值（金币、波次、连击等）也放在顶层；它同时供沙箱不变量检查与功能断言（scenarios.json 的 expect 表达式）引用，
+           字段一旦出现不得改名。沙箱会在运行后调用它做自动不变量检查——负血量实体未移除、数值异常、实体无限增长、重开不重置都会被判失败并要求修复。
     """.trimIndent() + "\n\n" + hardRules()
 
     private fun hardRules(): String = """
@@ -180,35 +209,27 @@ $seedSystems
 
     /**
      * 可玩性自检轮提示词（沙箱通过后逐轮注入，全部消费完才交付）。
-     * 轮数随用户预期轮次预算与回合类型分档，使”最少轮数”不超出用户预期：
-     * 生成轮——≤2 快速档无自检（最短路径交付）、3~4 一轮（内容完整性）、
-     * 5~10 两轮（内容完整性、体验与平台合规）、≥11 精品档追加第三轮深度打磨；
-     * 修复轮（[fixTurn]）——改动范围小，≤2 无自检、其余仅一轮回归自检
-     * （验证修复达成诉求且未破坏既有内容），不再走完整多轮自检：开销与任务大小成比例。
+     * 轮数随质量档位与回合类型分档：快速/轻量无自检、均衡一轮（内容完整性＋基本功能正确）、
+     * 精品两轮（追加丰富度与打磨）；修复轮（[fixTurn]）除快速档外仅一轮回归自检
+     * （验证修复达成诉求且未破坏既有内容）——开销与任务大小成比例。
      * 返回 (阶段标签, 提示文本) 列表。
      */
-    fun selfReviewPrompts(expectedLoops: Int = 5, fixTurn: Boolean = false): List<Pair<String, String>> {
-        val n = expectedLoops.coerceIn(1, 100)
+    fun selfReviewPrompts(tier: String = QualityTier.BALANCED, fixTurn: Boolean = false): List<Pair<String, String>> {
+        val t = QualityTier.normalize(tier)
         val contentReview = "校验中：可玩性自检（内容完整性）" to """
-            沙箱运行已通过。请对照 design_schema 与【可玩性要求】逐条自查内容完整性：
+            沙箱运行已通过。请对照 design_schema 与【可玩性要求】自查基本功能正确与内容完整性：
             清单内每个系统是否真实实现且玩家可感知（而非占位、空壳或单一元素机械重复）；
-            开始→进行→胜负→重开闭环是否完整；难度是否递进；核心数值反馈是否可见。
+            开始→进行→胜负→重开闭环是否完整；难度是否递进；核心数值反馈是否可见；
+            顶部约 110px 平台保留区无按钮且左右无文字标签（沙箱会自动检测）。
             有缺口必须用 editfile/appendfile 补齐后再声明完成；
             若逐条确认全部达标，声明完成并在总结中按清单简述各项达标情况（每条一行）。
         """.trimIndent()
-        val complianceReview = "校验中：可玩性自检（体验与平台合规）" to """
-            请自查体验与平台合规并修复所有问题：
-            顶部约 110px 平台保留区整条不得有任何按钮或可交互元素（沙箱会自动检测）；
-            左右两侧不得放任何文字标签，仅中央小块可放「第x关」类极短状态文字；
-            触控目标是否 ≥44px 且不遮挡视线；画面配色是否有基本美感与区分度；
-            关键操作是否有即时反馈（有 WebAudio 音效更佳）。
-            修复完成后声明完成；若确认全部达标，在总结中简述各项达标情况。
-        """.trimIndent()
-        val polishReview = "校验中：可玩性自检（深度打磨）" to """
-            请做最后一轮深度打磨并修复：
+        val enrichReview = "校验中：丰富度与打磨自检" to """
+            请做丰富度与打磨自查并落实改进：
+            功能更丰富——对照类型标配补足内容量（更多单位/敌人种类、波次或关卡、升级或成长线）；
             数值平衡（前期宽松后期紧张，普通玩家可通关）；视觉层次（背景/单位/UI/特效区分明显）；
             音效反馈有层次（不同事件不同音色，WebAudio 振幅可取 0.15 左右）；
-            文案与配色风格统一；无明显卡顿或交互死角。完成后声明完成并简述打磨项。
+            文案与配色风格统一。用 editfile/appendfile 落实后再声明完成。
         """.trimIndent()
         val regressionReview = "校验中：回归自检（修复未破坏既有内容）" to """
             本次是修复/调整回合。请回归自查：
@@ -216,50 +237,78 @@ $seedSystems
             修复没有破坏既有功能——对照 design_schema 抽查核心系统仍完整（可开局、可重开、核心数值反馈仍在），
             修复涉及的边界情形（触发条件、异常路径）已覆盖。有缺口用 editfile 修复后再声明完成。
         """.trimIndent()
-        if (fixTurn) return if (n <= 2) emptyList() else listOf(regressionReview)
-        return when {
-            n <= 2 -> emptyList()
-            n <= 4 -> listOf(contentReview)
-            n <= 10 -> listOf(contentReview, complianceReview)
-            else -> listOf(contentReview, complianceReview, polishReview)
+        if (fixTurn) return if (t == QualityTier.FAST) emptyList() else listOf(regressionReview)
+        return when (t) {
+            QualityTier.FAST, QualityTier.LIGHT -> emptyList()
+            QualityTier.BALANCED -> listOf(contentReview)
+            else -> listOf(contentReview, enrichReview)
         }
     }
 
     /**
-     * 精品档轮次预算未用足时的增强指令（Agent Loop 一次性注入）：
-     * 要求实质性扩充与打磨，堵住"零修改直通自检→提前收尾"的敷衍路径。
+     * 功能断言契约（工具模式）：把策划验收边界固化为 scenarios.json，由沙箱确定性执行。
+     * 均衡/精品档必须提供；快速/轻量档跳过。修复玩家报障时把问题固化为新断言追加
+     * （回归保护：此后每次修改都重跑全部断言，防"修好新问题弄坏旧功能"）。
      */
-    fun budgetUnderUsePrompt(expectedLoops: Int, roundsSoFar: Int): String = """
-        【轮次预算复核】用户预期约 $expectedLoops 轮（精品档），当前仅进行 $roundsSoFar 轮即通过了基础校验与沙箱。
-        请不要就此收尾——对照【轮次预算】精品档要求做实质性改进后再声明完成：
-        1. 内容量扩充：对照 design_schema 逐系统加深（更多单位/敌人种类、波次或关卡、成长线）；
-        2. 打磨项落地：视觉细节与层次、关键操作反馈动效、WebAudio 音效分层；
-        3. 体验长板：开局引导清晰、数值反馈即时、难度曲线平滑。
-        用 editfile/appendfile 落实改进后再次声明完成；确实无改进空间时，在总结中逐条说明已达标的理由。
+    private fun scenarioContract(): String = """
+        【功能断言 scenarios.json（均衡/精品档必须；快速/轻量档跳过）】
+        首次生成时在写完 index.html 后，用 writefile 写入 scenarios.json：把 design_schema 中每个 P0（及关键 P1）系统的验收标准固化为可执行断言。
+        格式（UTF-8 JSON，最多 ${GameScenarios.MAX_SCENARIOS} 条、每条最多 ${GameScenarios.MAX_STEPS} 步）：
+        {"scenarios":[{"id":"score-after-kill","system":"战斗","name":"击杀敌人后得分增加","steps":[{"tap":[50,80]},{"frames":24}],"expect":"s.score > 0"}]}
+        - steps 按序执行：{"tap":[x,y]}＝视口百分比处点按（如开局先点开始按钮）；{"drag":[x0,y0,x1,y1]}＝百分比拖动；{"frames":N}＝确定性推进 N 帧（每帧 50ms 游戏时间）；不写 steps 默认推进 ${GameScenarios.DEFAULT_FRAMES} 帧。
+        - expect 是针对 s（即 __wwDebugState() 返回快照）的布尔表达式，只能引用快照字段：s.score>0、s.state==='playing'、s.entities.length>=1、s.player.hp>0 等。
+        - 断言必须可失败：引用具体数值变化或状态迁移，禁止恒真式（如 typeof s.score!=='undefined'、s.entities.length>=0——写入时会被静态检查打回）；核心闭环至少覆盖：开局进入 playing、得分可增长、restart 后状态归零。
+        - 断言涉及需要时间演进的行为（出怪、击杀、得分增长、波次推进、倒计时）时，steps 的 frames 要给足（建议 ≥36 帧，并先点掉"开始"类按钮）：预备期/生成间隔类机制在少量帧内不会发生，帧不够断言必失败。
+        - 套件上限 ${GameScenarios.MAX_SCENARIOS} 条：新增回归断言导致超限时，合并同类项或替换最弱的旧断言（优先保留核心闭环与已修复缺陷的条目），保证回归覆盖不缩水。
+        - 沙箱交付验收会逐条执行（点按/拖动→推进帧→比对快照）：未通过以 scenario-fail[系统/名称] 回传（附实际快照），必须修复游戏逻辑或对齐断言字段后重跑。
+        - 迭代/修复轮维护此文件：玩家报障修复后把该问题固化为新断言追加；大幅重做游戏时同步重写断言。
     """.trimIndent()
 
     /**
-     * 用户预期轮次预算 → 生成策略引导（质量/成本平衡，注入工具模式与兼容模式上下文）。
-     * 快速档：最简一步到位；均衡档：类型标配完整可玩；精品档：内容更丰富＋打磨项。
+     * 功能断言缺失 nudge（均衡/精品档生成轮，一次性）：交付前补写 scenarios.json。
      */
-    fun loopBudgetPrompt(expectedLoops: Int): String {
-        val n = expectedLoops.coerceIn(1, 100)
-        return when {
-            n <= 2 -> """
-                【轮次预算】用户期望本轮 Agent Loop 约 $n 轮完成（快速档）：优先速度与 token 成本。
-                - 一次 writefile 写出最小可玩闭环（核心玩法完整、可开局可重开），不追求内容丰富度；
-                - 不做扩展内容与打磨；能一轮完成就不要拆分，修补轮也尽量合并处理。
+    fun scenarioNudgePrompt(): String = """
+        【功能断言缺失】本档位承诺"检查基本功能正确"，交付前需通过功能断言验证，但工作区还没有 scenarios.json。
+        请用 writefile 写入：为 design_schema 的每个 P0（及关键 P1）系统提供至少一条可失败的行为断言
+        （针对 __wwDebugState() 快照的布尔表达式，格式见工作流中的功能断言说明），然后再次声明完成。
+        核心闭环必须覆盖：开局进入 playing、得分可增长、失败可判定、restart 后状态归零。
+    """.trimIndent()
+
+    /**
+     * 精品档防敷衍增强指令（Agent Loop 一次性注入）：自检期间零修改直通时，
+     * 要求实质性丰富与打磨，堵住"空口完成"的敷衍交付路径。
+     */
+    fun premiumEnrichPrompt(): String = """
+        【丰富度增强】本档位承诺"功能更丰富"，但刚才的自检没有产生任何实际修改。
+        请对照【可玩性要求】与类型标配做实质性扩充：更多单位/敌人种类、波次或关卡、升级或成长线，
+        以及数值平衡与视觉/音效打磨。用 editfile/appendfile 落实改进后再次声明完成；
+        确实无改进空间时，在总结中逐条说明已达标的理由。
+    """.trimIndent()
+
+    /**
+     * 质量档位 → 生成策略引导（注入工具模式与兼容模式上下文）。
+     */
+    fun tierPrompt(tier: String): String {
+        val t = QualityTier.normalize(tier)
+        return when (t) {
+            QualityTier.FAST -> """
+                【质量档位：快速】最快速度直出产品：一次 writefile 写出最小可玩版本即声明完成。
+                本档位不做沙箱测试与自检轮——内容最简、能玩即可，速度优先。
             """.trimIndent()
-            n <= 10 -> """
-                【轮次预算】用户期望本轮 Agent Loop 约 $n 轮完成（均衡档）：质量与成本兼顾。
-                - 完整实现 design_schema 清单内系统（p0/p1），按类型标配内容量落地；
-                - 修补与自检高效进行，避免无效往返；无关扩展不做。
+            QualityTier.LIGHT -> """
+                【质量档位：轻量】最简可玩完整闭环：核心玩法完整、可开局可重开。
+                沙箱会验证可运行（不跑通不交付），但无自检轮——内容量以最简为准。
+            """.trimIndent()
+            QualityTier.BALANCED -> """
+                【质量档位：均衡】完整实现 design_schema 清单内系统（p0/p1），按类型标配内容量落地；
+                交付验收含功能断言（scenarios.json）：沙箱会逐系统验证行为符合验收标准，未通过会回传修复；
+                通过一轮内容完整性自检后再交付；修补高效进行，避免无效往返。
             """.trimIndent()
             else -> """
-                【轮次预算】用户期望本轮 Agent Loop 约 $n 轮完成（精品档）：质量优先，允许更多轮次与 token。
-                - 在清单系统之外按类型标配补充内容量（更多单位/波次/成长线）；
-                - P2 打磨项（视觉细节、反馈动效、音效层次）一并纳入实现；
-                - 可分多段写入与多轮打磨，充分自检确认后再交付。
+                【质量档位：精品】质量优先：在清单系统之外按类型标配补充内容量
+                （更多单位/敌人、波次或关卡递进、升级成长线）；P2 打磨项（视觉细节、反馈动效、
+                音效层次）一并纳入；可分多段写入与多轮打磨，充分自检确认后再交付；
+                交付验收含功能断言（scenarios.json）与深度重开验证。
             """.trimIndent()
         }
     }
@@ -302,12 +351,13 @@ $seedSystems
         4. 你声明完成后，系统会在沙箱真实运行游戏验证，运行错误文本会回传，必须依据报错修复；沙箱跑通并完成可玩性自检轮后停止调用工具并输出总结。
             """.trimIndent()
         }
-        return flow + "\n\n【工具纪律】\n" + """
+        return flow + "\n\n" + scenarioContract() + "\n\n【工具纪律】\n" + """
         - editfile 的 old_string 必须与文件原文逐字符一致（含缩进）；匹配失败时先 readfile 对准原文，不要凭记忆猜代码。
   - 同一处反复修复失败时，换实现思路（重构该函数 / 换数据结构），必要时直接 writefile 重写该模块所在的文件区域。
   - 不要在回复正文里粘贴整个文件的代码——文件内容只通过工具写入。
   - 除非用户明确说明，新系统按“类型标配的完整可玩版本”实现：核心玩法闭环必须完整，类型常见标配内容（多种单位/波次/升级/难度递进）至少具备其二；与需求无关的锦上添花不做。
   - 互不依赖的多处修改，请在同一轮并行发起多个 editfile 调用（一次响应可包含多个 tool call），不要每轮只改一处。
+  - readfile 尽量一次整读（文件通常千行以内，不要切片）；确需多个区段时也应在同一轮并行发起多个 readfile。读完定位到修改点后，尽量把互不依赖的修改在同一轮并行 editfile 落盘——每多一轮往返就多一份等待。
   - 文件被修改后，此前的 readfile 结果会被标记过期；请依据 editfile 返回的修改点上下文片段继续编辑，避免反复整读文件。
         """.trimIndent()
     }

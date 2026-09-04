@@ -33,8 +33,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -55,12 +55,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
-import kotlin.math.roundToInt
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.agent.IntentConfirmation
+import com.gamewishingwell.agent.QualityTier
 import com.gamewishingwell.data.ChatMessage
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.ChatViewModel
@@ -92,9 +92,9 @@ fun ChatScreen(
 
     var input by remember { mutableStateOf("") }
     var showSaveDialog by remember { mutableStateOf(false) }
-    // 确认卡轮次预算的屏幕级持有：修正回合重建卡片时不丢失用户已拨动的挡位；
+    // 确认卡质量档位的屏幕级持有：修正回合重建卡片时不丢失用户已选择的档位；
     // 新的首张确认卡（非重组）出现时清空，避免跨局残留。
-    var pendingLoops by remember { mutableStateOf<Int?>(null) }
+    var pendingTier by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
 
     // 列表总条目数 = 消息（含确认卡） + 生成中占位 + 错误卡片占位
@@ -124,7 +124,7 @@ fun ChatScreen(
         // 键盘展开时三者一起向上移动，输入框始终保持在键盘上方。
         Column(Modifier.padding(padding).fillMaxSize().imePadding()) {
             LaunchedEffect(session.pendingConfirmation) {
-                if (session.pendingConfirmation?.revised == false) pendingLoops = null
+                if (session.pendingConfirmation?.revised == false) pendingTier = null
             }
             LazyColumn(
                 state = listState,
@@ -167,9 +167,9 @@ fun ChatScreen(
                             IntentConfirmationCard(
                                 confirmation = card,
                                 enabled = index == enabledCardIndex && !session.isGenerating,
-                                loops = if (index == enabledCardIndex) pendingLoops ?: card.expectedLoops else card.expectedLoops,
-                                onLoopsChange = { pendingLoops = it },
-                                onConfirm = { unchecked, expectedLoops -> vm.confirmIntent(unchecked, expectedLoops) }
+                                tier = if (index == enabledCardIndex) pendingTier ?: card.qualityTier else card.qualityTier,
+                                onTierChange = { pendingTier = it },
+                                onConfirm = { unchecked, tier -> vm.confirmIntent(unchecked, tier) }
                             )
                         } else {
                             MessageBubble(msg)
@@ -194,8 +194,8 @@ fun ChatScreen(
                 placeholder = inputPlaceholder,
                 onValueChange = { input = it },
                 onSend = {
-                    // 确认卡待确认期间发送文本＝修正：携带当前轮次预算挡位，重建卡不丢失用户选择。
-                    vm.send(input.trim(), session.pendingConfirmation?.let { pendingLoops })
+                    // 确认卡待确认期间发送文本＝修正：携带当前质量档位，重建卡不丢失用户选择。
+                    vm.send(input.trim(), session.pendingConfirmation?.let { pendingTier })
                     input = ""
                 },
                 onStop = { vm.stopGeneration() }
@@ -261,24 +261,22 @@ private fun TypingBubble(stage: String) {
     }
 }
 
-/** Agent Loop 轮数挡位：滑条只在这些值之间跳动（索引 0..15 ↔ 轮数双向映射）。 */
-private val LoopStops = listOf(1, 2, 3, 4, 5, 8, 10, 12, 15, 20, 25, 30, 40, 50, 75, 100)
-
 @Composable
 private fun IntentConfirmationCard(
     confirmation: IntentConfirmation,
     enabled: Boolean,
-    loops: Int,
-    onLoopsChange: (Int) -> Unit,
-    onConfirm: (Set<String>, Int) -> Unit
+    tier: String,
+    onTierChange: (String) -> Unit,
+    onConfirm: (Set<String>, String) -> Unit
 ) {
     // 勾选状态默认全选；确认时锁定进卡片消息（uncheckedModules），历史卡重显不复位。
-    // 轮次预算 loops 由调用方（ChatScreen）持有：修正回合重建卡片不丢失用户已拨动的挡位。
+    // 质量档位 tier 由调用方（ChatScreen）持有：修正回合重建卡片不丢失用户已选择的档位。
     val checkedModules = remember(confirmation) {
         mutableStateMapOf<String, Boolean>().apply {
             confirmation.modules.forEach { put(it.module, it.module !in confirmation.uncheckedModules) }
         }
     }
+    val selectedTier = QualityTier.normalize(tier)
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer,
         contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
@@ -388,43 +386,41 @@ private fun IntentConfirmationCard(
                     )
                 }
             }
-            // 轮次预算滑条（挡位式）：用户预期的 Agent Loop 轮数，确认后写入会话
-            // 并驱动生成策略档位（快速/均衡/精品）。
-            val tierLabel = when {
-                loops <= 2 -> "快速：最简一步到位，无自检轮"
-                loops <= 4 -> "轻量：完整实现，一轮自检"
-                loops <= 10 -> "均衡：类型标配完整实现，两轮自检"
-                else -> "精品：内容更丰富＋打磨，三轮自检"
-            }
+            // 质量档位（四挡）：驱动生成提示词、测试深度（快速档跳过沙箱）、自检轮数与内容丰富度。
             Spacer(Modifier.size(10.dp))
             Text(
-                "生成预算：Agent Loop 轮数（越大越重视质量，耗时与消耗也越大）",
+                "质量档位（决定测试深度、自检轮数与内容丰富度）：",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
             )
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    "$loops 轮",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Text(
-                    tierLabel,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
-                )
+            QualityTier.ALL.forEach { t ->
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .toggleable(
+                            value = selectedTier == t,
+                            role = Role.RadioButton,
+                            enabled = enabled,
+                            onValueChange = { if (it) onTierChange(t) }
+                        )
+                        .padding(top = 2.dp)
+                ) {
+                    RadioButton(
+                        selected = selectedTier == t,
+                        onClick = null,
+                        enabled = enabled
+                    )
+                    Column(Modifier.padding(start = 6.dp)) {
+                        Text(QualityTier.label(t), style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            QualityTier.description(t),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+                        )
+                    }
+                }
             }
-            Slider(
-                value = LoopStops.indexOfFirst { it >= loops }
-                    .let { if (it < 0) LoopStops.lastIndex else it }
-                    .toFloat(),
-                onValueChange = { onLoopsChange(LoopStops[it.roundToInt()]) },
-                valueRange = 0f..LoopStops.lastIndex.toFloat(),
-                steps = LoopStops.size - 2,
-                enabled = enabled
-            )
             if (confirmation.designAssumptions.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
@@ -450,7 +446,7 @@ private fun IntentConfirmationCard(
             }
             Spacer(Modifier.size(10.dp))
             Button(
-                onClick = { onConfirm(checkedModules.filterValues { !it }.keys, loops) },
+                onClick = { onConfirm(checkedModules.filterValues { !it }.keys, selectedTier) },
                 enabled = enabled,
                 modifier = Modifier.fillMaxWidth()
             ) {

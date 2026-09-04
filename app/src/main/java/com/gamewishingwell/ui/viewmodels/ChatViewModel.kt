@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.gamewishingwell.agent.GameAgent
 import com.gamewishingwell.agent.GameSession
+import com.gamewishingwell.agent.QualityTier
 import com.gamewishingwell.data.GameMeta
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -28,12 +29,12 @@ class ChatViewModel(
         }
     }
 
-    /** 发送用户消息；确认门待确认期间 [expectedLoops] 携带当前轮次预算挡位，修正重建卡不丢失用户选择。 */
-    fun send(text: String, expectedLoops: Int? = null) {
+    /** 发送用户消息；确认门待确认期间 [qualityTier] 携带当前质量档位，修正重建卡不丢失用户选择。 */
+    fun send(text: String, qualityTier: String? = null) {
         val trimmed = text.trim()
         if (trimmed.isBlank()) return
         lastInstruction = trimmed
-        viewModelScope.launch { agent.sendUserMessage(trimmed, expectedLoops) }
+        viewModelScope.launch { agent.sendUserMessage(trimmed, qualityTier) }
     }
 
     fun regenerate() {
@@ -51,9 +52,9 @@ class ChatViewModel(
     }
 
     /** 确认门入口；[uncheckedModules] 为卡片上取消勾选、玩家不希望实现的系统；
-     *  [expectedLoops] 为玩家预期的 Agent Loop 轮数（1~100，默认 5）。 */
-    fun confirmIntent(uncheckedModules: Set<String> = emptySet(), expectedLoops: Int = 5) {
-        viewModelScope.launch { agent.confirmIntent(uncheckedModules, expectedLoops) }
+     *  [qualityTier] 为玩家选择的质量档位（fast/light/balanced/premium，默认均衡）。 */
+    fun confirmIntent(uncheckedModules: Set<String> = emptySet(), qualityTier: String = QualityTier.BALANCED) {
+        viewModelScope.launch { agent.confirmIntent(uncheckedModules, qualityTier) }
     }
 
     fun saveAs(title: String, onDone: (GameMeta?) -> Unit) {

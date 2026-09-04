@@ -149,7 +149,11 @@ class GameFileWorkspace(private val rootDir: File) {
         }
         file.writeText(content, Charsets.UTF_8)
         File(versionsDir, "${file.name}.version").writeText(nextVersion.toString(), Charsets.UTF_8)
-        writePointer(relativePath)
+        // 入口指针只随入口文件切换：写 scenarios.json 等辅助文件不得把"当前入口"
+        // 指偏（listfiles 观察与回滚语义都以入口为准）。
+        if (relativePath == GameFileWorkspaceEntryPoint.DEFAULT) {
+            writePointer(relativePath)
+        }
         return WorkspaceFile(relativePath, nextVersion, sha256(bytes), bytes.size)
     }
 
