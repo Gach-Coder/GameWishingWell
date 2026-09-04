@@ -174,6 +174,14 @@ fun GameScreen(
                     loadHtml(view, h)
                 }
             },
+            onRelease = { view ->
+                // 离开游戏页销毁 WebView：不销毁会持续占用共享渲染器的 tile 内存/JS 堆，
+                // 与沙箱实例累积后互相拖垮（设施故障根因之一）。销毁后清空引用，
+                // 避免设置面板等再对已销毁实例调用 evaluateJavascript。
+                runCatching { view.destroy() }
+                if (webView == view) webView = null
+                loadedHtml = null
+            },
             modifier = Modifier
                 .fillMaxSize()
                 .onSizeChanged { size ->
@@ -187,9 +195,10 @@ fun GameScreen(
                 }
         )
 
-        // 顶部操作条
+        // 顶部操作条：全透明背景，返回/设置悬浮于游戏画面之上；
+        // 内容仍避开状态栏（windowInsetsPadding），深色图标场景由游戏画面自衬。
         Surface(
-            color = Color.Black.copy(alpha = 0.45f),
+            color = Color.Transparent,
             modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter)
         ) {
             Row(

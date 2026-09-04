@@ -75,7 +75,12 @@ object GameValidator {
                 if (src.startsWith("http://") || src.startsWith("https://") || src.startsWith("//")) {
                     externalError("script", src, "JS")
                 } else {
-                    checks += ValidationIssue("resources", FILE_INDEX_HTML, 1, "本地 JS 资源无法内联校验，可能缺失：$src", "warning")
+                    // 与本地图片/音频同判 error：单文件交付里本地 JS 同样无法解析（必然 404），
+                    // warning 不阻断交付会把必坏的文件放行给玩家。
+                    checks += ValidationIssue(
+                        "resources", FILE_INDEX_HTML, 1,
+                        "本地 JS 资源缺失（自包含游戏禁止引用本地文件，代码请直接写在 <script> 内联）：$src", "error"
+                    )
                 }
             }
         }

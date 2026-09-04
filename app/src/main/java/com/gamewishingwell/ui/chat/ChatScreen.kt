@@ -43,6 +43,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -187,10 +188,21 @@ fun ChatScreen(
                     onRegenerate = { vm.regenerate() }
                 )
             }
+            // 停止键动态计时：Agent 生成中每秒刷新本轮已运行时长（发送/确认/修复/再试一次起算）。
+            var elapsedMs by remember { mutableStateOf(0L) }
+            LaunchedEffect(session.isGenerating) {
+                if (session.isGenerating) {
+                    while (true) {
+                        elapsedMs = vm.turnElapsedMs()
+                        delay(1_000)
+                    }
+                }
+            }
             InputRow(
                 value = input,
                 enabled = !session.isGenerating,
                 isGenerating = session.isGenerating,
+                elapsedText = formatElapsedCompact(elapsedMs),
                 placeholder = inputPlaceholder,
                 onValueChange = { input = it },
                 onSend = {
@@ -538,6 +550,7 @@ private fun InputRow(
     value: String,
     enabled: Boolean,
     isGenerating: Boolean,
+    elapsedText: String,
     placeholder: String,
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
@@ -561,11 +574,11 @@ private fun InputRow(
             )
             Spacer(Modifier.width(8.dp))
             if (isGenerating) {
-                // 发送后按钮切换为停止键，可随时中断 Agent Loop。
+                // 发送后按钮切换为停止键（动态显示本轮已运行时长），可随时中断 Agent Loop。
                 Button(onClick = onStop) {
                     Icon(Icons.Filled.Close, contentDescription = "停止")
                     Spacer(Modifier.width(4.dp))
-                    Text("停止")
+                    Text("停止 $elapsedText")
                 }
             } else {
                 Button(
@@ -577,6 +590,12 @@ private fun InputRow(
             }
         }
     }
+}
+
+/** 停止键上的紧凑计时：0分0秒 → 1分5秒 → 12分30秒。 */
+private fun formatElapsedCompact(ms: Long): String {
+    val totalSec = (ms.coerceAtLeast(0L)) / 1000
+    return "${totalSec / 60}分${totalSec % 60}秒"
 }
 
 @Composable

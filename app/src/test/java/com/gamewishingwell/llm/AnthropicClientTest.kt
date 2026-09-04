@@ -7,6 +7,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -115,6 +116,37 @@ class AnthropicClientTest {
         assertTrue(body.contains("\"type\":\"tool_result\""))
         assertTrue(body.contains("\"tool_use_id\":\"toolu_1\""))
 
+        server.shutdown()
+    }
+
+    @Test
+    fun `SSE error 事件抛 LlmError 而非静默返回空文本`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n" +
+                        "data: {\"type\":\"message_stop\"}\n\n"
+                )
+        )
+        server.start()
+
+        val client = AnthropicClient(
+            okHttp = OkHttpClient(),
+            apiKey = "test-key",
+            baseUrl = server.url("/").toString().trimEnd('/'),
+            model = "claude-sonnet-4-6"
+        )
+        val thrown = try {
+            client.streamChat(listOf(ChatMessage("user", "hi")), onDelta = {}, onDone = {})
+            null
+        } catch (e: LlmError) {
+            e
+        }
+        // 曾经被静默吞掉、以空文本"正常"返回——上层只能看到空回复无法归因。
+        assertNotNull(thrown)
+        assertTrue(thrown!!.message!!.contains("overloaded_error"))
         server.shutdown()
     }
 }

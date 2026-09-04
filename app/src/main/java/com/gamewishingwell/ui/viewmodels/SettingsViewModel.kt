@@ -27,6 +27,9 @@ class SettingsViewModel(
         repository.save(s)
     }
 
+    /** 该厂商上次保存过的 API Key（切换厂商时自动回填，免重复输入）。 */
+    fun rememberedApiKey(providerId: String): String = repository.rememberedApiKey(providerId)
+
     /** 思考开关即时持久化（Switch 语义：拨动即生效，无需保存按钮）。 */
     fun setThinkingEnabled(enabled: Boolean) {
         repository.updateThinking(enabled)

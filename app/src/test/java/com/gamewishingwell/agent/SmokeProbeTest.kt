@@ -14,6 +14,8 @@ class SmokeProbeTest {
         assertTrue(out.contains("orientation-mismatch"))
         // 铺满断言：拦固定逻辑分辨率 + 等比缩放黑边适配
         assertTrue(out.contains("canvas-not-fullscreen"))
+        // 定稿标志：宿主完成判定以探针 finalize 为准（deep 复跑中途不算完成）
+        assertTrue(out.contains("__wwSmokeFinalized"))
         assertFalse(out.contains("var __landscape = false;"))
     }
 

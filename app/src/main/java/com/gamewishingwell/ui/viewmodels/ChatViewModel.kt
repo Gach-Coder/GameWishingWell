@@ -47,6 +47,9 @@ class ChatViewModel(
         agent.stopGeneration()
     }
 
+    /** 本轮 Agent Loop 已运行时长（停止键计时显示用；确认门等待不计入）。 */
+    fun turnElapsedMs(): Long = agent.currentTurnElapsedMs()
+
     fun fixError(error: String) {
         viewModelScope.launch { agent.fixWithError(error) }
     }

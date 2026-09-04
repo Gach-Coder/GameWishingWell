@@ -25,6 +25,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -118,9 +119,16 @@ internal fun formatAgentDuration(ms: Long): String {
  * 生成任务运行在 [agentScope]（全局协程）中：切换页面/对话只会取消 ViewModel 的等待，
  * 不会取消生成本身；生成完成后任何页面都能立即通过 [session] 看到结果。
  *
- * Agent Loop 不做带错交付，但有硬上限防死循环：工具模式 40 轮、兼容模式 15 轮、
- * 同一错误签名连续 10 次、连续 24 轮无文件修改——任一超限即如实失败终止并保留
- * 中间版本；停止键是用户的主动中断方式。
+ * Agent Loop 不做带错交付，防死循环的熔断口径：
+ * - 工具模式：连续 24 轮无任何文件修改（空转熔断）即如实终止；修复轮数本身不设上限
+ *   （有文件修改即有进展，同类错误 3/6 次仅注入"换思路/重写模块"升级提示，不终止）；
+ * - 兼容模式（每轮全量重写，最贵路径）：总轮次有硬上限，超限如实失败并保留最新候选；
+ * 任一熔断退出都保留中间版本；停止键是用户的主动中断方式。
+ *
+ * 会话状态并发纪律：agent 协程（IO）、流式 onDelta 回调（OkHttp 线程）与停止键
+ * （主线程）都会写 [session]，一律经 `_session.update {}` 原子读-改-写——直接
+ * `value = value.copy(...)` 的快照覆盖会互相丢更新（如停止后的 INTERRUPTED 状态
+ * 被飞行中的进度回调覆盖回"生成中"）。
  */
 class GameAgent(
     private val appContext: Context,
@@ -135,7 +143,19 @@ class GameAgent(
     private val _session = MutableStateFlow(GameSession())
     val session: StateFlow<GameSession> = _session.asStateFlow()
 
+    /**
+     * 原子更新并返回更新后的终态（updateAndGet 语义；kotlinx.coroutines 未提供该扩展）。
+     * 供"更新后还要把同一份终态落盘"的路径使用，避免再读一次 _session.value
+     * 拿到的是被其它线程覆盖过的中间态。
+     */
+    private fun updateSession(transform: (GameSession) -> GameSession): GameSession {
+        var applied: GameSession? = null
+        _session.update { s -> transform(s).also { applied = it } }
+        return applied ?: _session.value
+    }
+
     /** 当前会话是否绑定到某个已保存的游戏（编辑模式），null 表示草稿模式。 */
+    @Volatile
     private var editingGameId: Long? = null
 
     private val agentScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -159,6 +179,9 @@ class GameAgent(
 
     private fun turnElapsedMs(): Long =
         if (turnStartedAtMs <= 0L) 0L else (System.currentTimeMillis() - turnStartedAtMs).coerceAtLeast(0L)
+
+    /** 本轮 Agent Loop 已运行时长（发送/确认/修复/再试一次起算，确认门等待不计入）；供前端停止键计时显示。 */
+    fun currentTurnElapsedMs(): Long = turnElapsedMs()
     private val sessionJson = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -170,7 +193,25 @@ class GameAgent(
         const val USER_MSG_CHANGE_MODEL = "本轮制作未能推进。你可以重试；若反复出现，请在设置中更换模型。"
         const val USER_MSG_NETWORK = "网络或服务连接异常，进度已保留。请检查网络与模型配置后重试。"
         const val USER_MSG_SANDBOX_ENV = "运行验证环境异常，进度已保留。请重试；若反复出现，请重启应用后再试。"
+
+        /**
+         * 兼容回环（每轮全量重写）的总轮次上限：最贵路径的止损熔断。工具模式靠
+         * "连续 24 轮无文件修改"熔断（有写入即有进展），兼容模式每轮都产出新候选、
+         * 空转熔断不适用，必须以总轮次封顶。上限需覆盖自检轮（≤2）+ 丰富度增强（1）
+         * + 常规修复轮次后仍有余量。
+         */
+        const val LEGACY_MAX_ROUNDS = 30
     }
+
+    /**
+     * 沙箱失败的"可修错误"提取：过滤空白与超时哨兵后剩余的真实错误文本。
+     * 为空 = 超时且无任何真实错误（慢环境时序问题而非游戏缺陷，按通过处理，
+     * 零帧推进除外——那是探针从未运行的设施异常）。
+     */
+    private fun smokeActionableErrors(smoke: SmokeTestResult): List<String> =
+        smoke.errors
+            .filter { it.isNotBlank() }
+            .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
 
     private val okHttp by lazy {
         OkHttpClient.Builder()
@@ -214,19 +255,20 @@ class GameAgent(
         alog("STOP by user")
         if (job?.isActive == true) job.cancel()
         activeGenerationJob = null
-        val interrupted = current.copy(
-            isGenerating = false,
-            streamingText = null,
-            agentStage = AgentStage.INTERRUPTED,
-            error = null,
-            qualityVerdict = null,
-            lastWarning = if (current.currentHtml != null) {
-                "已中断。你可以试玩当前版本，或继续描述需求。"
-            } else {
-                "已中断。请继续描述你的需求。"
-            }
-        )
-        _session.value = interrupted
+        _session.update { s ->
+            s.copy(
+                isGenerating = false,
+                streamingText = null,
+                agentStage = AgentStage.INTERRUPTED,
+                error = null,
+                qualityVerdict = null,
+                lastWarning = if (s.currentHtml != null) {
+                    "已中断。你可以试玩当前版本，或继续描述需求。"
+                } else {
+                    "已中断。请继续描述你的需求。"
+                }
+            )
+        }
     }
 
     // ---------- 会话管理 ----------
@@ -297,15 +339,16 @@ class GameAgent(
         val duplicate = last != null && last.isUser && last.content == trimmed
 
         val messages = if (duplicate) current.messages else current.messages + ChatMessage("user", trimmed)
-        val base = current.copy(
-            messages = messages,
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = AgentStage.INTENT,
-            qualityVerdict = null
-        )
-        _session.value = base
+        _session.update {
+            it.copy(
+                messages = messages,
+                isGenerating = true,
+                error = null,
+                streamingText = null,
+                agentStage = AgentStage.INTENT,
+                qualityVerdict = null
+            )
+        }
         markTurnStart()
         val job = trackGenerationJob(agentScope.launch {
             runUserTurn(trimmed, priorConfirmation)
@@ -346,21 +389,22 @@ class GameAgent(
         val lockedContent = IntentConfirmation.cardContent(
             pending.copy(uncheckedModules = uncheckedModules.sorted().distinct(), qualityTier = safeTier)
         )
-        val base = session.copy(
-            messages = session.messages.map { msg ->
-                if (msg.isConfirmCard && msg.content == pendingKey) msg.copy(content = lockedContent) else msg
-            },
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = AgentStage.PLANNING,
-            pendingConfirmation = null,
-            gameSchema = schema,
-            designPlan = finalPlan,
-            qualityTier = safeTier,
-            qualityVerdict = null
-        )
-        _session.value = base
+        _session.update { s ->
+            s.copy(
+                messages = s.messages.map { msg ->
+                    if (msg.isConfirmCard && msg.content == pendingKey) msg.copy(content = lockedContent) else msg
+                },
+                isGenerating = true,
+                error = null,
+                streamingText = null,
+                agentStage = AgentStage.PLANNING,
+                pendingConfirmation = null,
+                gameSchema = schema,
+                designPlan = finalPlan,
+                qualityTier = safeTier,
+                qualityVerdict = null
+            )
+        }
         alog("confirm: unchecked=[${uncheckedModules.joinToString(",")}] systems=${schema.gameSystems.joinToString(",")} tier=$safeTier")
         // 确认点击即重新起算：卡片等待用户思考的时间不属于生成回合耗时。
         markTurnStart()
@@ -393,16 +437,18 @@ class GameAgent(
             ?: legacyAnchoredSchema(s)
             ?: GameSchema(confidence = 1.0)
         alog("regenerate: full remake of last instruction")
-        _session.value = s.copy(
-            messages = s.messages + ChatMessage("user", "再试一次：重新制作"),
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = "代码生成中：正在重新制作",
-            pendingConfirmation = null,
-            gameSchema = schema,
-            qualityVerdict = null
-        )
+        _session.update { s ->
+            s.copy(
+                messages = s.messages + ChatMessage("user", "再试一次：重新制作"),
+                isGenerating = true,
+                error = null,
+                streamingText = null,
+                agentStage = "代码生成中：正在重新制作",
+                pendingConfirmation = null,
+                gameSchema = schema,
+                qualityVerdict = null
+            )
+        }
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
                 markTurnStart()
@@ -424,7 +470,7 @@ class GameAgent(
         if (_session.value.isGenerating) return
         val s = _session.value
         val html = s.currentHtml ?: run {
-            _session.value = s.copy(error = "当前没有可修复的游戏代码")
+            _session.update { it.copy(error = "当前没有可修复的游戏代码") }
             return
         }
         val file = Regex("""(index\.html|[A-Za-z0-9_.-]+\.(?:html|js|css))""").find(jsError)?.value ?: "index.html"
@@ -436,33 +482,23 @@ class GameAgent(
         // 运行错误不做次数预算或自动降级：每次都以完整玩法为上下文继续修复，用户可无限等待。
         val instruction = "游戏运行时报错，请修复并输出完整新版代码（保持原有玩法与 P0 特性）：\n$jsError"
         val messages = s.messages + ChatMessage("user", instruction)
-        val schema = s.gameSchema
-            ?: s.designPlan?.let { plan ->
-                GameSchema(
-                    visualDimension = plan.visualDimension,
-                    screenOrientation = plan.screenOrientation,
-                    gameSystems = plan.gameSystems,
-                    requestedSystems = plan.gameSystems,
-                    excludedSystems = plan.excludedSystems,
-                    confidence = 1.0,
-                    lockTemplateResolution = true
-                )
-            }
-            ?: GameSchema(confidence = 1.0)
-        val base = s.copy(
-            messages = messages,
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = AgentStage.FIXING,
-            pendingConfirmation = null,
-            gameSchema = schema,
-            knownErrors = known,
-            lastError = jsError.take(500),
-            lastErrorSignature = ErrorSignature.hash(normalized),
-            qualityVerdict = null
-        )
-        _session.value = base
+        // schema 推导与其它回合同源：gameSchema → 旧版会话兼容推导 → 兜底空 Schema。
+        val schema = legacyAnchoredSchema(s) ?: GameSchema(confidence = 1.0)
+        _session.update { cur ->
+            cur.copy(
+                messages = messages,
+                isGenerating = true,
+                error = null,
+                streamingText = null,
+                agentStage = AgentStage.FIXING,
+                pendingConfirmation = null,
+                gameSchema = schema,
+                knownErrors = known,
+                lastError = jsError.take(500),
+                lastErrorSignature = ErrorSignature.hash(normalized),
+                qualityVerdict = null
+            )
+        }
         markTurnStart()
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
@@ -515,18 +551,18 @@ class GameAgent(
 
     private suspend fun runUserTurn(instruction: String, priorConfirmation: IntentConfirmation?) {
         turnMutex.withLock {
-            alog("turn start: ${instruction.take(120).take(120)} priorConfirm=${priorConfirmation != null}")
+            alog("turn start: ${instruction.take(120)} priorConfirm=${priorConfirmation != null}")
 
             currentCoroutineContext().ensureActive()
             val s = _session.value
             if (!isConfigured()) {
-                failTurn(s, "请先在「设置」中配置 API Key、地址和模型")
+                failTurn("请先在「设置」中配置 API Key、地址和模型")
                 return@withLock
             }
 
             val llm = createClient()
             if (llm == null) {
-                failTurn(s, "请先在「设置」中配置 API Key、地址和模型")
+                failTurn("请先在「设置」中配置 API Key、地址和模型")
                 return@withLock
             }
 
@@ -540,7 +576,7 @@ class GameAgent(
                     reason = "确认门待确认期间的文本输入一律视为修正"
                 )
             } else {
-                _session.value = s.copy(agentStage = AgentStage.INTENT)
+                _session.update { it.copy(agentStage = AgentStage.INTENT) }
                 classifyIntent(instruction, llm)
             }
             alog("intent=${intent.intent} conf=${intent.confidence} reason=${intent.reason}")
@@ -572,7 +608,7 @@ class GameAgent(
             // 2) 识别层：检测会话级 Game Schema JSON：
             //    null  → 本对话还没有游戏 → 默认为首次制作；
             //    非 null → 已锚定一个游戏 → 在本轮消息上补全/覆盖同一份 JSON。
-            _session.value = _session.value.copy(agentStage = AgentStage.RECOGNITION)
+            _session.update { it.copy(agentStage = AgentStage.RECOGNITION) }
             val previousSchema = s.gameSchema ?: legacyAnchoredSchema(s)
             val localPatch = RecognitionEngine.extractLocal(instruction)
             val litePatch = if (localPatch.confidence < 0.8) {
@@ -596,7 +632,7 @@ class GameAgent(
                 recognition.gameSchema
             }
             // 识别结果先写回会话，后续策划/确认/生成都共享同一份 JSON。
-            _session.value = _session.value.copy(gameSchema = schema)
+            _session.update { it.copy(gameSchema = schema) }
 
             // 3) 策划层：策划子 Agent 拿到识别层共享的 module_list，逐项策划每个
             //    module 在这款游戏中的具体实现方式（业务验收边界）。
@@ -633,23 +669,24 @@ class GameAgent(
             }
             // 确认卡作为消息写入聊天流：确认/重组后卡片始终保留在对话中，
             // 仅最后一张与 pendingConfirmation 匹配的卡片可交互，其余只读回显。
-            val next = _session.value.copy(
-                messages = _session.value.messages + ChatMessage(
-                    ChatMessage.ROLE_CONFIRM_CARD,
-                    IntentConfirmation.cardContent(confirmation)
-                ),
-                pendingConfirmation = confirmation,
-                gameSchema = schema,
-                isGenerating = false,
-                streamingText = null,
-                agentStage = AgentStage.CONFIRM,
-                error = null,
-                designPlan = draftPlan,
-                qualityVerdict = null
-            )
             currentCoroutineContext().ensureActive()
             alog("gate card built: systems=${schema.gameSystems.joinToString(",")}")
-            _session.value = next
+            val next = updateSession { s ->
+                s.copy(
+                    messages = s.messages + ChatMessage(
+                        ChatMessage.ROLE_CONFIRM_CARD,
+                        IntentConfirmation.cardContent(confirmation)
+                    ),
+                    pendingConfirmation = confirmation,
+                    gameSchema = schema,
+                    isGenerating = false,
+                    streamingText = null,
+                    agentStage = AgentStage.CONFIRM,
+                    error = null,
+                    designPlan = draftPlan,
+                    qualityVerdict = null
+                )
+            }
             persistSessionMessages(next)
         }
     }
@@ -695,21 +732,23 @@ class GameAgent(
     private suspend fun fixReportedIssue(s: GameSession, instruction: String) {
         val html = s.currentHtml
         if (html.isNullOrBlank()) {
-            failTurn(s, "当前没有可修复的游戏代码；如想制作或改进游戏，请直接描述你的需求。")
+            failTurn("当前没有可修复的游戏代码；如想制作或改进游戏，请直接描述你的需求。")
             return
         }
         val schema = s.gameSchema
             ?: legacyAnchoredSchema(s)
             ?: GameSchema(confidence = 1.0)
         val fixInstruction = "玩家报告了游戏异常，请优先按异常修复处理（最小改动）；若玩家实际想要的是功能调整，以玩家本轮诉求为准：\n$instruction"
-        _session.value = s.copy(
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = AgentStage.FIXING,
-            gameSchema = schema,
-            qualityVerdict = null
-        )
+        _session.update { s ->
+            s.copy(
+                isGenerating = true,
+                error = null,
+                streamingText = null,
+                agentStage = AgentStage.FIXING,
+                gameSchema = schema,
+                qualityVerdict = null
+            )
+        }
         generateFromIntent(
             instruction = fixInstruction,
             intent = schema,
@@ -728,21 +767,23 @@ class GameAgent(
     private suspend fun iterateDirectly(s: GameSession, instruction: String) {
         val html = s.currentHtml
         if (html.isNullOrBlank()) {
-            failTurn(s, "当前没有可编辑的游戏代码；如想制作游戏，请直接描述你的需求。")
+            failTurn("当前没有可编辑的游戏代码；如想制作游戏，请直接描述你的需求。")
             return
         }
         val schema = s.gameSchema
             ?: legacyAnchoredSchema(s)
             ?: GameSchema(confidence = 1.0)
-        _session.value = s.copy(
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = "游戏修改中：正在准备迭代上下文",
-            pendingConfirmation = null,
-            gameSchema = schema,
-            qualityVerdict = null
-        )
+        _session.update { s ->
+            s.copy(
+                isGenerating = true,
+                error = null,
+                streamingText = null,
+                agentStage = "游戏修改中：正在准备迭代上下文",
+                pendingConfirmation = null,
+                gameSchema = schema,
+                qualityVerdict = null
+            )
+        }
         generateFromIntent(
             instruction = instruction,
             intent = schema,
@@ -780,7 +821,7 @@ class GameAgent(
         currentUserRequest: String,
         llm: LlmClient
     ): DesignPlan {
-        _session.value = _session.value.copy(agentStage = AgentStage.PLANNING)
+        _session.update { it.copy(agentStage = AgentStage.PLANNING) }
         return PlanningEngine.draftWithLlm(
             schema = schema,
             llm = llm,
@@ -806,7 +847,7 @@ class GameAgent(
         } else {
             "游戏策划中：正在重新策划（${replan.joinToString("、")}），其余系统沿用已确认方案"
         }
-        _session.value = _session.value.copy(agentStage = stage)
+        _session.update { it.copy(agentStage = stage) }
         return PlanningEngine.reorganizeWithLlm(
             schema = schema,
             previousPlan = priorPlan,
@@ -840,7 +881,7 @@ class GameAgent(
     }
 
     private suspend fun generateChatReply(s: GameSession, instruction: String, llm: LlmClient) {
-        _session.value = s.copy(isGenerating = true, agentStage = AgentStage.CHAT, streamingText = null)
+        _session.update { it.copy(isGenerating = true, agentStage = AgentStage.CHAT, streamingText = null) }
         // chat 虽然不改文件，但回答要贴着当前会话：把 rolling summary 作为
         // 只读上下文注入，避免“它能联机吗”这类问题答非所问。
         val summary = s.rollingSummary.takeIf { it.isNotBlank() }
@@ -855,20 +896,21 @@ class GameAgent(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            failTurn(_session.value, "回复失败，请重试。", internalDetail = "对话 LLM 调用失败：${e.message}")
+            failTurn("回复失败，请重试。", internalDetail = "对话 LLM 调用失败：${e.message}")
             return
         }
         val text = HtmlExtractor.nonCodeText(reply).ifBlank { "（空回复）" }
-        val next = _session.value.copy(
-            messages = _session.value.messages + ChatMessage(
-                "assistant",
-                text.take(1000) + "（耗时 ${formatAgentDuration(turnElapsedMs())}）"
-            ),
-            isGenerating = false,
-            agentStage = AgentStage.DONE,
-            error = null
-        )
-        _session.value = next
+        val next = updateSession { s ->
+            s.copy(
+                messages = s.messages + ChatMessage(
+                    "assistant",
+                    text.take(1000) + "（耗时 ${formatAgentDuration(turnElapsedMs())}）"
+                ),
+                isGenerating = false,
+                agentStage = AgentStage.DONE,
+                error = null
+            )
+        }
         persistSessionMessages(next)
     }
 
@@ -903,7 +945,7 @@ class GameAgent(
     ) {
         val llm = createClient()
         if (llm == null) {
-            failTurn(_session.value, "请先在「设置」中配置 API Key、地址和模型")
+            failTurn("请先在「设置」中配置 API Key、地址和模型")
             return
         }
 
@@ -925,21 +967,23 @@ class GameAgent(
         } else {
             "决策层定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
         }
-        _session.value = _session.value.copy(
-            isGenerating = true,
-            error = null,
-            streamingText = null,
-            agentStage = planningStage,
-            gameSchema = intent,
-            designPlan = plan,
-            filePlan = listOf("index.html"),
-            decisionLog = _session.value.decisionLog + decisionEntry
-        )
+        _session.update { s ->
+            s.copy(
+                isGenerating = true,
+                error = null,
+                streamingText = null,
+                agentStage = planningStage,
+                gameSchema = intent,
+                designPlan = plan,
+                filePlan = listOf("index.html"),
+                decisionLog = s.decisionLog + decisionEntry
+            )
+        }
 
         // 工具沙箱工作区：会话级目录（草稿或已保存游戏），种子为当前代码版本。
         val workspace = GameFileWorkspace(gameWorkspaceDir())
         seedWorkspace(workspace, existingHtml)
-        // 条件引入机制：本轮允许的内置引擎（提示词已按此教学；写入校验同步裁决）
+        // 条件引入机制：本轮允许的内置引擎只算一次（提示词/执行器/写入校验/验收同源共用）。
         val allowedEngines = GameEngines.allowedFor(
             plan.visualDimension,
             plan.gameSystems,
@@ -958,6 +1002,7 @@ class GameAgent(
             plan = plan,
             firstGeneration = existingHtml.isNullOrBlank(),
             seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
+            allowedEngines = allowedEngines,
             fixTurn = isFixTurn
         )
         if (outcome is GenOutcome.LegacyFallback) {
@@ -965,6 +1010,7 @@ class GameAgent(
                 llm, instruction, plan, existingHtml, outcome.firstHtml,
                 seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
                 startRound = outcome.roundsConsumed,
+                allowedEngines = allowedEngines,
                 fixTurn = isFixTurn
             )
         }
@@ -984,36 +1030,37 @@ class GameAgent(
             }
         } + "（本次 Agent Loop 共 ${accepted.rounds} 轮，耗时 ${formatAgentDuration(elapsedMs)}）"
         val summary = buildRollingSummary(plan, accepted.report, accepted.html)
-        val next = _session.value.copy(
-            messages = _session.value.messages + ChatMessage("assistant", assistantText.take(1000)),
-            currentHtml = accepted.html,
-            gameGenerated = true,
-            streamingText = null,
-            isGenerating = false,
-            error = null,
-            agentStage = AgentStage.DONE,
-            pendingConfirmation = null,
-            lastWarning = run {
-                // UI 零技术细节：不给用户展示校验 warning 原文（DOM id/资源缺失等
-                // 是内部检查项，修复是 Agent 职责），只保留结果性提示。
-                "已通过自动检查，建议实际试玩确认效果。"
-            },
-            rollingSummary = summary,
-            fileManifest = workspace.manifest(),
-            snapshots = _session.value.snapshots + "index.html:${GameFileWorkspace.sha256(accepted.html)}",
-            designPlan = plan,
-            knownIssues = accepted.report.warnings.map { "${it.category}:${it.message}" },
-            lastError = null,
-            qualityVerdict = null,
-            decisionLog = _session.value.decisionLog + listOf(
-                "第 ${accepted.rounds} 轮结束：基础校验 0 error / ${accepted.report.warnings.size} warning，沙箱冒烟通过，回合耗时 ${formatAgentDuration(elapsedMs)}（elapsedMs=$elapsedMs）",
-                accepted.metricsNote ?: "",
-                "已退出 Agent Loop 并交付；实际体验问题由玩家试玩后回传"
-            ).filter { it.isNotBlank() },
-        )
         currentCoroutineContext().ensureActive()
         alog("turn reply: rounds=${accepted.rounds} elapsedMs=$elapsedMs")
-        _session.value = next
+        val next = updateSession { s ->
+            s.copy(
+                messages = s.messages + ChatMessage("assistant", assistantText.take(1000)),
+                currentHtml = accepted.html,
+                gameGenerated = true,
+                streamingText = null,
+                isGenerating = false,
+                error = null,
+                agentStage = AgentStage.DONE,
+                pendingConfirmation = null,
+                lastWarning = run {
+                    // UI 零技术细节：不给用户展示校验 warning 原文（DOM id/资源缺失等
+                    // 是内部检查项，修复是 Agent 职责），只保留结果性提示。
+                    "已通过自动检查，建议实际试玩确认效果。"
+                },
+                rollingSummary = summary,
+                fileManifest = workspace.manifest(),
+                snapshots = s.snapshots + "index.html:${GameFileWorkspace.sha256(accepted.html)}",
+                designPlan = plan,
+                knownIssues = accepted.report.warnings.map { "${it.category}:${it.message}" },
+                lastError = null,
+                qualityVerdict = null,
+                decisionLog = s.decisionLog + listOf(
+                    "第 ${accepted.rounds} 轮结束：基础校验 0 error / ${accepted.report.warnings.size} warning，沙箱冒烟通过，回合耗时 ${formatAgentDuration(elapsedMs)}（elapsedMs=$elapsedMs）",
+                    accepted.metricsNote ?: "",
+                    "已退出 Agent Loop 并交付；实际体验问题由玩家试玩后回传"
+                ).filter { it.isNotBlank() },
+            )
+        }
         persistSession(next)
     }
 
@@ -1034,6 +1081,8 @@ class GameAgent(
         plan: DesignPlan,
         firstGeneration: Boolean,
         seedHash: String? = null,
+        /** 本轮允许的内置引擎集合（generateFromIntent 一次算好传入，验收与写入校验同源）。 */
+        allowedEngines: Set<String> = GameEngines.BUNDLED.keys,
         /** 修复轮（运行报错回传/修复快车道）：自检降为一轮回归检查，且不参与预算复核。 */
         fixTurn: Boolean = false
     ): GenOutcome {
@@ -1052,8 +1101,6 @@ class GameAgent(
         // 可玩性自检轮随质量档位与回合类型分档：快速/轻量无自检、均衡一轮、精品两轮；
         // 修复轮除快速档外仅一轮回归自检。每轮自检后重新走校验+沙箱验收。
         val tier = QualityTier.normalize(_session.value.qualityTier)
-        // 条件引入机制：完成验收的引擎声明裁决与 executor/提示词同源。
-        val allowedEngines = GameEngines.allowedFor(plan.visualDimension, plan.gameSystems, tier)
         val selfReviews = ArrayDeque(GamePrompt.selfReviewPrompts(tier, fixTurn))
         // 精品档防敷衍增强（一次性）：自检期间零修改直通时注入丰富度增强指令。
         var enrichNudged = false
@@ -1081,19 +1128,22 @@ class GameAgent(
             round++
             currentCoroutineContext().ensureActive()
             val file = GameFileWorkspaceEntryPoint.DEFAULT
-            val genStage = if (firstGeneration) {
-                "代码生成中（工具模式）：正在生成 $file 第 $round 轮"
+            // 轮次动词按入口文件当前是否已存在判定（而非回合级 firstGeneration）：
+            // 同一回合内首次写入 index.html 之后的轮次都是 editfile 增量修改，应显示"正在修改"。
+            val fileExists = workspace.read(file) != null
+            val genStage = if (fileExists) {
+                "第 $round 轮 - 代码修改中（工具模式）：正在修改 $file"
             } else {
-                "代码修改中（工具模式）：正在修改 $file 第 $round 轮"
+                "第 $round 轮 - 代码生成中（工具模式）：正在生成 $file"
             }
-            _session.value = _session.value.copy(agentStage = genStage, streamingText = null)
+            _session.update { it.copy(agentStage = genStage, streamingText = null) }
 
             val resp = try {
                 callLlm(llm, messages, GameTools.specs(), stageLabel = genStage)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                failTurn(_session.value, USER_MSG_NETWORK, internalDetail = "LLM 调用失败：${e.message}")
+                failTurn(USER_MSG_NETWORK, internalDetail = "LLM 调用失败：${e.message}")
                 return GenOutcome.Failed
             }
             currentCoroutineContext().ensureActive()
@@ -1121,7 +1171,6 @@ class GameAgent(
                     }
                     if (nudgesLeft <= 0) {
                         failTurn(
-                            _session.value,
                             USER_MSG_CHANGE_MODEL,
                             internalDetail = "模型未通过工具产出游戏代码（可能不支持 function calling）"
                         )
@@ -1146,7 +1195,7 @@ class GameAgent(
                         // 发布保留更大候选：修复提示后的赶工短版往往残缺（白屏），
                         // 中断试玩应拿到此前最完整的版本。
                         val published = if ((current?.length ?: 0) >= directHtml.length) current else directHtml
-                        _session.value = _session.value.copy(currentHtml = published)
+                        _session.update { it.copy(currentHtml = published) }
                     }
                 }
 
@@ -1170,26 +1219,22 @@ class GameAgent(
                             val scenariosJson = smokeScenariosJson(workspace, tier)
                             val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(content, scenariosJson, expectLandscape)
                             sandboxAttempts += smoke?.attempts ?: 0
-                            if (smoke != null && smoke.message == "sandbox-infra") {
+                            if (smoke != null && smoke.message?.startsWith("sandbox-infra") == true) {
                                 failTurn(
-                                    _session.value,
                                     USER_MSG_SANDBOX_ENV,
-                                    internalDetail = "沙箱设施异常（不可读/执行异常），未交付"
+                                    internalDetail = "沙箱设施异常（${smoke.message}·尝试 ${smoke.attempts} 次），未交付"
                                 )
                                 return GenOutcome.Failed
                             }
                             alog("sandbox: passed=${smoke?.passed} frames=${smoke?.framesRun} attempts=${smoke?.attempts} errors=${smoke?.errors?.joinToString(";")?.take(400)}")
                             if (smoke != null && !smoke.passed) {
-                                val smokeErrors = (smoke.errors + listOfNotNull(smoke.message?.takeIf { it == "smoke-timeout" }))
-                                    .filter { it.isNotBlank() }
-                                    .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
+                                val smokeErrors = smokeActionableErrors(smoke)
                                 // 超时且无任何真实错误：帧有推进=慢环境时序问题，按通过处理（落入下方
                                 // 自检轮/交付流程），绝不作为可修错误回传；零帧推进=探针从未运行
                                 //（离屏页面事件/定时器被冻结等设施问题），判运行验证环境异常，不放行交付。
                                 if (smokeErrors.isEmpty() && smoke.framesRun <= 0) {
                                     alog("sandbox timeout with ZERO frames -> infra failure")
                                     failTurn(
-                                        _session.value,
                                         USER_MSG_SANDBOX_ENV,
                                         internalDetail = "沙箱超时且零帧推进（探针未运行，疑似离屏页面冻结），未交付"
                                     )
@@ -1222,11 +1267,13 @@ class GameAgent(
                                     saveGlobalErrorSignatures(known)
                                     // 写入 lastError：冒烟类熔断后的重试轮才有具体问题可修，
                                     // 否则重试轮上下文看不到任何遗留问题（rolling summary 是旧的"通过"）。
-                                    _session.value = _session.value.copy(
-                                        knownErrors = known,
-                                        lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
-                                        knownIssues = smokeErrors.take(5)
-                                    )
+                                    _session.update { s ->
+                                        s.copy(
+                                            knownErrors = known,
+                                            lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
+                                            knownIssues = smokeErrors.take(5)
+                                        )
+                                    }
                                     stubborn = StubbornErrorTracker.update(
                                         stubborn,
                                         smokeErrors.map { StubbornErrorTracker.issueSignature("sandbox", it) }.toSet()
@@ -1266,14 +1313,14 @@ class GameAgent(
                             ) {
                                 scenarioNudged = true
                                 alog("scenario nudge: scenarios.json missing (tier=$tier)")
-                                _session.value = _session.value.copy(agentStage = "校验中：正在补写功能断言")
+                                _session.update { it.copy(agentStage = "校验中：正在补写功能断言") }
                                 messages += ChatMessage("user", GamePrompt.scenarioNudgePrompt())
                                 continue
                             }
                             val review = selfReviews.removeFirstOrNull()
                             if (review != null) {
                                 alog("self-review round: ${review.first} (rounds so far=$round)")
-                                _session.value = _session.value.copy(agentStage = review.first)
+                                _session.update { it.copy(agentStage = review.first) }
                                 messages += ChatMessage("user", (scenarioEvidence?.plus("\n\n") ?: "") + review.second)
                                 continue
                             }
@@ -1282,7 +1329,7 @@ class GameAgent(
                             if (!fixTurn && tier == QualityTier.PREMIUM && !enrichNudged && !mutatedSinceFirstPass) {
                                 enrichNudged = true
                                 alog("premium enrich nudge: no mutation during reviews")
-                                _session.value = _session.value.copy(agentStage = "校验中：丰富度增强（精品档）")
+                                _session.update { it.copy(agentStage = "校验中：丰富度增强（精品档）") }
                                 messages += ChatMessage("user", GamePrompt.premiumEnrichPrompt())
                                 continue
                             }
@@ -1298,7 +1345,6 @@ class GameAgent(
                         }
                         if (nudgesLeft <= 0) {
                             failTurn(
-                                _session.value,
                                 "本轮没有产生新的修改。你可以重试，或直接描述想要的效果（如“再简单一点”“加个计分板”）。",
                                 internalDetail = "模型未成功执行任何 editfile 即宣称完成（nudge 耗尽）"
                             )
@@ -1339,7 +1385,6 @@ class GameAgent(
                 // content == null 且 mutatedOnce：防御分支（工具写入后文件不应消失）。
                 if (nudgesLeft <= 0) {
                     failTurn(
-                        _session.value,
                         USER_MSG_CHANGE_MODEL,
                         internalDetail = "模型未通过工具产出游戏代码（可能不支持 function calling）"
                     )
@@ -1355,7 +1400,7 @@ class GameAgent(
             var mutatedThisRound = false
             for (call in resp.toolCalls) {
                 currentCoroutineContext().ensureActive()
-                _session.value = _session.value.copy(agentStage = "工具执行中：${call.name}")
+                _session.update { it.copy(agentStage = "工具执行中：${call.name}") }
                 val outcome = executor.execute(call)
                 if (outcome.name == GameTools.READ_FILE) readfileCalls++
                 // 空转计数看"是否写入过任何文件"（含 scenarios.json）；
@@ -1368,7 +1413,7 @@ class GameAgent(
                 if (outcome.mutated) {
                     lastReport = outcome.report
                     // 中间版本即刻发布：中断后玩家可立即试玩该版本。
-                    _session.value = _session.value.copy(currentHtml = outcome.html, streamingText = null)
+                    _session.update { it.copy(currentHtml = outcome.html, streamingText = null) }
                 }
                 alog("tool ${call.name}: ok=${outcome.ok} mutated=${outcome.mutated} obs=${outcome.observation.take(200)}")
 
@@ -1400,16 +1445,17 @@ class GameAgent(
                 // 不是交付，也没有带错交付；用户可重试或换模型。
                 idleRounds >= 24 -> {
                     failTurn(
-                        _session.value,
                         USER_MSG_CHANGE_MODEL,
                         internalDetail = "连续 $idleRounds 轮无文件修改（空转熔断）"
                     )
                     return GenOutcome.Failed
                 }
                 idleRounds > 0 && idleRounds % 8 == 0 -> {
-                    _session.value = _session.value.copy(
-                        agentStage = "代码生成中：已连续 $idleRounds 轮没有文件修改，正在催促模型落盘"
-                    )
+                    _session.update {
+                        it.copy(
+                            agentStage = "代码生成中：已连续 $idleRounds 轮没有文件修改，正在催促模型落盘"
+                        )
+                    }
                     messages += ChatMessage("user", "已连续 $idleRounds 轮没有文件修改。请直接完成 writefile / editfile 修改，或停止调用工具并输出最终总结。")
                 }
             }
@@ -1419,6 +1465,9 @@ class GameAgent(
     /**
      * 兼容降级回环：网关/模型不支持 function calling（首轮即在正文输出整份 HTML）时，
      * 退回“全量重写 → 抽取 → 校验 → 文本反馈”循环；每轮重建 prompt，不累积历史。
+     *
+     * 兼容模式每轮都是整文件再生成（最贵路径），必须有硬上限：总轮次达
+     * [LEGACY_MAX_ROUNDS] 即如实失败并保留最新候选版本，不做带错交付。
      */
     private suspend fun runLegacyRewriteLoop(
         llm: LlmClient,
@@ -1429,6 +1478,8 @@ class GameAgent(
         seedHash: String? = null,
         /** 工具模式降级前已消耗的轮次：兼容回环续数，保证总轮数与 LLM 调用次数对齐。 */
         startRound: Int = 1,
+        /** 本轮允许的内置引擎集合（generateFromIntent 一次算好传入，与写入校验同源）。 */
+        allowedEngines: Set<String> = GameEngines.BUNDLED.keys,
         /** 修复轮：自检降为一轮回归检查，且不参与预算复核（与工具模式同规则）。 */
         fixTurn: Boolean = false
     ): GenOutcome {
@@ -1436,102 +1487,130 @@ class GameAgent(
         var feedback = ""
         // 兼容模式与工具模式共用同一组可玩性自检轮提示（随质量档位与回合类型分档），全部消费完才交付。
         val tier = QualityTier.normalize(_session.value.qualityTier)
-        // 条件引入机制：兼容回环的引擎声明裁决与工具模式同源。
-        val allowedEngines = GameEngines.allowedFor(plan.visualDimension, plan.gameSystems, tier)
         val legacyReviews = ArrayDeque(GamePrompt.selfReviewPrompts(tier, fixTurn))
         var round = startRound
-        var lastReport = GameValidator.validate(firstCandidate, allowedEngines)
+        var lastReport: ValidationReport = ValidationReport()
         // 精品档防敷衍增强（一次性，与工具模式同款）：兼容模式同样堵"零修改直通自检"的敷衍交付。
         var legacyEnrichNudged = false
-        /**
-         * 交付判定：精品档生成轮首次交付前一次性注入丰富度增强指令并返回 null
-         * （调用方继续循环落实）；否则返回 Accepted 由调用方交付。
-         */
-        fun deliverOrNudge(html: String, reason: String, currentRound: Int): GenOutcome? {
+        val expectLandscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
+
+        /** 交付判定：精品档生成轮首次交付前一次性注入丰富度增强指令并返回 null（外层继续落实）；否则返回 Accepted。 */
+        fun deliverOrNudge(html: String, reason: String): GenOutcome? {
             if (!fixTurn && tier == QualityTier.PREMIUM && !legacyEnrichNudged) {
                 legacyEnrichNudged = true
                 alog("premium enrich nudge (legacy/$reason)")
-                _session.value = _session.value.copy(agentStage = "校验中：丰富度增强（精品档）")
+                _session.update { it.copy(agentStage = "校验中：丰富度增强（精品档）") }
                 feedback = GamePrompt.premiumEnrichPrompt() + "\n请输出增强后的完整 HTML。"
                 workingHtml = html
                 return null
             }
-            alog("ACCEPTED($reason): rounds=$currentRound bytes=${html.toByteArray(Charsets.UTF_8).size}")
-            return GenOutcome.Accepted(html, "", currentRound, lastReport)
+            alog("ACCEPTED($reason): rounds=$round bytes=${html.toByteArray(Charsets.UTF_8).size}")
+            return GenOutcome.Accepted(html, "", round, lastReport)
         }
-        _session.value = _session.value.copy(currentHtml = firstCandidate)
-        if (!lastReport.hasErrors) {
-            // 防假修改闸：工具失效降级进来时 firstCandidate 可能就是种子原文——
+
+        /** 通过（或慢环境超时按通过）后：先消费剩余自检轮，全部消费完才允许交付。 */
+        fun consumeReviewOrDeliver(html: String, reason: String): GenOutcome? {
+            val review = legacyReviews.removeFirstOrNull()
+            if (review != null) {
+                alog("self-review round (legacy/$reason): ${review.first}")
+                feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
+                workingHtml = html
+                _session.update { it.copy(agentStage = review.first) }
+                return null
+            }
+            return deliverOrNudge(html, reason)
+        }
+
+        /**
+         * 单个候选的统一验证分流（首候选与循环体共用一份实现）：
+         * - 校验错误 / 沙箱可修错误 → 写好 feedback 返回 null（外层继续重写循环）；
+         * - 通过或慢环境超时 → 消费自检轮或交付（非 null 为终局）；
+         * - 设施异常 / 零帧超时 → failTurn 后返回 Failed，不放行交付。
+         */
+        suspend fun evaluateCandidate(html: String, reason: String, isSeedCandidate: Boolean): GenOutcome? {
+            _session.update {
+                it.copy(
+                    currentHtml = html,
+                    agentStage = "校验中：正在对 ${GameFileWorkspaceEntryPoint.DEFAULT} 做语法与基本逻辑校验",
+                    streamingText = null
+                )
+            }
+            lastReport = GameValidator.validate(html, allowedEngines)
+            currentCoroutineContext().ensureActive()
+            if (lastReport.hasErrors) {
+                recordKnownErrors(lastReport)
+                feedback = validationFeedback(
+                    lastReport,
+                    ErrorSignature.hash(ErrorSignature.normalize(lastReport.errors.joinToString(";") { it.message }))
+                )
+                workingHtml = html
+                _session.update { it.copy(agentStage = "校验中：正在为 ${GameFileWorkspaceEntryPoint.DEFAULT} 生成修复方案") }
+                return null
+            }
+            // 防假修改闸（仅种子候选）：工具失效降级进来时 firstCandidate 可能就是种子原文——
             // 与种子完全一致的"成功"等于没改，要求输出包含修改的新版本。
-            if (seedHash != null && GameFileWorkspace.sha256(firstCandidate) == seedHash) {
+            if (isSeedCandidate && seedHash != null && GameFileWorkspace.sha256(html) == seedHash) {
                 feedback = "输出与当前版本完全一致。请在保持未要求部分不变的前提下，输出包含本次修改的完整 HTML。"
-                workingHtml = firstCandidate
-            } else {
-            // 静态校验通过：轻量及以上档位过沙箱冒烟才能交付（快速档跳过测试）。
-            val expectLandscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
-            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(firstCandidate, landscape = expectLandscape)
-            if (smoke == null || smoke.passed) {
-                val review = legacyReviews.removeFirstOrNull()
-                if (review == null) {
-                    deliverOrNudge(firstCandidate, "legacy-first", round)?.let { return it }
-                } else {
-                    alog("self-review round (legacy-first): ${review.first}")
-                    feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
-                    _session.value = _session.value.copy(agentStage = review.first)
-                }
-            } else if (smoke.message == "sandbox-infra") {
-                failTurn(_session.value, USER_MSG_SANDBOX_ENV, internalDetail = "兼容模式沙箱设施异常（首个候选），未交付")
+                workingHtml = html
+                return null
+            }
+            // 静态校验通过：轻量及以上档位过沙箱冒烟才能交付（快速档跳过测试）；横板按横屏视口。
+            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(html, landscape = expectLandscape)
+            if (smoke != null && smoke.message?.startsWith("sandbox-infra") == true) {
+                failTurn(USER_MSG_SANDBOX_ENV, internalDetail = "兼容模式沙箱设施异常（${smoke.message}·尝试 ${smoke.attempts} 次），未交付")
                 return GenOutcome.Failed
-            } else {
-                val smokeErrors = (smoke.errors + listOfNotNull(smoke.message?.takeIf { it == "smoke-timeout" }))
-                    .filter { it.isNotBlank() }
-                    .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
+            }
+            if (smoke != null && !smoke.passed) {
+                val smokeErrors = smokeActionableErrors(smoke)
                 if (smokeErrors.isEmpty()) {
+                    // 超时且无真实错误：零帧推进=探针从未运行（设施问题）不交付；
+                    // 有帧推进=慢环境时序问题，按通过处理走自检/交付。
                     if (smoke.framesRun <= 0) {
-                        alog("legacy sandbox timeout with ZERO frames -> infra failure (first)")
-                        failTurn(_session.value, USER_MSG_SANDBOX_ENV, internalDetail = "兼容模式沙箱超时且零帧推进（首个候选），未交付")
+                        alog("legacy sandbox timeout with ZERO frames -> infra failure ($reason)")
+                        failTurn(USER_MSG_SANDBOX_ENV, internalDetail = "兼容模式沙箱超时且零帧推进（$reason），未交付")
                         return GenOutcome.Failed
                     }
-                    // 慢环境超时无真实错误：按通过处理，同样先消费自检轮。
-                    val review = legacyReviews.removeFirstOrNull()
-                    if (review == null) {
-                        deliverOrNudge(firstCandidate, "legacy-timeout-pass-first", round)?.let { return it }
-                    } else {
-                        alog("self-review round (legacy-timeout-pass): ${review.first}")
-                        feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
-                        _session.value = _session.value.copy(agentStage = review.first)
-                    }
-                } else {
-                    _session.value = _session.value.copy(
+                    return consumeReviewOrDeliver(html, "$reason-timeout-pass")
+                }
+                workingHtml = html
+                _session.update { s ->
+                    s.copy(
+                        agentStage = "沙箱运行未通过：正在生成修复方案",
                         lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
                         knownIssues = smokeErrors.take(5)
                     )
-                    feedback = "沙箱运行未通过（确定性 tick ${smoke.framesRun} 帧）：" +
-                        smokeErrors.take(5).joinToString("；") + "。请修复后重新输出完整 HTML。"
                 }
+                feedback = "基础校验已通过，但冒烟测试未通过（确定性 tick ${smoke.framesRun} 帧）：" +
+                    smokeErrors.take(5).joinToString("；") + "。请修复后重新输出完整 HTML。"
+                return null
             }
-            }
-        } else {
-            recordKnownErrors(lastReport)
-            feedback = validationFeedback(
-                lastReport,
-                ErrorSignature.hash(ErrorSignature.normalize(lastReport.errors.joinToString(";") { it.message }))
-            )
+            return consumeReviewOrDeliver(html, reason)
         }
-        workingHtml = firstCandidate
 
-        // 兼容模式每轮都是整文件再生成（最贵路径），必须有硬上限：
-        // 超限如实失败并保留最新候选版本，不做带错交付。
+        // 首候选（工具模式降级前已产出的正文 HTML）：直接进入统一验证分流。
+        evaluateCandidate(firstCandidate, "legacy-first", isSeedCandidate = true)?.let { return it }
+
         while (true) {
             round++
+            // 兼容模式每轮都是整文件再生成（最贵路径），必须有硬上限：
+            // 超限如实失败并保留最新候选版本，不做带错交付。
+            if (round > LEGACY_MAX_ROUNDS) {
+                alog("legacy loop round cap reached: $round")
+                failTurn(
+                    USER_MSG_CHANGE_MODEL,
+                    internalDetail = "兼容模式达轮次上限（$LEGACY_MAX_ROUNDS 轮，每轮全量重写的最贵路径止损熔断），已保留最新候选"
+                )
+                return GenOutcome.Failed
+            }
             currentCoroutineContext().ensureActive()
             val file = GameFileWorkspaceEntryPoint.DEFAULT
-            val genStage = if (existingHtml.isNullOrBlank()) {
-                "代码生成中（兼容模式）：正在生成 $file 第 $round 轮"
+            // 与工具模式同理：回合内已产出过候选版本（或本就有种子）后的轮次为"修改"
+            val genStage = if (workingHtml.isNullOrBlank()) {
+                "第 $round 轮 - 代码生成中（兼容模式）：正在生成 $file"
             } else {
-                "代码修改中（兼容模式）：正在修改 $file 第 $round 轮"
+                "第 $round 轮 - 代码修改中（兼容模式）：正在修改 $file"
             }
-            _session.value = _session.value.copy(agentStage = genStage, streamingText = null)
+            _session.update { it.copy(agentStage = genStage, streamingText = null) }
 
             val reply = try {
                 callLlm(
@@ -1549,88 +1628,39 @@ class GameAgent(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                failTurn(_session.value, USER_MSG_NETWORK, internalDetail = "兼容模式 LLM 调用失败：${e.message}")
+                failTurn(USER_MSG_NETWORK, internalDetail = "兼容模式 LLM 调用失败：${e.message}")
                 return GenOutcome.Failed
             }
 
             currentCoroutineContext().ensureActive()
             val extracted = HtmlExtractor.extract(reply)
             currentCoroutineContext().ensureActive()
-            if (extracted.html == null) {
-                feedback = "上一条回复无法抽取到完整 HTML（${extracted.error ?: "缺少 ```html 围栏或 <html> 标签"}）。请只输出一个完整 HTML 文件。"
-                _session.value = _session.value.copy(
-                    lastError = feedback,
-                    agentStage = "校验中：正在检查输出是否为完整 HTML"
-                )
-                continue
-            }
-
             val candidate = extracted.html
-            _session.value = _session.value.copy(
-                currentHtml = candidate,
-                agentStage = "校验中：正在对 $file 做语法与基本逻辑校验",
-                streamingText = null
-            )
-            lastReport = GameValidator.validate(candidate, allowedEngines)
-            currentCoroutineContext().ensureActive()
-
-            if (lastReport.hasErrors) {
-                recordKnownErrors(lastReport)
-                feedback = validationFeedback(
-                    lastReport,
-                    ErrorSignature.hash(ErrorSignature.normalize(lastReport.errors.joinToString(";") { it.message }))
-                )
-                _session.value = _session.value.copy(
-                    agentStage = "校验中：正在为 $file 生成修复方案"
-                )
-                continue
-            }
-
-            // 静态校验通过：轻量及以上档位过沙箱冒烟（快速档跳过测试）；横板按横屏视口。
-            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(candidate, landscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE)
-            if (smoke != null && !smoke.passed) {
-                val smokeErrors = (smoke.errors + listOfNotNull(smoke.message?.takeIf { it == "smoke-timeout" }))
-                    .filter { it.isNotBlank() }
-                    .filterNot { it == "smoke-timeout" || it == "冒烟测试超时" }
-                if (smokeErrors.isEmpty()) {
-                    if (smoke.framesRun <= 0) {
-                        alog("legacy sandbox timeout with ZERO frames -> infra failure")
-                        failTurn(_session.value, USER_MSG_SANDBOX_ENV, internalDetail = "兼容模式沙箱超时且零帧推进，未交付")
-                        return GenOutcome.Failed
-                    }
-                    // 慢环境超时无真实错误：按通过处理，同样先消费自检轮。
-                    val timeoutReview = legacyReviews.removeFirstOrNull()
-                    if (timeoutReview != null) {
-                        alog("self-review round (legacy-timeout-pass): ${timeoutReview.first}")
-                        feedback = timeoutReview.second + "\n请输出修复或确认后的完整 HTML。"
-                        workingHtml = candidate
-                        _session.value = _session.value.copy(agentStage = timeoutReview.first)
-                        continue
-                    }
-                    deliverOrNudge(candidate, "legacy-timeout-pass", round)?.let { return it }
-                    continue
+            if (candidate == null) {
+                feedback = "上一条回复无法抽取到完整 HTML（${extracted.error ?: "缺少 ```html 围栏或 <html> 标签"}）。请只输出一个完整 HTML 文件。"
+                _session.update {
+                    it.copy(lastError = feedback, agentStage = "校验中：正在检查输出是否为完整 HTML")
                 }
-                feedback = "基础校验已通过，但冒烟测试未通过（确定性 tick ${smoke.framesRun} 帧）：" +
-                    smokeErrors.take(5).joinToString("；") + "。请修复后重新输出完整 HTML。"
-                workingHtml = candidate
-                _session.value = _session.value.copy(
-                    agentStage = "沙箱运行未通过：正在生成修复方案",
-                    lastError = smokeErrors.firstOrNull() ?: "沙箱运行未通过",
-                    knownIssues = smokeErrors.take(5)
-                )
                 continue
             }
 
-            val review = legacyReviews.removeFirstOrNull()
-            if (review != null) {
-                alog("self-review round (legacy): ${review.first}")
-                feedback = review.second + "\n请输出修复或确认后的完整 HTML。"
-                workingHtml = candidate
-                _session.value = _session.value.copy(agentStage = review.first)
-                continue
-            }
-            deliverOrNudge(candidate, "legacy", round)?.let { return it }
+            evaluateCandidate(candidate, "legacy", isSeedCandidate = false)?.let { return it }
         }
+    }
+
+    /** 策划上下文 + 引擎范式契约 + 质量档位口径（工具模式与兼容回环共用一份组装）。 */
+    private fun gameContractBlock(plan: DesignPlan): String = buildString {
+        append(GamePrompt.planContext(plan))
+        append("\n\n")
+        append(
+            GamePrompt.engineContract(
+                plan.visualDimension,
+                plan.gameSystems,
+                QualityTier.normalize(_session.value.qualityTier)
+            )
+        )
+        append("\n\n")
+        append(GamePrompt.tierPrompt(QualityTier.normalize(_session.value.qualityTier)))
     }
 
     /** 工具模式上下文（最小化注入）：模板或 rolling summary + 指令 + 策划 Schema + 工作流。 */
@@ -1657,17 +1687,7 @@ class GameAgent(
             append("游戏工作区已有 index.html，最新内容请通过 readfile 获取（上下文中的代码可能已过期）。\n\n")
         }
         append("用户指令：$instruction\n\n")
-        append(GamePrompt.planContext(plan))
-        append("\n\n")
-        append(
-            GamePrompt.engineContract(
-                plan.visualDimension,
-                plan.gameSystems,
-                QualityTier.normalize(_session.value.qualityTier)
-            )
-        )
-        append("\n\n")
-        append(GamePrompt.tierPrompt(QualityTier.normalize(_session.value.qualityTier)))
+        append(gameContractBlock(plan))
         append("\n\n")
         append(GamePrompt.toolWorkflowPrompt(firstGeneration))
         append("\n\n")
@@ -1716,11 +1736,13 @@ class GameAgent(
         val normalized = ErrorSignature.normalize(report.errors.joinToString(";") { it.message })
         val known = RetryBookkeeping.record(_session.value.knownErrors, classifyFailure(report), normalized)
         saveGlobalErrorSignatures(known)
-        _session.value = _session.value.copy(
-            knownErrors = known,
-            knownIssues = report.warnings.map { "${it.category}:${it.message}" },
-            lastError = report.errors.firstOrNull()?.message
-        )
+        _session.update { s ->
+            s.copy(
+                knownErrors = known,
+                knownIssues = report.warnings.map { "${it.category}:${it.message}" },
+                lastError = report.errors.firstOrNull()?.message
+            )
+        }
     }
 
     /** 冒烟测试 runner：注入优先（测试/诊断），否则用同 WebView 内核的真实实现。 */
@@ -1734,10 +1756,10 @@ class GameAgent(
      * 跑不过 tick"才判定失败并回填修复。
      */
     /** 沙箱设施异常哨兵：结果不可读/执行异常——不交付（沙箱通过才交付），以独立理由退出。 */
-    private fun sandboxInfraResult(): SmokeTestResult = SmokeTestResult(
+    private fun sandboxInfraResult(reason: String): SmokeTestResult = SmokeTestResult(
         passed = false,
         errors = listOf("沙箱执行环境异常"),
-        message = "sandbox-infra"
+        message = "sandbox-infra:$reason"
     )
 
     /** 均衡/精品档读取工作区功能断言（档位不符/文件缺失/解析失败 → null，沙箱按无断言运行）。 */
@@ -1762,7 +1784,7 @@ class GameAgent(
         } else {
             "冒烟测试中：正在沙箱验证游戏可运行"
         }
-        _session.value = _session.value.copy(agentStage = stage)
+        _session.update { it.copy(agentStage = stage) }
         return try {
             // 精品档（deep 模式）：真实调用 restart() 完整重开后复跑半程帧。
             val result = runner.run(
@@ -1773,7 +1795,7 @@ class GameAgent(
             )
             if (!result.passed && result.errors.isEmpty() && result.message != "smoke-timeout") {
                 android.util.Log.w("GameAgent", "沙箱结果不可读：${result.message}")
-                sandboxInfraResult()
+                sandboxInfraResult("结果不可读(${result.message})")
             } else {
                 result
             }
@@ -1781,7 +1803,7 @@ class GameAgent(
             throw e
         } catch (e: Exception) {
             android.util.Log.w("GameAgent", "沙箱执行异常", e)
-            sandboxInfraResult()
+            sandboxInfraResult("执行异常(${e.message})")
         }
     }
 
@@ -1798,9 +1820,11 @@ class GameAgent(
     ) {
         if (signatureRepeat >= 3) {
             alog("escalation: $kind x$signatureRepeat detail=$stubbornDetail")
-            _session.value = _session.value.copy(
-                agentStage = "校验中：同类$kind 错误已连续出现 $signatureRepeat 轮，正在要求模型更换实现思路"
-            )
+            _session.update {
+                it.copy(
+                    agentStage = "校验中：同类$kind 错误已连续出现 $signatureRepeat 轮，正在要求模型更换实现思路"
+                )
+            }
         }
         val detail = stubbornDetail?.let { "「$it」" } ?: ""
         when {
@@ -1845,21 +1869,22 @@ class GameAgent(
     }
 
     /** 如实终止回合：[message] 面向用户（零技术细节）；[internalDetail] 只写入决策日志供诊断。 */
-    private suspend fun failTurn(s: GameSession, message: String, internalDetail: String? = null) {
+    private suspend fun failTurn(message: String, internalDetail: String? = null) {
         currentCoroutineContext().ensureActive()
         alog("FAIL: $message | detail=$internalDetail")
-        val failed = s.copy(
-            isGenerating = false,
-            streamingText = null,
-            error = message + "（本轮耗时 ${formatAgentDuration(turnElapsedMs())}）",
-            agentStage = AgentStage.FAILED,
-            decisionLog = if (internalDetail.isNullOrBlank()) {
-                s.decisionLog
-            } else {
-                s.decisionLog + "失败详情（仅决策日志，不对用户展示）：$internalDetail"
-            }
-        )
-        _session.value = failed
+        val failed = updateSession { s ->
+            s.copy(
+                isGenerating = false,
+                streamingText = null,
+                error = message + "（本轮耗时 ${formatAgentDuration(turnElapsedMs())}）",
+                agentStage = AgentStage.FAILED,
+                decisionLog = if (internalDetail.isNullOrBlank()) {
+                    s.decisionLog
+                } else {
+                    s.decisionLog + "失败详情（仅决策日志，不对用户展示）：$internalDetail"
+                }
+            )
+        }
         persistSessionMessages(failed)
     }
 
@@ -1968,17 +1993,7 @@ class GameAgent(
 
         val body = buildString {
             append("用户指令：$instruction\n\n")
-            append(GamePrompt.planContext(plan))
-            append("\n\n")
-            append(
-                GamePrompt.engineContract(
-                    plan.visualDimension,
-                    plan.gameSystems,
-                    QualityTier.normalize(_session.value.qualityTier)
-                )
-            )
-            append("\n\n")
-            append(GamePrompt.tierPrompt(QualityTier.normalize(_session.value.qualityTier)))
+            append(gameContractBlock(plan))
             val leftovers = leftoverIssues()
             if (leftovers.isNotBlank()) {
                 append("\n【上一轮遗留问题（未解决，本轮最优先处理）】\n$leftovers\n")
@@ -2029,20 +2044,20 @@ class GameAgent(
                 if (attempt >= 3 || !isRetryableLlmError(e)) throw e
                 val waitMs = if (attempt == 1) 5_000L else 15_000L
                 alog("LLM 调用失败（第 $attempt 次），${waitMs / 1000}s 后自动重试：${e.message?.take(140)}")
-                _session.value = _session.value.copy(
-                    agentStage = "网络波动，正在自动重试（第 $attempt/2 次）…"
-                )
+                _session.update { it.copy(agentStage = "网络波动，正在自动重试（第 $attempt/2 次）…") }
                 delay(waitMs)
             }
         }
     }
 
-    /** 可重试判定：IO 异常、超时/连接类文本、服务端过载（5xx/429）。 */
+    /** 可重试判定：IO 异常、超时/连接类文本、服务端过载（5xx/429/overloaded）。 */
     private fun isRetryableLlmError(e: Exception): Boolean {
         if (e is IOException) return true
         val msg = e.message ?: ""
         if (Regex("API 错误 5\\d\\d").containsMatchIn(msg)) return true
         if (msg.contains("429")) return true
+        // Anthropic SSE error 事件（529 overloaded_error 等）没有数字状态码，按类型识别。
+        if (msg.contains("overloaded_error", ignoreCase = true)) return true
         return Regex("timeout|timed out|connection|reset|unreachable|broken pipe|EOF", RegexOption.IGNORE_CASE)
             .containsMatchIn(msg)
     }
@@ -2063,7 +2078,9 @@ class GameAgent(
                     sb.append(delta)
                     if (stageLabel != null && sb.length - lastProgressMark >= 200) {
                         lastProgressMark = sb.length
-                        _session.value = _session.value.copy(agentStage = "$stageLabel 已接收 ${sb.length} 字符")
+                        // onDelta 运行在 OkHttp IO 线程，与 agent 协程/停止键并发写会话，
+                        // 必须走原子 update（快照覆盖会丢其它线程刚写入的字段）。
+                        _session.update { it.copy(agentStage = "$stageLabel 已接收 ${sb.length} 字符") }
                     }
                 },
                 onThinking = { /* 思考过程属于内部信号，不回显到前端 */ },
@@ -2075,11 +2092,13 @@ class GameAgent(
                 // 兼容模式的代码生成流被停止键中断时，抢救未收完的 HTML，
                 // 让玩家仍可“立即游玩”中间版本。
                 HtmlExtractor.extractPartial(sb.toString())?.let { partial ->
-                    _session.value = _session.value.copy(
-                        currentHtml = partial,
-                        lastWarning = "已中断。当前版本可能不完整，可试玩或继续。",
-                        agentStage = AgentStage.INTERRUPTED
-                    )
+                    _session.update { s ->
+                        s.copy(
+                            currentHtml = partial,
+                            lastWarning = "已中断。当前版本可能不完整，可试玩或继续。",
+                            agentStage = AgentStage.INTERRUPTED
+                        )
+                    }
                 }
             }
             throw e

@@ -15,6 +15,10 @@ class SmokeRetryPolicyTest {
         assertTrue(isRetryableInfraFailure(SmokeTestResult(false, errors = emptyList(), message = "probe-result-unavailable")))
         // 零帧超时且无真实错误
         assertTrue(isRetryableInfraFailure(SmokeTestResult(false, framesRun = 0, errors = listOf("冒烟测试超时"), message = "smoke-timeout")))
+        // 预热门握手失败：渲染器对 JS 桥无响应，重建实例大概率恢复
+        assertTrue(isRetryableInfraFailure(SmokeTestResult(false, errors = listOf("沙箱预热失败：渲染器对 JS 桥无响应"), message = MESSAGE_WARMUP_FAILED)))
+        // 渲染进程死亡信号
+        assertTrue(isRetryableInfraFailure(SmokeTestResult(false, errors = listOf("渲染进程丢失"), message = MESSAGE_RENDERER_GONE)))
     }
 
     @Test

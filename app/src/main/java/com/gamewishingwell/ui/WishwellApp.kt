@@ -1,5 +1,6 @@
 package com.gamewishingwell.ui
 
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -34,6 +35,9 @@ fun WishwellApp() {
     val showBottomBar = currentRoute == "home" || currentRoute == "settings" || currentRoute?.startsWith("chat") == true
 
     Scaffold(
+        // 顶栏 inset 由各页面自己的 TopAppBar 处理；游戏页无 TopAppBar，
+        // 置零后 WebView 全屏铺到状态栏下，消除游戏画面顶部的留白条。
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
             if (showBottomBar) {
                 NavigationBar {

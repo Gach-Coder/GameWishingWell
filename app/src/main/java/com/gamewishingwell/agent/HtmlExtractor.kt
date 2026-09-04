@@ -14,6 +14,9 @@ object HtmlExtractor {
 
     // 使用贪婪匹配（到最后一个闭合标记），避免代码里的字符串中出现 </html> 或 ``` 时被提前截断
     private val fenceRegex = Regex("```(?:html)?\\s*([\\s\\S]*)```", RegexOption.IGNORE_CASE)
+    // 非贪婪逐块匹配：贪婪捕获吞并多个围栏块（```html 后又出现 ```json 等）时，
+    // 用它逐块找出第一个完整 HTML。
+    private val lazyFenceRegex = Regex("```(?:html)?\\s*([\\s\\S]*?)```", RegexOption.IGNORE_CASE)
     // 可选捕获 DOCTYPE，保证抽取结果按标准模式渲染
     private val htmlRegex = Regex("(?:<!DOCTYPE\\s+html[^>]*>\\s*)?<html[\\s\\S]*</html>", RegexOption.IGNORE_CASE)
     private val externalUrlRegex = Regex("""\b(?:https?://|//[a-z][a-z0-9.-]*[/'"])""", RegexOption.IGNORE_CASE)
@@ -38,7 +41,18 @@ object HtmlExtractor {
     fun extract(raw: String): ExtractResult {
         val warnings = mutableListOf<String>()
 
-        val fenced = fenceRegex.find(raw)?.groupValues?.get(1)?.trim()
+        val greedyFenced = fenceRegex.find(raw)?.groupValues?.get(1)?.trim()
+        // 贪婪捕获可能把多个围栏块连同中间的说明文字一起吞入（如 ```html 游戏代码```
+        // 说明 ```json 数据```），带尾巴的 HTML 不是可交付产物：此时逐块找第一个
+        // 完整 HTML；都不完整再回退贪婪结果（游戏代码字符串里可能真有 ``` 字面量）。
+        val fenced = if (greedyFenced != null && greedyFenced.contains("```")) {
+            lazyFenceRegex.findAll(raw)
+                .mapNotNull { it.groupValues[1].trim() }
+                .firstOrNull { it.contains("</html>", ignoreCase = true) }
+                ?: greedyFenced
+        } else {
+            greedyFenced
+        }
         val rawMatch = htmlRegex.find(raw)?.value
 
         val candidate = when {
@@ -65,8 +79,9 @@ object HtmlExtractor {
 
     /** 从回复中剥离代码块，得到模型说的话（用于对话展示）。 */
     fun nonCodeText(raw: String): String {
+        // 非贪婪逐块剥离：贪婪会把两个围栏块之间的正文一并删掉（模型给玩家的说明丢失）。
         var t = raw
-        t = t.replace(fenceRegex, "")
+        t = t.replace(lazyFenceRegex, "")
         t = t.replace(htmlRegex, "")
         return t.trim()
     }

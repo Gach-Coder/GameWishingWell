@@ -1,6 +1,7 @@
 package com.gamewishingwell.agent
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -82,5 +83,24 @@ class HtmlExtractorTest {
         assertTrue(partial!!.startsWith("<html", ignoreCase = true))
         assertTrue(partial.endsWith("</html>", ignoreCase = true))
         assertTrue(partial.contains("canvas"))
+    }
+
+    @Test
+    fun `多围栏回复取第一个完整 HTML 不吞并后续块`() {
+        val jsonBlock = "```json\n{\"scenarios\":[]}\n```"
+        val raw = "游戏做好了：\n\n```html\n$simpleHtml\n```\n\n断言数据：\n$jsonBlock\n\n完成。"
+        val result = HtmlExtractor.extract(raw)
+        assertNotNull(result.html)
+        assertEquals(simpleHtml, result.html)
+        assertFalse(result.html!!.contains("scenarios"))
+    }
+
+    @Test
+    fun `多围栏回复 nonCodeText 保留围栏之间的正文`() {
+        val raw = "游戏做好了！\n\n```html\n$simpleHtml\n```\n\n断言如下：\n\n```json\n[1,2]\n```\n\n完成。"
+        val text = HtmlExtractor.nonCodeText(raw)
+        assertTrue(text.contains("断言如下"))
+        assertTrue(text.contains("完成"))
+        assertFalse(text.contains("<html"))
     }
 }

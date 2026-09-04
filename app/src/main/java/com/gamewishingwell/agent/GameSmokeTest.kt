@@ -7,6 +7,7 @@ import android.os.Looper
 import android.webkit.ConsoleMessage
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -52,7 +53,9 @@ data class SmokeTestResult(
     /** 断言结果摘要（"系统/名称 通过|失败:原因"），供有据自检与决策日志使用。 */
     val scenarioResults: List<String> = emptyList(),
     /** 沙箱总尝试次数（设施类失败时 runner 重建 WebView 重试）。 */
-    val attempts: Int = 1
+    val attempts: Int = 1,
+    /** 探针是否已定稿（deep 复跑中途 framesRun≥MAX 不算完成——修复宿主提前收单竞态）。 */
+    val finalized: Boolean = false
 )
 
 object NoopSmokeTestRunner : SmokeTestRunner {
@@ -97,6 +100,7 @@ object SmokeTestProbe {
               if (window.$MARKER) return;
               window.$MARKER = true;
               window.__wwSmokeResult = {passed:false, framesRun:0, errors:[]};
+              window.__wwSmokeFinalized = false;
               window.__wwSmokePending = [];
               // 功能断言数据（宿主注入的 scenarios.json，标准 JSON 数组）：
               // 主跑帧通过后在 finalize 路径里逐条确定性执行。
@@ -378,6 +382,7 @@ object SmokeTestProbe {
                   debugStateCheck(true);
                 }
                 __finalized = true;
+                window.__wwSmokeFinalized = true; // 宿主完成判定的权威信号（deep 复跑中途不算完成）
                 window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: (phase === 2 ? ${MAX_FRAMES} + ticked : ticked), errors: window.__wwSmokeResult.errors, scenarios: __scenLog};
                 return;
               }
@@ -588,25 +593,33 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                 var lastFrames = 0
                 var lastPumpCount = 0
 
-                val timeout = Runnable {
-                    if (!finished) {
-                        android.util.Log.w("SmokeRunner", "outer timeout after polls=$polls last=$lastRaw")
-                        finished = true
-                        runCatching { webView.stopLoading() }
-                        cont.resumeWith(Result.success(SmokeTestResult(false, errors = listOf("冒烟测试超时"), message = "smoke-timeout")))
-                    }
-                }
-
                 var livenessRunnable: Runnable? = null
+                var timeoutRunnable: Runnable? = null
 
                 val finish: (SmokeTestResult) -> Unit = { result ->
                     if (!finished) {
                         finished = true
-                        main.removeCallbacks(timeout)
+                        timeoutRunnable?.let { main.removeCallbacks(it) }
                         livenessRunnable?.let { main.removeCallbacks(it) }
                         cont.resumeWith(Result.success(result))
+                        // 用完即毁（根修复）：泄漏的 WebView 实例会持续占用共享渲染器的
+                        // tile 内存与 JS 堆，累积后新页面无法绘制（tile memory limits
+                        // exceeded）→ 探针停滞 → "运行验证环境异常"。摧毁后资源归还，
+                        // 同进程内多轮沙箱不再互相拖垮；取消路径同理销毁。
+                        main.post { runCatching { webView.destroy() } }
                     }
                 }
+
+                val timeout = Runnable {
+                    // 超时也必须走 finish()：它负责 destroy WebView。超时恰恰发生在
+                    // renderer 最病态（tile memory 已紧张）的时刻，直接 resume 会把
+                    // 病态实例泄漏在共享渲染器上，后续沙箱连环"设施异常"的根源之一。
+                    if (!finished) {
+                        android.util.Log.w("SmokeRunner", "outer timeout after polls=$polls last=$lastRaw")
+                        finish(SmokeTestResult(false, errors = listOf("冒烟测试超时"), message = "smoke-timeout"))
+                    }
+                }
+                timeoutRunnable = timeout
 
                 // 活性看门狗：宽限期后仍双零 → 提前以 smoke-frozen 终止本次尝试
                 // （可重试标记），把 80s 干等压缩成 ~15s。
@@ -620,13 +633,40 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
 
                 val consoleErrors = mutableListOf<String>()
 
+                /**
+                 * 渲染器健康握手：空白页上执行一次最小 JS 并等待回声。回声正常才载入
+                 * 游戏页面；连续无响应则按可重试设施失败终止（message=smoke-warmup），
+                 * 由 runner 销毁重建 WebView 后重试——把"神秘停滞"变成快速确定性重建。
+                 */
+                fun handshake(attempt: Int) {
+                    if (finished) return
+                    webView.evaluateJavascript("1+1") { echo ->
+                        if (finished) return@evaluateJavascript
+                        if (echo != null) {
+                            android.util.Log.d("SmokeRunner", "warmup echo ok (attempt=$attempt)")
+                            webView.loadDataWithBaseURL(null, prepared, "text/html", "UTF-8", null)
+                        } else if (attempt >= MAX_WARMUP_CHECKS) {
+                            android.util.Log.w("SmokeRunner", "warmup failed after $attempt checks")
+                            finish(
+                                SmokeTestResult(
+                                    false,
+                                    errors = listOf("沙箱预热失败：渲染器对 JS 桥无响应"),
+                                    message = MESSAGE_WARMUP_FAILED
+                                )
+                            )
+                        } else {
+                            main.postDelayed({ handshake(attempt + 1) }, WARMUP_INTERVAL_MS)
+                        }
+                    }
+                }
+
                 fun poll() {
                     if (finished) return
                     polls++
                     // 每次轮询顺手驱动一帧批次（宿主驱动帧推进：evaluateJavascript 不经定时器队列，
                     // 不受离屏 WebView 后台节流影响），再读取探针终态。
                     val js = "(function(){try{if(window.__wwPump){window.__wwPump($FRAMES_PER_POLL);}}catch(pumpErr){}" +
-                        "try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],done:(r&&r.framesRun>=${SmokeTestProbe.MAX_FRAMES})||(r&&r.errors&&r.errors.length>0),rs:document.readyState,m:!!window.__wwSmokeInstalled,pfn:typeof window.__wwPump,pc:window.__wwPumpCount||0,sc:(r&&r.scenarios)||[]});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true,rs:document.readyState});}})()"
+                        "try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],fin:!!window.__wwSmokeFinalized,rs:document.readyState,m:!!window.__wwSmokeInstalled,pfn:typeof window.__wwPump,pc:window.__wwPumpCount||0,sc:(r&&r.scenarios)||[]});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true,rs:document.readyState});}})()"
                     webView.evaluateJavascript(js) { value ->
                         lastRaw = value
                         if (polls <= 8) {
@@ -646,7 +686,9 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                         val parsed = parseProbeResult(value, emptyList())
                         // 完成判定不重复解析原文：framesRun 已实时同步（>=MAX 即跑满），
                         // errors 非空即出错，passed 为探针 finalize 的终态。
-                        if (parsed.errors.isNotEmpty() || parsed.framesRun >= SmokeTestProbe.MAX_FRAMES || parsed.passed) {
+                        // 完成判定以探针定稿为准：deep 复跑期间 framesRun 已达 MAX 但未定稿，
+                        // 不能提前收单（历史 bug：读到中间态被判"结果不可读"设施异常）。
+                        if (parsed.errors.isNotEmpty() || parsed.passed || parsed.finalized) {
                             val console = synchronized(consoleErrors) { consoleErrors.toList() }
                             finish(
                                 SmokeTestResult(
@@ -709,15 +751,31 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                         }
                     }
                     view.webViewClient = object : WebViewClient() {
+                        var blankChecked = false
                         override fun onPageFinished(view: WebView, url: String?) {
                             android.util.Log.d("SmokeRunner", "onPageFinished url=$url")
-                            // 不依赖单次 onPageFinished：从加载完成起开始轮询探针结果。
-                            view.postDelayed(::poll, FIRST_POLL_DELAY_MS)
+                            if (!blankChecked) {
+                                // 预热门：先在空白页确认 evaluateJavascript 链路活着再载入真实页面。
+                                // 病态渲染器在这里数秒内快速失败并重建，不消耗整轮外层超时。
+                                blankChecked = true
+                                handshake(0)
+                            } else {
+                                // 不依赖单次 onPageFinished：从加载完成起开始轮询探针结果。
+                                view.postDelayed(::poll, FIRST_POLL_DELAY_MS)
+                            }
+                        }
+
+                        // 渲染器死亡信号（Chromium 官方回调）：与其等 80s 外层超时，
+                        // 不如立刻按可重试设施失败终止本次尝试并重建实例。
+                        override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                            android.util.Log.w("SmokeRunner", "renderer gone (crashed=${detail.didCrash()})")
+                            finish(SmokeTestResult(false, errors = listOf("渲染进程丢失"), message = MESSAGE_RENDERER_GONE))
+                            return true
                         }
                     }
                     // 兜底：若 onPageFinished 未触发（个别环境），仍按计划开始轮询。
                     main.postDelayed(::poll, FIRST_POLL_DELAY_MS + 2500)
-                    view.loadDataWithBaseURL(null, prepared, "text/html", "UTF-8", null)
+                    view.loadDataWithBaseURL(null, BLANK_HTML, "text/html", "UTF-8", null)
                 }
                 main.postDelayed(timeout, timeoutMs)
                 main.postDelayed(liveness, LIVENESS_GRACE_MS)
@@ -765,6 +823,7 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                 passed = passed && errors.isEmpty(),
                 framesRun = frames,
                 errors = errors + consoleErrors,
+                finalized = (json["fin"] as? JsonPrimitive)?.contentOrNull == "true",
                 message = if (passed) "smoke-ok" else "smoke-failed",
                 scenarioTotal = scenEntries.size,
                 scenarioPassed = scenResults.count { it.endsWith(" 通过") },
@@ -791,15 +850,25 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         // 探针活性宽限：超过后仍 frames=0 且 pump=0 判设施冻结，提前终止本次尝试。
         // 健康探针在 2~6s 内即有帧推进，15s 足以避开慢模拟器的正常加载耗时。
         const val LIVENESS_GRACE_MS = 15_000L
+        // 渲染器预热握手：JS 桥回声重试上限与间隔（共 5s），无响应按可重试设施失败重建。
+        const val MAX_WARMUP_CHECKS = 10
+        const val WARMUP_INTERVAL_MS = 500L
+        // 预热用空白页（随后才载入真实游戏页面）。
+        const val BLANK_HTML = "<html><body></body></html>"
     }
 }
 
+/** 沙箱设施类失败的消息标记（isRetryableInfraFailure 与 runner 共用）。 */
+internal const val MESSAGE_WARMUP_FAILED = "smoke-warmup"
+internal const val MESSAGE_RENDERER_GONE = "smoke-renderer-gone"
+
 /**
- * 设施类失败判定（可重建 WebView 重试）：零帧冻结（smoke-frozen）与结果不可读
- * 属于测试环境瞬时问题；游戏自身错误（有错误文本）与有帧推进的超时不属于，不重试。
+ * 设施类失败判定（可重建 WebView 重试）：零帧冻结（smoke-frozen）、结果不可读、
+ * 预热握手失败（smoke-warmup）、渲染器死亡（smoke-renderer-gone）属于测试环境
+ * 瞬时问题；游戏自身错误（有错误文本）与有帧推进的超时不属于，不重试。
  */
 internal fun isRetryableInfraFailure(r: SmokeTestResult): Boolean = when (r.message) {
-    "smoke-frozen", "probe-result-unavailable" -> true
+    "smoke-frozen", "probe-result-unavailable", MESSAGE_WARMUP_FAILED, MESSAGE_RENDERER_GONE -> true
     "smoke-timeout" -> r.framesRun <= 0 && r.errors.all { it == "冒烟测试超时" || it == "smoke-timeout" }
     else -> false
 }

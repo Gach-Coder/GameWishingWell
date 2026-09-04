@@ -23,6 +23,22 @@ class SettingsRepository(context: Context) {
     private val _settings = MutableStateFlow(load())
     val settings: StateFlow<LlmSettings> = _settings.asStateFlow()
 
+    /** 每个服务商独立记忆的 API Key 存储槽（api_key_deepseek / api_key_kimi …）。 */
+    private fun providerKeySlot(providerId: String): String = "api_key_$providerId"
+
+    init {
+        // 一次性迁移：升级前只存过当前厂商的 api_key——补写到该厂商的记忆槽，
+        // 之后切换厂商即可自动回填，不必重新输入。
+        val s = _settings.value
+        if (s.apiKey.isNotBlank() && rememberedApiKey(s.providerId).isBlank()) {
+            secure.putString(providerKeySlot(s.providerId), s.apiKey)
+        }
+    }
+
+    /** 该厂商上次保存过的 API Key（无记忆返回空串；切换厂商时用于自动回填）。 */
+    fun rememberedApiKey(providerId: String): String =
+        secure.getString(providerKeySlot(providerId)) ?: ""
+
     private fun load(): LlmSettings {
         val providerId = secure.getString("provider_id") ?: ProviderPresets.DEFAULT.id
         val preset = ProviderPresets.byId(providerId) ?: ProviderPresets.DEFAULT
@@ -50,6 +66,8 @@ class SettingsRepository(context: Context) {
         )
         secure.putString("provider_id", normalized.providerId)
         secure.putString("api_key", normalized.apiKey)
+        // 按厂商记忆 Key：切回该厂商时自动回填，免重复输入（Keystore 加密存储）。
+        secure.putString(providerKeySlot(normalized.providerId), normalized.apiKey)
         secure.putString("base_url", normalized.baseUrl)
         secure.putString("model", normalized.model)
         secure.putString("system_prompt", normalized.systemPrompt)

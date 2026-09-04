@@ -112,7 +112,7 @@ class AnthropicClient(
                     val line = source.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val payload = line.removePrefix("data:").trim()
-                    handleEvent(payload, text, blocks, onDelta)
+                    handleEvent(payload, text, blocks, onDelta, onThinking)
                 }
                 onDone()
                 LlmResponse(
@@ -142,7 +142,8 @@ class AnthropicClient(
         payload: String,
         text: StringBuilder,
         blocks: HashMap<Int, PartialToolBlock>,
-        onDelta: (String) -> Unit
+        onDelta: (String) -> Unit,
+        onThinking: (String) -> Unit
     ) {
         val obj = try {
             Json.parseToJsonElement(payload).jsonObject
@@ -150,6 +151,15 @@ class AnthropicClient(
             return
         }
         when (obj["type"]?.jsonPrimitive?.contentOrNull) {
+            // SSE 错误事件（overloaded_error / invalid_request_error 等服务端 mid-stream 推送）：
+            // 必须抛出而非静默吞掉——吞掉会让流"正常"结束并返回空文本，上层只能看到
+            // 空回复，无法归因（可重试错误交由 GameAgent.callLlm 的退避重试处理）。
+            "error" -> {
+                val err = obj["error"]?.jsonObject
+                val type = err?.get("type")?.jsonPrimitive?.contentOrNull ?: "error"
+                val message = err?.get("message")?.jsonPrimitive?.contentOrNull ?: payload.take(200)
+                throw LlmError("API 错误 ($type)：$message")
+            }
             "content_block_start" -> {
                 val index = obj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: return
                 val block = obj["content_block"]?.jsonObject ?: return
@@ -172,6 +182,10 @@ class AnthropicClient(
                     "input_json_delta" -> {
                         val chunk = delta["partial_json"]?.jsonPrimitive?.contentOrNull ?: return
                         blocks[index]?.arguments?.append(chunk)
+                    }
+                    "thinking_delta" -> {
+                        val chunk = delta["thinking"]?.jsonPrimitive?.contentOrNull ?: return
+                        onThinking(chunk)
                     }
                 }
             }

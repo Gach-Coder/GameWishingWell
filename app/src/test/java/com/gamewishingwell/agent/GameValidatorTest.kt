@@ -49,6 +49,15 @@ class GameValidatorTest {
     }
 
     @Test
+    fun `本地 script src 与本地图片同为 error`() {
+        // 单文件交付里本地 JS 同样必然 404：曾只报 warning 不阻断，坏件会漏到玩家手里。
+        val html = "<html><body><script src=\"game.js\"></script><img src=\"sprite.png\"></body></html>"
+        val report = GameValidator.validate(html)
+        assertTrue(report.errors.any { it.category == "resources" && it.message.contains("game.js") })
+        assertTrue(report.errors.any { it.category == "resources" && it.message.contains("sprite.png") })
+    }
+
+    @Test
     fun `eval 与 new Function 违反安全契约`() {
         val html = "<html><body><script>var r = eval('1+1'); var f = new Function('return 1');</script></body></html>"
         val report = GameValidator.validate(html)

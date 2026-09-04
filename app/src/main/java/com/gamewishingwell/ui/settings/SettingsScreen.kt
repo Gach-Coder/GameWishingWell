@@ -112,7 +112,7 @@ fun SettingsScreen() {
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Text(
-                "配置 AI 服务商后，就可以在「创作」里用一句话生成游戏。API Key 只保存在本机（Keystore 加密）。",
+                "配置 AI 服务商后，就可以在「创作」里用一句话生成游戏。API Key 只保存在本机（Keystore 加密），各厂商的 Key 分别记忆：切换服务商时自动回填，无需重复输入。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -144,6 +144,9 @@ fun SettingsScreen() {
                                     baseUrl = p.baseUrl
                                     model = p.defaultModel
                                 }
+                                // 按厂商记忆的 Key 自动回填：切回用过的厂商免重复输入；
+                                // 未用过的厂商清空旧 Key，避免拿 A 家的 Key 请求 B 家。
+                                apiKey = vm.rememberedApiKey(p.id)
                                 providerMenu = false
                             }
                         )
