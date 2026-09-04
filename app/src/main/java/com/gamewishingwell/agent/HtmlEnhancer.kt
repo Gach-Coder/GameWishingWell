@@ -11,10 +11,18 @@ package com.gamewishingwell.agent
  * 3. 平台设置桥接：音量（window.__wwSetVolume，默认 0.8，钳制 0–1.5）与暂停
  *    （window.__wwSetPaused）暴露给原生顶栏"设置"面板调用；游戏页内不注入任何
  *    设置按钮/面板 UI，仅隐藏游戏自带的重开类按钮避免与平台"重新游戏"重复。
+ * 4. 内置引擎注入：HTML 声明 <meta name="ww-engine" content="three"> 时，
+ *    把 APK assets 里的引擎源码注入 <head>（在游戏脚本之前执行）。
+ *    引擎源码经 [engineSourceProvider] 获取——真机由 Application 接入 assets
+ *    读取实现，JVM 单测可替换为桩；真实游戏页与沙箱共用本注入管道。
  *
  * 只影响 WebView 里渲染的副本，磁盘上保存的原始 HTML 保持不动。
  */
 object HtmlEnhancer {
+
+    /** 引擎源码提供器：name → 源码（未知引擎返回 null）。真机接 assets，测试可替换。 */
+    @Volatile
+    var engineSourceProvider: ((String) -> String?)? = null
 
     private val ERROR_PRELUDE = """
     <script>
@@ -242,15 +250,19 @@ object HtmlEnhancer {
 
     private val headTagRegex = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
     private val htmlTagRegex = Regex("<html[^>]*>", RegexOption.IGNORE_CASE)
+    private const val ENGINE_INJECTED_MARK = "__wwEngineInjected"
 
     fun inject(html: String): String {
         if (html.isBlank()) return html
 
         val needsErrorCatcher = !html.contains("unhandledrejection", ignoreCase = true)
         val needsViewportFix = !html.contains("__wwViewportFixApplied")
-        if (!needsErrorCatcher && !needsViewportFix) return html
+        val engineScripts = buildEngineScripts(html)
+        if (!needsErrorCatcher && !needsViewportFix && engineScripts.isEmpty()) return html
 
         val preludes = buildString {
+            // 引擎最先注入：必须在游戏脚本（以及视口修复/错误捕获之后的游戏逻辑）之前完成定义。
+            engineScripts.forEach { append(it).append("\n") }
             if (needsViewportFix) append(VIEWPORT_PRELUDE).append("\n")
             if (needsErrorCatcher) append(ERROR_PRELUDE).append("\n")
         }
@@ -264,5 +276,22 @@ object HtmlEnhancer {
             return html.substring(0, at) + "\n" + preludes + html.substring(at)
         }
         return preludes + html
+    }
+
+    /**
+     * 按声明顺序产出引擎注入块（幂等：已注入过标记则跳过）。
+     * 只注入已内置的引擎——未内置/本轮条件不允许的声明由 GameValidator 打回，
+     * 这里静默跳过可保证渲染副本不因非法声明而注入未知代码。
+     */
+    private fun buildEngineScripts(html: String): List<String> {
+        if (html.contains(ENGINE_INJECTED_MARK)) return emptyList()
+        val provider = engineSourceProvider ?: return emptyList()
+        return GameEngines.declaredEngines(html)
+            .filter { it in GameEngines.BUNDLED }
+            .mapNotNull { engine ->
+                provider(engine)?.let { source ->
+                    "<script>/* $ENGINE_INJECTED_MARK:$engine */\n$source\n</script>"
+                }
+            }
     }
 }

@@ -296,6 +296,86 @@ $seedSystems
     """.trimIndent()
 
     /**
+     * 内置引擎契约（条件引入机制）：按 design_schema 的维度/系统与质量档位组装——
+     * 只"教"本轮允许的引擎（three=3D 必须、matter=物理系统必须、pixi/cannon/tween
+     * 按条件可选）；其余游戏明确禁用引擎与 WebGL。声明协议统一：
+     * <head> 内 <meta name="ww-engine" content="...">（可逗号分隔多个，仅此一行，
+     * 不写任何 <script src>），平台在渲染层自动注入引擎源码（真机与沙箱同管道），
+     * 声明白名单外或条件不符的引擎会被基础校验打回。
+     */
+    fun engineContract(
+        visualDimension: String,
+        systems: Collection<String> = emptyList(),
+        tier: String = QualityTier.BALANCED
+    ): String {
+        val allowed = GameEngines.allowedFor(visualDimension, systems, tier)
+        if (allowed.isEmpty()) {
+            return """
+            【引擎使用限制】本游戏不使用任何引擎：所有图形用 Canvas 2D 自绘、物理/运动用简单确定性公式手写；
+            禁止声明 ww-engine（内置引擎仅特定游戏类型经平台注入使用）。
+            """.trimIndent()
+        }
+        val hasPhysics = systems.contains("物理")
+        val sections = mutableListOf<String>()
+        sections += """
+            【内置引擎声明协议】在 <head> 内写 <meta name="ww-engine" content="${allowed.joinToString(",")}">
+            （可只声明实际用到的引擎子集，逗号分隔；不写任何 <script src>，平台渲染时自动注入源码，代码直接用全局对象）。
+        """.trimIndent()
+        if (GameEngines.THREE in allowed) {
+            sections += """
+            【3D 引擎 three.js（本游戏必须使用）】全局 THREE。
+            1. 渲染器必须 new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true})——沙箱画面检测依赖 canvas.toDataURL 读回像素，
+               缺少 preserveDrawingBuffer 会被判白屏回炉；setPixelRatio(Math.min(window.devicePixelRatio||1,2))；resize 同步 camera.aspect 与 renderer.setSize。
+            2. 主循环 requestAnimationFrame（沙箱接管为确定性 tick 照常可测）；dt 钳制 0.05s。
+            3. 移动端性能预算：低多边形；重复物体用合并几何或 InstancedMesh；光照 ≤1 平行光+环境光；纹理用 Canvas 程序化生成；
+               场景物体数百级，保证手机 60fps。
+            4. 触控（3D 标准）：左半屏虚拟摇杆移动（可见半透明、identifier 跟踪）、右半屏滑动转视角、右下动作键；HUD 从顶部约 120px 安全区下开始。
+            严禁手写 Canvas 2D 透视投影/软件光栅化模拟 3D。
+        """.trimIndent()
+        }
+        if (GameEngines.MATTER in allowed) {
+            sections += """
+            【2D 物理引擎 matter.js（本游戏含物理系统，必须使用）】全局 Matter。
+            1. Engine.create() 建世界， Bodies.rectangle/circle 建刚体（静态平台/墙壁 isStatic:true），
+               Composite.add(engine.world, ...) 装配；1 物理单位≈1px。
+            2. 主循环每帧 Engine.update(engine, dt*1000)（dt 秒、钳制 ≤0.05）；matter 只做物理不渲染——
+               渲染仍用 Canvas 2D，从 body.position/body.angle 读状态自绘。
+            3. 玩家运动用 Body.setVelocity/body.force，不要直接改 position；碰撞反馈用 Events.on(engine,'collisionStart',...)；
+               摆绳/吊钩用 Constraint。
+            4. restart() 时 World.clear + 重建刚体；__wwDebugState() 快照从 body.position 读取 entities/player 坐标。
+        """.trimIndent()
+        }
+        if (GameEngines.PIXI in allowed) {
+            sections += """
+            【2D 渲染引擎 pixi.js（可选：仅当同屏活动实体数百级、Canvas 2D 明显卡顿时才使用）】全局 PIXI。
+            new PIXI.Application({view:canvas, antialias:true, backgroundAlpha:0})；精灵纹理用离屏 Canvas 程序化生成
+            （PIXI.Texture.from）；大量同类精灵用 ParticleContainer；保持 rAF 主循环与 restart()/__wwDebugState 契约。
+            一般 2D 游戏仍首选 Canvas 2D 自绘。
+        """.trimIndent()
+        }
+        if (GameEngines.CANNON in allowed) {
+            sections += """
+            【3D 物理引擎 cannon（可选：仅真刚体需求——翻滚/堆叠/抛射时使用，与 three 配合）】全局 CANNON。
+            声明 content="three,cannon"；new CANNON.World() 设 gravity；每帧 world.step(1/60, dt, 3)；
+            把 body.position/quaternion 同步到 three 的 mesh。体素世界简单 AABB 碰撞直接手写更简，不必引入。
+        """.trimIndent()
+        }
+        if (GameEngines.TWEEN in allowed) {
+            sections += """
+            【补间库 tween.js（精品档打磨可用）】全局 TWEEN。声明 content 加 tween；
+            new TWEEN.Tween(obj).to(...).easing(...) 链式补间，主循环里 TWEEN.update(now) 驱动 UI/动效；
+            游戏逻辑数值仍自管理，tween 只用于表现层。
+        """.trimIndent()
+        }
+        if (!hasPhysics && GameEngines.MATTER !in allowed) {
+            sections += """
+            【物理实现边界】本游戏未含物理系统：重力/碰撞用简化确定性公式手写即可，不要声明物理引擎。
+        """.trimIndent()
+        }
+        return sections.joinToString("\n\n")
+    }
+
+    /**
      * 质量档位 → 生成策略引导（注入工具模式与兼容模式上下文）。
      */
     fun tierPrompt(tier: String): String {

@@ -47,7 +47,11 @@ object GameValidator {
     private val cssUrlRegex = Regex("""url\(\s*['"]?([^)'"\s]+)['"]?\s*\)""", RegexOption.IGNORE_CASE)
     private val externalUrlRegex = Regex("""(?:https?://|//[a-z][a-z0-9.-]*[/'"])""", RegexOption.IGNORE_CASE)
 
-    fun validate(html: String): ValidationReport {
+    fun validate(
+        html: String,
+        /** 本轮条件允许的引擎集合（条件引入机制）；缺省=全部内置引擎。 */
+        allowedEngines: Set<String> = GameEngines.BUNDLED.keys
+    ): ValidationReport {
         if (html.isBlank()) {
             return ValidationReport(
                 listOf(ValidationIssue("resources", FILE_INDEX_HTML, 1, "HTML 内容为空", "error"))
@@ -128,6 +132,32 @@ object GameValidator {
                 "error"
             )
         }
+
+        // 内置引擎声明白名单（条件引入机制）：ww-engine 只允许平台已内置且本轮
+        // 条件允许的引擎（GameAgent 按 design_schema 维度/系统/档位算出 allowedEngines
+        // 传入；默认全部内置引擎，供 JVM 单测与文件级校验使用）。
+        GameEngines.declaredEngines(html)
+            .filterNot { it in GameEngines.BUNDLED.keys }
+            .forEach { engine ->
+                checks += ValidationIssue(
+                    "resources", FILE_INDEX_HTML, 1,
+                    "不支持的引擎声明：$engine（平台未内置该引擎；ww-engine 只能声明内置引擎：" +
+                        "${GameEngines.BUNDLED.keys.joinToString("/")}，由平台渲染时自动注入源码）",
+                    "error"
+                )
+            }
+        val bundledDeclared = GameEngines.declaredEngines(html).filter { it in GameEngines.BUNDLED.keys }
+        bundledDeclared
+            .filterNot { it in allowedEngines }
+            .forEach { engine ->
+                checks += ValidationIssue(
+                    "resources", FILE_INDEX_HTML, 1,
+                    "引擎 $engine 不适用于本游戏（适用条件：${GameEngines.BUNDLED[engine]?.condition}；" +
+                        "本轮可用引擎：${if (allowedEngines.isEmpty()) "无——本游戏类型不需要引擎" else allowedEngines.joinToString("/")}）。" +
+                        "请移除该声明并按当前技术方案实现",
+                    "error"
+                )
+            }
 
         return ValidationReport(checks.distinctBy { "${it.category}|${it.message}" })
     }

@@ -69,4 +69,63 @@ class HtmlEnhancerTest {
         assertTrue(out.contains("<script>var x=1;"))
         assertEquals(1, Regex("unhandledrejection").findAll(out).count())
     }
+
+    // ---------- 内置引擎注入 ----------
+
+    @Test
+    fun `声明 ww-engine 时注入引擎源码且位于视口修复与游戏脚本之前`() {
+        val provider = HtmlEnhancer.engineSourceProvider
+        try {
+            HtmlEnhancer.engineSourceProvider = { name -> if (name == "three") "/*THREE_SOURCE*/" else null }
+            val html = "<html><head><meta name=\"ww-engine\" content=\"three\"></head><body><script>var x=1;</script></body></html>"
+            val out = HtmlEnhancer.inject(html)
+            assertTrue(out.contains("__wwEngineInjected:three"))
+            assertTrue(out.contains("/*THREE_SOURCE*/"))
+            // 顺序：引擎 → 视口修复 → 游戏脚本
+            val engineAt = out.indexOf("/*THREE_SOURCE*/")
+            assertTrue(engineAt in 0 until out.indexOf("__wwViewportFixApplied"))
+            assertTrue(engineAt < out.indexOf("var x=1;"))
+            // 原始 meta 声明保留（磁盘副本不动，注入只影响渲染副本）
+            assertTrue(out.contains("ww-engine"))
+        } finally {
+            HtmlEnhancer.engineSourceProvider = provider
+        }
+    }
+
+    @Test
+    fun `未声明引擎时不注入且白名单外声明被静默跳过`() {
+        val provider = HtmlEnhancer.engineSourceProvider
+        try {
+            HtmlEnhancer.engineSourceProvider = { name -> "/*SRC_$name*/" }
+            // 无声明：不注入引擎块
+            val plain = HtmlEnhancer.inject(htmlWithHead)
+            assertFalse(plain.contains("__wwEngineInjected"))
+            // 白名单外声明：渲染层不注入未知代码（由基础校验打回）
+            val bad = HtmlEnhancer.inject("<html><head><meta name=\"ww-engine\" content=\"babylon\"></head><body></body></html>")
+            assertFalse(bad.contains("__wwEngineInjected"))
+            assertFalse(bad.contains("/*SRC_babylon*/"))
+        } finally {
+            HtmlEnhancer.engineSourceProvider = provider
+        }
+    }
+
+    @Test
+    fun `引擎注入幂等且 provider 缺引擎时不注入`() {
+        val provider = HtmlEnhancer.engineSourceProvider
+        try {
+            HtmlEnhancer.engineSourceProvider = { null }
+            val html = "<html><head><meta name=\"ww-engine\" content=\"three\"></head><body></body></html>"
+            // provider 拿不到源码（assets 缺失）：不产生空注入块
+            val out = HtmlEnhancer.inject(html)
+            assertFalse(out.contains("__wwEngineInjected"))
+
+            HtmlEnhancer.engineSourceProvider = { name -> if (name == "three") "/*THREE_SOURCE*/" else null }
+            val once = HtmlEnhancer.inject(html)
+            val twice = HtmlEnhancer.inject(once)
+            assertEquals(1, Regex("__wwEngineInjected:three").findAll(twice).count())
+            assertEquals(once, twice)
+        } finally {
+            HtmlEnhancer.engineSourceProvider = provider
+        }
+    }
 }

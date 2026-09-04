@@ -32,6 +32,25 @@
 运行期由 Android WebView（Chromium 内核）解释执行。无编译环节，生成即玩；
 鸿蒙 ArkWeb 同为 Chromium 内核，双端可复用。
 
+内置 JS 引擎库（3D/物理等重模块的平台注入方案，条件引入机制）：
+- 引擎不要求模型手写重模块（3D 软渲染/物理模拟实测必然退化为伪 3D 或碰撞 bug）——
+  平台在 APK assets/engines/ 内置五个引擎（全部 UMD 全局、版本锁定、已验证可内联无 </script 字面量）：
+  three.min.js（r128，全局 THREE，~600KB）/ matter.min.js（0.20，全局 Matter，~83KB）/
+  pixi.min.js（7.4，全局 PIXI，~456KB）/ cannon.min.js（0.6.2 UMD，全局 CANNON，~132KB；cannon-es 无 UMD 故取经典版）/
+  tween.umd.js（21，全局 TWEEN，~35KB）；
+- 声明协议：模型在 HTML <head> 写 <meta name="ww-engine" content="three,matter">（逗号分隔多个，仅此一行，无任何 <script src>）；
+- 注入管道：AppContainer 为 HtmlEnhancer 接入 assets 引擎源码 provider（惰性读取+缓存），
+  HtmlEnhancer 检测声明后在 <head> 注入引擎源码（置于视口修复/游戏脚本之前，幂等）——
+  真实游戏页（GameScreen）与沙箱（AndroidSmokeTestRunner）共用同一 inject 管道，天然一致；
+- 条件引入机制（GameEngines.allowedFor：维度×系统×档位裁决，提示词/校验/执行器三处同源）：
+  three=3D 必须；matter=含物理系统必须；pixi=弹幕射击可选（同屏数百实体性能不足时）；
+  cannon=3D+物理可选（真刚体需求；体素 AABB 手写更简）；tween=精品档可选（表现层补间）。
+  提示词只"教"满足条件的引擎（GamePrompt.engineContract 按条件组装范式段：必选/可选措辞），
+  GameValidator.validate(html, allowedEngines) 打回条件不符的声明（如贪吃蛇声明 matter）；
+- 游戏文件保持文本自包含（不含资源引用），离线可玩承诺与外部资源禁令不变；
+- 引擎准入条件：单文件无依赖（UMD）、版本锁定、真机与沙箱注入一致、提示词有使用范式；
+  新增引擎 = GameEngines 注册表加一行 + assets 放文件 + 范式文案 + 单测。
+
 二、Agent核心说明
 *前端 LLM SSE 显示 Agent 状态（游戏识别中/游戏策划中/游戏生成中/游戏校验中/对话回复中等）
 *UI 零错误细节纪律：用户只输入游戏需求、只关心进度与结果；消除 bug 是 Agent 的内部职责。
@@ -311,7 +330,13 @@ GameWishingWell/
       ├─ main/
       │  ├─ AndroidManifest.xml
       │  ├─ assets/
-      │  │  └─ game_template.html    # 首次生成时给 LLM 的示例游戏模板
+      │  │  ├─ game_template.html    # 首次生成时给 LLM 的示例游戏模板
+      │  │  └─ engines/              # 内置 JS 引擎库（ww-engine 声明后由 HtmlEnhancer 条件注入）
+      │  │     ├─ three.min.js       # 3D（THREE，条件：3D 必须）
+      │  │     ├─ matter.min.js      # 2D 物理（Matter，条件：物理系统必须）
+      │  │     ├─ pixi.min.js        # 2D WebGL 渲染（PIXI，条件：弹幕类可选）
+      │  │     ├─ cannon.min.js      # 3D 刚体物理（CANNON，条件：3D+物理可选）
+      │  │     └─ tween.umd.js       # 补间动效（TWEEN，条件：精品档可选）
       │  ├─ java/com/gamewishingwell/
       │  │  ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
@@ -324,14 +349,15 @@ GameWishingWell/
       │  │  │  ├─ GameTemplateSystems.kt # 对标模板的具体系统实现/验收边界（LLM 策划的种子与回退）
       │  │  │  ├─ GamePlan.kt            # 策划层：LLM 逐系统阐述具体实现、P0/P1/P2、验收清单
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
-	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令）；运行校验由沙箱承担
+	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单）；运行校验由沙箱承担
+	      │  │  │  ├─ GameEngines.kt        # 内置引擎条件注册表（ww-engine 解析/BUNDLED/allowedFor 条件矩阵）
 	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控
 	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试 + 功能断言执行 + 画面方向断言（横板按横屏视口运行）
       │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入 / 行级 patch
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
       │  │  │  ├─ QualityGate.kt         # 两段式自检 verdict
       │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
-	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入
+	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入（视口修复/错误捕获/内置引擎注入）
 	      │  │  │  └─ GenerationForegroundService.kt # 生成期前台服务（dataSync）：后台保活/进度通知/停止入口/wakelock
       │  │  ├─ data/
       │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage

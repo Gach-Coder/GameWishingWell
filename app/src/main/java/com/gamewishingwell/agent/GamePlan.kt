@@ -598,7 +598,18 @@ object PlanningEngine {
         } else {
             "竖版/竖屏布局方案"
         }
-        result += "WebGL / 原生 3D 引擎 / 外部模型资产"
+        // 引擎条件化：3D 用内置 three.js（+真刚体需求可选 cannon）；物理系统用内置
+        // matter.js（手写碰撞是 bug 重灾区）；2D/2.5D 默认 Canvas 2D（弹幕类性能
+        // 不足时可选 pixi）。条件裁决见 GameEngines.allowedFor。
+        result += if (schema.visualDimension == GameSchema.DIMENSION_3D) {
+            "手写 Canvas 2D 软件光栅化模拟 3D（3D 必须使用内置 three.js 引擎：在 head 声明 <meta name=\"ww-engine\" content=\"three\">，平台渲染时自动注入）"
+        } else {
+            "3D 渲染方案（2D/2.5D 用 Canvas 2D 自绘；弹幕类同屏数百实体性能不足时可选内置 pixi.js）"
+        }
+        if (schema.gameSystems.contains("物理")) {
+            result += "手写物理/碰撞模拟（物理系统必须使用内置 matter.js：声明 ww-engine 由平台注入；3D 真刚体需求可选 cannon）"
+        }
+        result += "外部模型/贴图资产（3D 几何与纹理一律程序化生成）"
         result += "联机对战、账号系统与服务端存档"
         result += "外部图片、音频、字体、CDN 与第三方 JS 库"
         result += "eval / new Function / 动态 require / import()"

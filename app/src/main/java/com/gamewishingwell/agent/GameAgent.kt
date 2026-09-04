@@ -939,7 +939,16 @@ class GameAgent(
         // 工具沙箱工作区：会话级目录（草稿或已保存游戏），种子为当前代码版本。
         val workspace = GameFileWorkspace(gameWorkspaceDir())
         seedWorkspace(workspace, existingHtml)
-        val executor = GameToolExecutor(workspace)
+        // 条件引入机制：本轮允许的内置引擎（提示词已按此教学；写入校验同步裁决）
+        val allowedEngines = GameEngines.allowedFor(
+            plan.visualDimension,
+            plan.gameSystems,
+            QualityTier.normalize(_session.value.qualityTier)
+        )
+        val executor = GameToolExecutor(
+            workspace,
+            validate = { GameValidator.validate(it, allowedEngines) }
+        )
 
         var outcome = runToolLoop(
             llm = llm,
@@ -1043,6 +1052,8 @@ class GameAgent(
         // 可玩性自检轮随质量档位与回合类型分档：快速/轻量无自检、均衡一轮、精品两轮；
         // 修复轮除快速档外仅一轮回归自检。每轮自检后重新走校验+沙箱验收。
         val tier = QualityTier.normalize(_session.value.qualityTier)
+        // 条件引入机制：完成验收的引擎声明裁决与 executor/提示词同源。
+        val allowedEngines = GameEngines.allowedFor(plan.visualDimension, plan.gameSystems, tier)
         val selfReviews = ArrayDeque(GamePrompt.selfReviewPrompts(tier, fixTurn))
         // 精品档防敷衍增强（一次性）：自检期间零修改直通时注入丰富度增强指令。
         var enrichNudged = false
@@ -1142,7 +1153,7 @@ class GameAgent(
                 // 模型声称完成：以工作区内容为准重新校验，通过且（修改轮）确实
                 // 发生了内容变化才接受；防止模型不做任何修改就宣称完成。
                 if (content != null) {
-                    val report = GameValidator.validate(content)
+                    val report = GameValidator.validate(content, allowedEngines)
                     lastReport = report
                     if (!report.hasErrors) {
                         val changed = seedHash == null || GameFileWorkspace.sha256(content) != seedHash
@@ -1425,9 +1436,11 @@ class GameAgent(
         var feedback = ""
         // 兼容模式与工具模式共用同一组可玩性自检轮提示（随质量档位与回合类型分档），全部消费完才交付。
         val tier = QualityTier.normalize(_session.value.qualityTier)
+        // 条件引入机制：兼容回环的引擎声明裁决与工具模式同源。
+        val allowedEngines = GameEngines.allowedFor(plan.visualDimension, plan.gameSystems, tier)
         val legacyReviews = ArrayDeque(GamePrompt.selfReviewPrompts(tier, fixTurn))
         var round = startRound
-        var lastReport = GameValidator.validate(firstCandidate)
+        var lastReport = GameValidator.validate(firstCandidate, allowedEngines)
         // 精品档防敷衍增强（一次性，与工具模式同款）：兼容模式同样堵"零修改直通自检"的敷衍交付。
         var legacyEnrichNudged = false
         /**
@@ -1558,7 +1571,7 @@ class GameAgent(
                 agentStage = "校验中：正在对「$module」做语法与基本逻辑校验",
                 streamingText = null
             )
-            lastReport = GameValidator.validate(candidate)
+            lastReport = GameValidator.validate(candidate, allowedEngines)
             currentCoroutineContext().ensureActive()
 
             if (lastReport.hasErrors) {
@@ -1645,6 +1658,14 @@ class GameAgent(
         }
         append("用户指令：$instruction\n\n")
         append(GamePrompt.planContext(plan))
+        append("\n\n")
+        append(
+            GamePrompt.engineContract(
+                plan.visualDimension,
+                plan.gameSystems,
+                QualityTier.normalize(_session.value.qualityTier)
+            )
+        )
         append("\n\n")
         append(GamePrompt.tierPrompt(QualityTier.normalize(_session.value.qualityTier)))
         append("\n\n")
@@ -1954,6 +1975,14 @@ class GameAgent(
         val body = buildString {
             append("用户指令：$instruction\n\n")
             append(GamePrompt.planContext(plan))
+            append("\n\n")
+            append(
+                GamePrompt.engineContract(
+                    plan.visualDimension,
+                    plan.gameSystems,
+                    QualityTier.normalize(_session.value.qualityTier)
+                )
+            )
             append("\n\n")
             append(GamePrompt.tierPrompt(QualityTier.normalize(_session.value.qualityTier)))
             val leftovers = leftoverIssues()

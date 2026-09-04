@@ -220,7 +220,7 @@ object GameSystemCatalog {
         if (templateSpecific == null) {
             when (dimension) {
                 GameSchema.DIMENSION_2_5D -> result += "用 Canvas 2D 斜 45° 投影表现 2.5D"
-                GameSchema.DIMENSION_3D -> result += "用 Canvas 2D 透视投影模拟 3D，不引入 WebGL/模型资产"
+                GameSchema.DIMENSION_3D -> result += "用内置 three.js 引擎实现 3D（head 声明 ww-engine 由平台注入源码，几何纹理程序化生成）"
                 else -> result += "用 2D 精灵/几何图形绘制"
             }
             result += if (orientation == GameSchema.ORIENTATION_LANDSCAPE) {
