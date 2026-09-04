@@ -1,6 +1,10 @@
 package com.gamewishingwell.ui.game
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebView
@@ -35,6 +39,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -54,6 +59,13 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.gamewishingwell.agent.HtmlEnhancer
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.GameViewModel
+
+/** 从 Compose 上下文向上找宿主 Activity（LocalContext 通常是 Activity，稳妥起见遍历包装链）。 */
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -93,6 +105,22 @@ fun GameScreen(
     }
 
     LaunchedEffect(Unit) { vm.load(source, gameId); loadDone = true }
+
+    val landscape by vm.landscape.collectAsState()
+
+    // 画面方向（Game Schema）：横板游戏由平台请求横屏呈现——不依赖模型
+    // "canvas 自适应 + 用户自己横握手机"（WebView 不会跟随物理旋转自动变横）。
+    // 竖版游戏不强制旋转（沿用系统方向）；离开游戏页时恢复进入前的方向。
+    DisposableEffect(landscape) {
+        val activity = context.findActivity()
+        if (activity != null && landscape) {
+            val previous = activity.requestedOrientation
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            onDispose { activity.requestedOrientation = previous }
+        } else {
+            onDispose { }
+        }
+    }
 
     val loadHtml: (WebView, String) -> Unit = { view, h ->
         view.loadDataWithBaseURL(null, HtmlEnhancer.inject(h), "text/html", "UTF-8", null)

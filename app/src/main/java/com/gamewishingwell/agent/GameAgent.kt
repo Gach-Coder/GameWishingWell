@@ -1153,9 +1153,11 @@ class GameAgent(
                             }
                             // 快速档不做任何测试：跳过沙箱直接走交付判定；其余档位跑冒烟验证
                             // （失败则把错误作为观察回填继续修，同签名熔断同样生效）；
-                            // 均衡/精品档携带工作区功能断言（scenarios.json）一并执行。
+                            // 均衡/精品档携带工作区功能断言（scenarios.json）一并执行；
+                            // 横板游戏以横屏视口运行（与真实游戏页一致）并断言主画布方向。
+                            val expectLandscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
                             val scenariosJson = smokeScenariosJson(workspace, tier)
-                            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(content, scenariosJson)
+                            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(content, scenariosJson, expectLandscape)
                             sandboxAttempts += smoke?.attempts ?: 0
                             if (smoke != null && smoke.message == "sandbox-infra") {
                                 failTurn(
@@ -1453,7 +1455,8 @@ class GameAgent(
                 workingHtml = firstCandidate
             } else {
             // 静态校验通过：轻量及以上档位过沙箱冒烟才能交付（快速档跳过测试）。
-            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(firstCandidate)
+            val expectLandscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
+            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(firstCandidate, landscape = expectLandscape)
             if (smoke == null || smoke.passed) {
                 val review = legacyReviews.removeFirstOrNull()
                 if (review == null) {
@@ -1570,8 +1573,8 @@ class GameAgent(
                 continue
             }
 
-            // 静态校验通过：轻量及以上档位过沙箱冒烟（快速档跳过测试）。
-            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(candidate)
+            // 静态校验通过：轻量及以上档位过沙箱冒烟（快速档跳过测试）；横板按横屏视口。
+            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(candidate, landscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE)
             if (smoke != null && !smoke.passed) {
                 val smokeErrors = (smoke.errors + listOfNotNull(smoke.message?.takeIf { it == "smoke-timeout" }))
                     .filter { it.isNotBlank() }
@@ -1724,7 +1727,11 @@ class GameAgent(
         return GameScenarios.toJson(scenarios)
     }
 
-    private suspend fun runSmokeTest(html: String, scenariosJson: String? = null): SmokeTestResult? {
+    private suspend fun runSmokeTest(
+        html: String,
+        scenariosJson: String? = null,
+        landscape: Boolean = false
+    ): SmokeTestResult? {
         // null = 无可用 runner（JVM 单测）：跳过沙箱。真机上 runner 恒存在，
         // 设施异常一律返回哨兵并以"运行验证环境异常"退出——不借设施问题放行交付。
         val runner = smokeRunner ?: return null
@@ -1740,7 +1747,8 @@ class GameAgent(
             val result = runner.run(
                 html,
                 deep = QualityTier.normalize(_session.value.qualityTier) == QualityTier.PREMIUM,
-                scenariosJson = scenariosJson
+                scenariosJson = scenariosJson,
+                landscape = landscape
             )
             if (!result.passed && result.errors.isEmpty() && result.message != "smoke-timeout") {
                 android.util.Log.w("GameAgent", "沙箱结果不可读：${result.message}")

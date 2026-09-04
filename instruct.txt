@@ -60,8 +60,11 @@ Agent处理message流程如下：
 	→ 识别层：
 		检测 Game Schema JSON 会话级的游戏Json 是否为空：
 			Json为空 → 对话历史不包含游戏 → 默认为首次 dev 对话
-			Json非空 → 对话已经锚定某游戏 
-		正则 + Lite LLM 抽取游戏特征（除非用户说明，按该游戏类型的核心+标配系统集合识别），补全或修正 Game Schema JSON 信息（先过 JSON Schema +枚举白名单校验，非法值拒绝或映射默认值）
+			Json非空 → 对话已经锚定某游戏
+		正则 + Lite LLM 抽取游戏特征（除非用户说明，按该游戏类型的核心+标配系统集合识别），补全或修正 Game Schema JSON 信息
+			（先过 JSON Schema +枚举白名单校验：方向/维度的同义写法先归一化——横屏/横版/landscape→横板、竖屏/portrait→竖版、
+			  2d/二维→2D、伪3d→2.5D、三维→3D——归一化在 Lite LLM 解析出口与 validate 双侧生效；
+			  不归一化时白名单会把 Lite LLM 常回的"横屏"静默映射成默认竖版，用户明确要横板却被翻成竖版；非法值仍映射默认值）
 	 		若返回为空实体，则判断 message 为普通 chat （意图层可能误判漏判）
 		解析实体包括：
 			画面维度：2D，2.5D，3D
@@ -145,10 +148,15 @@ Agent处理message流程如下：
 			工具失效降级：连续 2 轮既无工具调用也无代码输出（模型不支持/未启用 function calling，如实测 glm-5.3-flash）
 			→ 整体降级为兼容回环——工具模式提示词禁止正文输出代码，会把这类模型锁死成"只能干聊"；
 			兼容回环入口带 seedHash 防假修改闸：输出与种子完全一致时拒绝，要求输出包含修改的新版本
-		校验体系（沙箱唯一裁决）：运行正确性的唯一校验来源是沙箱——同内核 WebView 直载探针注入后的游戏 HTML
-			（不用 iframe/srcdoc——实测模拟器上 iframe 加载/结果读取链路不可靠，历史累计 200+ 次超时，且 srcdoc 的 opaque origin 引发跨源异常）；
+	校验体系（沙箱唯一裁决）：运行正确性的唯一校验来源是沙箱——同内核 WebView 直载探针注入后的游戏 HTML
+		（不用 iframe/srcdoc——实测模拟器上 iframe 加载/结果读取链路不可靠，历史累计 200+ 次超时，且 srcdoc 的 opaque origin 引发跨源异常）；
+		视口方向随 Game Schema：横板游戏按 640×360 横屏视口运行（竖版按 360×640），与真实游戏页的横屏呈现一致；
 			探针跑帧捕获异常（24帧×50ms/帧≈1.2s游戏时间）+ 全局 error 监听（含事件回调）+ console error 采集 + 多点触控派发（中心/底部中央/左右下侧的 touchstart/touchend/click + 一次拖动，开始后与跑帧中段各一轮，让"开始"类交互真实触发并进入运行态）
 			+ localStorage 内存 stub + 顶部保留区扫描（约110px 平台操作条区域内出现 button/a/input 等可交互元素即判失败回传，平台自身 __ww 前缀元素除外；左右无文字标签、中央仅极短状态文字由生成提示词约束）
+			+ 画面方向与铺满断言（orientation-mismatch / canvas-not-fullscreen，跑沙箱的档位生效）：按 Game Schema 注入方向期望，
+			  取面积最大的可见 canvas 为主画布，横板要求视觉宽>高、竖版要求高>宽（getBoundingClientRect 反映 transform 后视觉盒，
+			  旋转画布实现同样正确判定）——拦"把关卡做成横向卷轴但画面仍是竖版"的假横板交付；同时断言主画布宽≥85% 视口宽、高≥60% 视口高
+			  ——拦"固定逻辑分辨率+等比缩放居中"的黑边适配（宽屏左右大片空白）；无 canvas 的 DOM 游戏跳过（白屏检测兜底）
 			+ restart() 契约检查（全档：全局 restart() 函数缺失即判失败回传；精品档 deep 模式额外真实调用 restart() 完整重开后复跑 12 帧，验证"完整重开"不抛错）
 			+ 可观测性契约断言（全档）：生成契约要求游戏暴露 window.__wwDebugState() 状态快照
 			  （静态校验先行检查函数存在），沙箱跑满帧后调用它做通用不变量检查——
@@ -216,6 +224,16 @@ Agent处理message流程如下：
 	→ HTML+CSS+JS game
 		game_generated = True
 	→（用户进入游戏测试和游玩）
+		画面方向平台侧消费（横板承诺的最终兑现，与档位无关）：GameScreen 从持久化 agent_state.json 读 Game Schema 的
+		  screenOrientation，横板游戏请求 Activity 横屏（SCREEN_ORIENTATION_SENSOR_LANDSCAPE，MainActivity 已配置
+		  orientation|screenSize configChanges 不重建、WebView 保持页面并触发页面 resize），离开游戏页恢复原方向；
+		  竖版游戏不强制旋转。生成提示词同步携带画面方向与适配硬性契约：
+		  ① 方向：主画布宽高比与 orientation 一致（横板≠横向卷轴玩法+竖版/窄幅画面）；
+		  ② 铺满：以窗口实际尺寸为逻辑分辨率全屏自适应，禁止固定逻辑分辨率等比缩放留黑边；
+		  ③ 禁自旋转：平台已保证横屏视口，游戏自行 rotate 会二次旋转；
+		  ④ 触控布局标准：横板动作类=左下并排 ◀▶ 方向键（可见半透明、各≥64px）+右下跳跃大键（≥80px），
+		    方向语义=触点横向位置（严禁用触点纵向位置决定左右），多点触控按 identifier 跟踪、方向与跳跃可同按，
+		    支持拇指不离屏滑动切换方向；竖版游戏控件置底部一排或两角。
 		→ 运行时报错（格式化回传：file:line + stack + console 片段）再回到Agent Loop 修复
 		→ 运行无报错，用户可选择输入文本改进游戏或报告缺陷，则回到Agent Loop 修复
 		→ 更新 GameSession 并持久化（代码 + rolling summary：
@@ -226,7 +244,7 @@ Agent处理message流程如下：
 | 质量门 | 快速 | 轻量 | 均衡 | 精品 |
 | --- | --- | --- | --- | --- |
 | 静态产品契约（自包含/eval 禁令/__wwDebugState 存在） | ✅ | ✅ | ✅ | ✅ |
-| 沙箱运行门（跑帧+异常+白屏+保留区+不变量） | ❌ | ✅ | ✅ | ✅ |
+| 沙箱运行门（跑帧+异常+白屏+保留区+不变量+画面方向） | ❌ | ✅ | ✅ | ✅ |
 | deep 重开验证（真实调 restart() 复跑 12 帧） | ❌ | ❌ | ❌ | ✅ |
 | 功能断言（scenarios.json 行为验证） | ❌ | ❌ | ✅ | ✅ |
 | 可玩性自检轮（有据自查） | ❌ | ❌ | 1 轮内容完整性 | 2 轮（+丰富度打磨） |
@@ -308,7 +326,7 @@ GameWishingWell/
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
 	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令）；运行校验由沙箱承担
 	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控
-	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试 + 功能断言执行
+	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试 + 功能断言执行 + 画面方向断言（横板按横屏视口运行）
       │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入 / 行级 patch
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
       │  │  │  ├─ QualityGate.kt         # 两段式自检 verdict
@@ -331,7 +349,7 @@ GameWishingWell/
       │  │     ├─ Container.kt              # 从 Application 获取容器
       │  │     ├─ home/HomeScreen.kt        # 我的游戏页
       │  │     ├─ chat/ChatScreen.kt        # 创作/编辑对话页
-      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页
+      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复）
       │  │     ├─ settings/SettingsScreen.kt # 设置页
       │  │     └─ viewmodels/
       │  │        ├─ HomeViewModel.kt

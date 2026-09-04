@@ -27,8 +27,16 @@ interface SmokeTestRunner {
      * 额外真实调用 restart() 完整重开后复跑半程帧，验证重开契约。
      * [scenariosJson] 为功能断言（均衡/精品档，标准 JSON 数组文本，null=无断言）：
      * 主跑帧通过后在同一探针内逐条执行（点按/拖动→推进帧→比对 __wwDebugState() 快照）。
+     * [landscape] 为画面方向（Game Schema 的 screenOrientation==横板 时 true）：
+     * 沙箱以横屏视口（640×360）运行，与真实游戏页的横屏呈现一致；收尾断言主画布
+     * 宽>高（竖版游戏按竖屏视口运行并断言高>宽），拦"口头横屏化、画面仍竖版"的假交付。
      */
-    suspend fun run(html: String, deep: Boolean = false, scenariosJson: String? = null): SmokeTestResult
+    suspend fun run(
+        html: String,
+        deep: Boolean = false,
+        scenariosJson: String? = null,
+        landscape: Boolean = false
+    ): SmokeTestResult
 }
 
 @kotlinx.serialization.Serializable
@@ -48,7 +56,7 @@ data class SmokeTestResult(
 )
 
 object NoopSmokeTestRunner : SmokeTestRunner {
-    override suspend fun run(html: String, deep: Boolean, scenariosJson: String?): SmokeTestResult =
+    override suspend fun run(html: String, deep: Boolean, scenariosJson: String?, landscape: Boolean): SmokeTestResult =
         SmokeTestResult(passed = true, message = "noop-smoke-runner")
 }
 
@@ -72,7 +80,7 @@ object SmokeTestProbe {
     const val RESERVED_TOP_PX = 110
     private const val MARKER = "__wwSmokeInstalled"
 
-    fun inject(html: String, deep: Boolean = false, scenariosJson: String? = null): String {
+    fun inject(html: String, deep: Boolean = false, scenariosJson: String? = null, landscape: Boolean = false): String {
         if (html.contains(MARKER)) return html
         // 场景断言数据用 <script type="application/json"> 承载（放在探针脚本之前，
         // 解析时元素已可用）：避免把 JSON 内嵌进 JS 字符串字面量的转义问题；
@@ -131,6 +139,10 @@ object SmokeTestProbe {
               var __pokedInitial = false; // 首帧后的首轮交互只做一次
               // deep（精品档）：restart() 真实重开后复跑半程帧，验证"完整重开"契约。
               var __deep = ${if (deep) "true" else "false"};
+              // 画面方向期望（宿主按 Game Schema 注入）：横板断言主画布宽>高，
+              // 竖版断言高>宽。getBoundingClientRect 反映 transform 后的视觉盒，
+              // 旋转画布实现的横板游戏同样按宽>高判定。
+              var __landscape = ${if (landscape) "true" else "false"};
               var phase = 1;   // 1=首次运行 2=restart 后复跑
               var limit = ${MAX_FRAMES};
               window.requestAnimationFrame = function(cb){
@@ -351,6 +363,7 @@ object SmokeTestProbe {
                   restartPresenceCheck();
                   blankCheck();
                   reservedAreaCheck();
+                  orientationCheck();
                   debugStateCheck(false);
                   // 功能断言：主跑帧与不变量检查全绿后才执行（有错时先修运行问题），
                   // 之后才进入 deep 复跑——断言自身会调用 restart() 重置。
@@ -478,6 +491,37 @@ object SmokeTestProbe {
                   }
                 } catch (e) {}
               }
+              // 画面方向断言（Game Schema 契约）：取面积最大的可见 canvas 为主画布，
+              // 其视觉宽高比必须与 design_schema 的 orientation 一致。拦"把关卡做成
+              // 横向卷轴但画面仍是竖版"的假横板——这正是玩家投诉"说是横屏实际竖屏"的来源。
+              // 同时检查铺满程度：主画布宽度应占视口宽 ≥85%、高度占 ≥60%——拦"固定逻辑
+              // 分辨率 + 等比缩放居中"的黑边适配（宽屏左右大片空白）。
+              // 无 canvas 的 DOM 游戏跳过（内容检测由白屏检查兜底）。
+              function orientationCheck(){
+                try {
+                  var canvases = document.querySelectorAll('canvas');
+                  var main = null, mainArea = 0;
+                  for (var i = 0; i < canvases.length; i++) {
+                    var r = canvases[i].getBoundingClientRect();
+                    if (r.width <= 1 || r.height <= 1) continue;
+                    var area = r.width * r.height;
+                    if (area > mainArea) { mainArea = area; main = r; }
+                  }
+                  if (!main) return;
+                  var w = Math.round(main.width), h = Math.round(main.height);
+                  if (__landscape && w <= h) {
+                    window.__wwSmokeResult.errors.push('orientation-mismatch: 画面方向应为横板（主画布宽>高），实际主画布为 ' + w + 'x' + h + '。横板游戏不能只把关卡做成横向卷轴而保持竖版/窄幅画面：平台会以横屏视口加载，直接以窗口实际尺寸为逻辑分辨率全屏铺满即可，不要旋转画布');
+                  } else if (!__landscape && h <= w) {
+                    window.__wwSmokeResult.errors.push('orientation-mismatch: 画面方向应为竖版（主画布高>宽），实际主画布为 ' + w + 'x' + h + '；请按竖屏视口布局');
+                  }
+                  var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+                  if (vw > 0 && vh > 0 && main.width >= vw * 0.5) {
+                    if (main.width < vw * 0.85 || main.height < vh * 0.6) {
+                      window.__wwSmokeResult.errors.push('canvas-not-fullscreen: 主画布 ' + w + 'x' + h + ' 未铺满视口 ' + Math.round(vw) + 'x' + Math.round(vh) + '（要求宽≥85%、高≥60%）。禁止固定逻辑分辨率后等比缩放居中留黑边——应以窗口实际尺寸为逻辑分辨率全屏自适应');
+                    }
+                  }
+                } catch (e) {}
+              }
               // 看门狗已移除：离屏页面的 setTimeout 可能被冻结（永不触发）；
               // 超时的真边界是宿主侧外层超时（TIMEOUT_MS），frames=0 的超时由上层判设施异常。
             })();
@@ -506,15 +550,20 @@ object SmokeTestProbe {
 class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner {
 
     @SuppressLint("SetJavaScriptEnabled")
-    override suspend fun run(html: String, deep: Boolean, scenariosJson: String?): SmokeTestResult {
-        val prepared = HtmlEnhancer.inject(SmokeTestProbe.inject(html, deep, scenariosJson))
+    override suspend fun run(
+        html: String,
+        deep: Boolean,
+        scenariosJson: String?,
+        landscape: Boolean
+    ): SmokeTestResult {
+        val prepared = HtmlEnhancer.inject(SmokeTestProbe.inject(html, deep, scenariosJson, landscape))
         val timeoutMs = if (deep) DEEP_TIMEOUT_MS else TIMEOUT_MS
         // 设施类失败（零帧冻结/结果不可读）重建 WebView 重试：实测该故障间歇性发作
         // （曾连续五回合在 LLM 工作全部完成后死在沙箱、之后自愈），新实例大概率落到
         // 健康 renderer 上；游戏自身错误（有错误文本/帧有推进）不属于此类，不重试。
         var last = SmokeTestResult(false, errors = listOf("冒烟测试超时"), message = "smoke-timeout")
         repeat(MAX_ATTEMPTS) { attempt ->
-            val result = runOnce(prepared, timeoutMs)
+            val result = runOnce(prepared, timeoutMs, landscape)
             last = result.copy(attempts = attempt + 1)
             if (!isRetryableInfraFailure(result)) return last
             if (attempt < MAX_ATTEMPTS - 1) {
@@ -524,7 +573,7 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         return last
     }
 
-    private suspend fun runOnce(prepared: String, timeoutMs: Long): SmokeTestResult =
+    private suspend fun runOnce(prepared: String, timeoutMs: Long, landscape: Boolean): SmokeTestResult =
         withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { cont ->
                 val main = Handler(Looper.getMainLooper())
@@ -623,7 +672,9 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                     view.settings.allowContentAccess = false
                     view.settings.useWideViewPort = true
                     view.settings.loadWithOverviewMode = true
-                    view.layout(0, 0, 360, 640)
+                    // 视口方向与真实游戏页一致：横板游戏在 GameScreen 中以横屏呈现，
+                    // 沙箱同样按横屏 640×360 运行（竖版按 360×640），方向断言才有意义。
+                    if (landscape) view.layout(0, 0, 640, 360) else view.layout(0, 0, 360, 640)
                     view.webChromeClient = object : WebChromeClient() {
                         override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
                             if (consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {

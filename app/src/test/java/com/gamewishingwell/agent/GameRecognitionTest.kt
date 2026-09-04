@@ -209,4 +209,66 @@ class GameRecognitionTest {
         val decoded = json.decodeFromString<GameSchema>(encoded)
         assertEquals(schema, decoded)
     }
+
+    @Test
+    fun `方向与维度的同义写法归一化为枚举规范值`() {
+        // Lite LLM 常回 "横屏/竖屏/landscape/portrait" 等口语值，必须归一化，
+        // 否则白名单会把 "横屏" 静默映射成默认竖版（用户要横板被翻成竖版）。
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, GameSchema.normalizeOrientation("横屏"))
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, GameSchema.normalizeOrientation("横版"))
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, GameSchema.normalizeOrientation("Landscape"))
+        assertEquals(GameSchema.ORIENTATION_PORTRAIT, GameSchema.normalizeOrientation("竖屏"))
+        assertEquals(GameSchema.ORIENTATION_PORTRAIT, GameSchema.normalizeOrientation("portrait"))
+        assertEquals("横板", GameSchema.normalizeOrientation("横板"))
+        assertNull(GameSchema.normalizeOrientation("外星方向"))
+        assertNull(GameSchema.normalizeOrientation(null))
+        assertNull(GameSchema.normalizeOrientation(""))
+
+        assertEquals(GameSchema.DIMENSION_2D, GameSchema.normalizeDimension("2d"))
+        assertEquals(GameSchema.DIMENSION_2D, GameSchema.normalizeDimension("二维"))
+        assertEquals(GameSchema.DIMENSION_2_5D, GameSchema.normalizeDimension("伪3d"))
+        assertEquals(GameSchema.DIMENSION_3D, GameSchema.normalizeDimension("三维"))
+        assertNull(GameSchema.normalizeDimension("4D"))
+        assertNull(GameSchema.normalizeDimension(null))
+    }
+
+    @Test
+    fun `validate 把同义方向值归一化而不是翻成默认竖版`() {
+        val landscape = GameSchema(screenOrientation = "横屏")
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, GameSchemaValidator.validate(landscape).screenOrientation)
+
+        val portrait = GameSchema(screenOrientation = "竖屏")
+        assertEquals(GameSchema.ORIENTATION_PORTRAIT, GameSchemaValidator.validate(portrait).screenOrientation)
+
+        // 非法值仍回落默认（2D/竖版），保持旧行为
+        assertEquals(GameSchema.DIMENSION_2D, GameSchemaValidator.validate(GameSchema(visualDimension = "4D")).visualDimension)
+        assertEquals(GameSchema.ORIENTATION_PORTRAIT, GameSchemaValidator.validate(GameSchema(screenOrientation = "方形")).screenOrientation)
+    }
+
+    @Test
+    fun `识别层 Lite LLM 回复中的同义方向值参与合并且不翻转用户明确值`() {
+        // Lite LLM 回 "横屏"：解析出口归一化为 "横板"
+        val landscapePatch = GameSchemaValidator.parseLiteLlmReply(
+            """{"visualDimension":"2D","screenOrientation":"横屏","gameSystems":["平台跳跃"],"confidence":0.8}"""
+        )
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, landscapePatch?.screenOrientation)
+
+        // Lite LLM 缺省填 "竖屏"、正则明确抽出横板时：合并结果以正则为准
+        val regex = RecognitionEngine.extractLocal("制作一个横板的超级玛丽")
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, regex.screenOrientation)
+        val portraitPatch = GameSchemaValidator.parseLiteLlmReply(
+            """{"visualDimension":"2D","screenOrientation":"竖屏","gameSystems":[],"confidence":0.8}"""
+        )
+        val merged = RecognitionEngine.merge(regex, portraitPatch)
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, merged.screenOrientation)
+
+        // 完整识别链路：横板需求 + Lite LLM 缺省竖屏 → 最终 Schema 仍是横板
+        val recognized = RecognitionEngine.recognize("制作一个横板的超级玛丽", null, portraitPatch)
+        assertEquals(GameSchema.ORIENTATION_LANDSCAPE, recognized.gameSchema.screenOrientation)
+        // 策划层派生的验收清单与提示词携带同一方向，横板游戏沙箱按横屏视口运行
+        val plan = PlanningEngine.build(recognized.gameSchema)
+        assertTrue(plan.templateClass.contains("横板"))
+        assertTrue(plan.acceptanceChecklist.any { it.contains("横板") })
+        assertTrue(plan.excludedApproaches.any { it.contains("竖版") })
+    }
 }

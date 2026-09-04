@@ -355,6 +355,32 @@ data class GameSchema(
 
         const val ORIENTATION_LANDSCAPE = "横板"
         const val ORIENTATION_PORTRAIT = "竖版"
+
+        private val landscapePattern = Regex("横板|横版|横屏|landscape|水平", RegexOption.IGNORE_CASE)
+        private val portraitPattern = Regex("竖版|竖屏|portrait|竖直|垂直", RegexOption.IGNORE_CASE)
+
+        /**
+         * 画面方向口语值归一化：LLM 常回 "横屏/横版/landscape" 等同义写法，
+         * 枚举白名单只认规范值——不归一化会把"横屏"静默映射成默认竖版
+         * （用户明确要横板却被翻成竖版）。无法识别时返回 null，不猜默认。
+         */
+        fun normalizeOrientation(value: String?): String? = when {
+            value.isNullOrBlank() -> null
+            landscapePattern.containsMatchIn(value) -> ORIENTATION_LANDSCAPE
+            portraitPattern.containsMatchIn(value) -> ORIENTATION_PORTRAIT
+            else -> null
+        }
+
+        /** 画面维度同义值归一化（2d/二维/平面 → 2D 等）；无法识别返回 null。 */
+        fun normalizeDimension(value: String?): String? {
+            if (value.isNullOrBlank()) return null
+            return when (value.trim().lowercase()) {
+                "2d", "二维", "平面", "2维" -> DIMENSION_2D
+                "2.5d", "伪3d", "斜45" -> DIMENSION_2_5D
+                "3d", "三维", "立体", "3维" -> DIMENSION_3D
+                else -> null
+            }
+        }
     }
 
     val hasMeaningfulFeatures: Boolean
@@ -408,21 +434,15 @@ object GameSchemaValidator {
 
     /**
      * JSON Schema + 枚举白名单校验。
-     * 非法画面维度/方向映射默认值，非法系统丢弃；templateId 不在模板库时置 null。
+     * 同义值先归一化（横屏→横板、二维→2D 等），非法值才映射默认值；
+     * 非法系统丢弃；templateId 不在模板库时置 null。
      */
     fun validate(schema: GameSchema): GameSchema {
-        val dimension = if (schema.visualDimension in setOf(
-                GameSchema.DIMENSION_2D,
-                GameSchema.DIMENSION_2_5D,
-                GameSchema.DIMENSION_3D
-            )
-        ) schema.visualDimension else GameSchema.DIMENSION_2D
+        val dimension = GameSchema.normalizeDimension(schema.visualDimension)
+            ?: GameSchema.DIMENSION_2D
 
-        val orientation = if (schema.screenOrientation in setOf(
-                GameSchema.ORIENTATION_LANDSCAPE,
-                GameSchema.ORIENTATION_PORTRAIT
-            )
-        ) schema.screenOrientation else GameSchema.ORIENTATION_PORTRAIT
+        val orientation = GameSchema.normalizeOrientation(schema.screenOrientation)
+            ?: GameSchema.ORIENTATION_PORTRAIT
 
         val requested = schema.requestedSystems
             .filter { GameSystemCatalog.isValid(it) }
@@ -476,9 +496,11 @@ object GameSchemaValidator {
             null
         } ?: return null
 
+        // 归一化放在解析出口：merge 的"Lite LLM 缺省竖版回退正则"保护分支
+        // 只认规范值，不归一化的 "竖屏" 会绕过保护、"横屏" 会在白名单被翻成竖版。
         return GameSchemaPatch(
-            visualDimension = obj.string("visualDimension")?.takeIf { it.isNotBlank() },
-            screenOrientation = obj.string("screenOrientation")?.takeIf { it.isNotBlank() },
+            visualDimension = GameSchema.normalizeDimension(obj.string("visualDimension")),
+            screenOrientation = GameSchema.normalizeOrientation(obj.string("screenOrientation")),
             gameSystems = obj.stringList("gameSystems").filter { it.isNotBlank() },
             excludedSystems = obj.stringList("excludedSystems").filter { it.isNotBlank() },
             reAddSystems = obj.stringList("reAddSystems").filter { it.isNotBlank() },

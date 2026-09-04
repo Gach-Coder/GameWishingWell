@@ -3,6 +3,8 @@ package com.gamewishingwell.ui.viewmodels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.gamewishingwell.agent.GameAgent
+import com.gamewishingwell.agent.GameSchema
+import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.data.GameRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -10,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 
 class GameViewModel(
     private val repository: GameRepository,
@@ -26,22 +29,37 @@ class GameViewModel(
     private val _loadedGameId = MutableStateFlow<Long?>(null)
     val loadedGameId: StateFlow<Long?> = _loadedGameId.asStateFlow()
 
+    /** 游戏 Schema 的画面方向（true = 横板）：游戏页据此请求横屏呈现。 */
+    private val _landscape = MutableStateFlow(false)
+    val landscape: StateFlow<Boolean> = _landscape.asStateFlow()
+
+    private val sessionJson = Json { ignoreUnknownKeys = true }
+
     fun load(source: String, gameId: Long) {
         viewModelScope.launch {
-            val (html, id) = withContext(Dispatchers.IO) {
+            val (html, id, landscape) = withContext(Dispatchers.IO) {
                 if (source == "game" && gameId > 0) {
                     val h = repository.loadGameHtml(gameId)
                     if (h != null) repository.touchPlay(gameId)
-                    h to gameId
+                    Triple(h, gameId, sessionLandscape(repository.loadGameAgentState(gameId)))
                 } else {
-                    repository.loadDraftHtml() to null
+                    Triple(repository.loadDraftHtml(), null, sessionLandscape(repository.loadDraftAgentState()))
                 }
             }
             _html.value = html
             _loadedGameId.value = id
+            _landscape.value = landscape
             _jsError.value = null
         }
     }
+
+    /** 从持久化的 agent_state.json 读画面方向；缺失/解析失败按竖版处理（不强制旋转）。 */
+    private fun sessionLandscape(raw: String?): Boolean = runCatching {
+        raw?.let {
+            sessionJson.decodeFromString<GameSession>(it).gameSchema?.screenOrientation ==
+                GameSchema.ORIENTATION_LANDSCAPE
+        } ?: false
+    }.getOrDefault(false)
 
     fun onJsError(message: String) {
         // 同一页面反复报同一个错时保留第一条，避免覆盖层闪烁；
