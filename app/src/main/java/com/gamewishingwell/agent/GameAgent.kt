@@ -1080,11 +1080,11 @@ class GameAgent(
         while (true) {
             round++
             currentCoroutineContext().ensureActive()
-            val module = moduleForRound(plan, round)
+            val file = GameFileWorkspaceEntryPoint.DEFAULT
             val genStage = if (firstGeneration) {
-                "代码生成中（工具模式）：正在生成「$module」· 第 $round 轮 · ${QualityTier.label(tier)}档"
+                "代码生成中（工具模式）：正在生成 $file 第 $round 轮"
             } else {
-                "代码修改中（工具模式）：正在处理「$module」· 第 $round 轮 · ${QualityTier.label(tier)}档"
+                "代码修改中（工具模式）：正在修改 $file 第 $round 轮"
             }
             _session.value = _session.value.copy(agentStage = genStage, streamingText = null)
 
@@ -1525,11 +1525,11 @@ class GameAgent(
         while (true) {
             round++
             currentCoroutineContext().ensureActive()
-            val module = moduleForRound(plan, round)
+            val file = GameFileWorkspaceEntryPoint.DEFAULT
             val genStage = if (existingHtml.isNullOrBlank()) {
-                "代码生成中：正在生成「$module」系统模块（兼容模式）· 第 $round 轮"
+                "代码生成中（兼容模式）：正在生成 $file 第 $round 轮"
             } else {
-                "代码修改中：正在处理「$module」系统模块（兼容模式）· 第 $round 轮"
+                "代码修改中（兼容模式）：正在修改 $file 第 $round 轮"
             }
             _session.value = _session.value.copy(agentStage = genStage, streamingText = null)
 
@@ -1568,7 +1568,7 @@ class GameAgent(
             val candidate = extracted.html
             _session.value = _session.value.copy(
                 currentHtml = candidate,
-                agentStage = "校验中：正在对「$module」做语法与基本逻辑校验",
+                agentStage = "校验中：正在对 $file 做语法与基本逻辑校验",
                 streamingText = null
             )
             lastReport = GameValidator.validate(candidate, allowedEngines)
@@ -1581,7 +1581,7 @@ class GameAgent(
                     ErrorSignature.hash(ErrorSignature.normalize(lastReport.errors.joinToString(";") { it.message }))
                 )
                 _session.value = _session.value.copy(
-                    agentStage = "校验中：正在为「$module」系统生成修复方案"
+                    agentStage = "校验中：正在为 $file 生成修复方案"
                 )
                 continue
             }
@@ -1834,12 +1834,6 @@ class GameAgent(
     }.trimEnd()
 
     /** 子阶段显示的当前系统模块：按轮次在系统列表中轮换，避免只显示固定主系统。 */
-    private fun moduleForRound(plan: DesignPlan, round: Int): String {
-        val systems = plan.gameSystems
-        if (systems.isEmpty()) return plan.primarySystem.ifBlank { "核心玩法" }
-        val index = ((round - 1) % systems.size + systems.size) % systems.size
-        return systems[index]
-    }
 
     private fun classifyFailure(report: ValidationReport): ErrorCategory {
         val messages = report.errors.joinToString(" ") { it.category + ":" + it.message }
@@ -2069,7 +2063,7 @@ class GameAgent(
                     sb.append(delta)
                     if (stageLabel != null && sb.length - lastProgressMark >= 200) {
                         lastProgressMark = sb.length
-                        _session.value = _session.value.copy(agentStage = "$stageLabel · 已接收 ${sb.length} 字符")
+                        _session.value = _session.value.copy(agentStage = "$stageLabel 已接收 ${sb.length} 字符")
                     }
                 },
                 onThinking = { /* 思考过程属于内部信号，不回显到前端 */ },
