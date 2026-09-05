@@ -105,6 +105,57 @@ internal fun formatAgentDuration(ms: Long): String {
 }
 
 /**
+ * LLM 失败分类（internal 供单测）：
+ * - 账户额度/计费类不可重试且需要如实的用户文案——GLM 以 429+code1113 表达"余额不足"、
+ *   DeepSeek 以 402 表达 Insufficient Balance；这类确定性失败若按 429 当限流重试，
+ *   会白烧退避时间并把"服务不可用"伪装成"网络波动"（实测连重试 4 次后仍报网络异常）。
+ * - 鉴权/模型不存在类同理：重试无意义，直接以服务状态文案失败。
+ */
+internal object LlmFailureClassifier {
+
+    private val BALANCE_PATTERN = Regex(
+        "API 错误 402|余额|insufficient[_\\s]?balance|arrear|欠费|充值|资源包|\"code\":\"1113\"",
+        RegexOption.IGNORE_CASE
+    )
+
+    fun isBalanceExhausted(e: Exception): Boolean {
+        val msg = e.message ?: return false
+        return BALANCE_PATTERN.containsMatchIn(msg)
+    }
+
+    /** 可重试判定：IO 异常、超时/连接类文本、服务端过载（5xx / 429 真限流 / overloaded）。 */
+    fun isRetryable(e: Exception): Boolean {
+        if (isBalanceExhausted(e)) return false
+        if (e is IOException) return true
+        val msg = e.message ?: ""
+        if (Regex("API 错误 5\\d\\d").containsMatchIn(msg)) return true
+        if (msg.contains("429")) return true
+        // Anthropic SSE error 事件（529 overloaded_error 等）没有数字状态码，按类型识别。
+        if (msg.contains("overloaded_error", ignoreCase = true)) return true
+        return Regex("timeout|timed out|connection|reset|unreachable|broken pipe|EOF", RegexOption.IGNORE_CASE)
+            .containsMatchIn(msg)
+    }
+
+    /**
+     * 非重试失败的如实用户文案（LLM 服务状态，不是技术细节）；null=走通用网络失败文案。
+     */
+    fun userMessage(e: Exception): String? {
+        val msg = e.message ?: return null
+        return when {
+            isBalanceExhausted(e) ->
+                "LLM 服务不可用：账户余额不足或配额已耗尽，进度已保留。请到服务商账户充值后重试。"
+            Regex("API 错误 40[13]").containsMatchIn(msg) ||
+                msg.contains(Regex("invalid[_\\s]?api[_\\s]?key|authentication|unauthorized", RegexOption.IGNORE_CASE)) ->
+                "LLM 服务不可用：API Key 无效或无访问权限，进度已保留。请在设置中检查密钥。"
+            Regex("API 错误 404").containsMatchIn(msg) ||
+                msg.contains(Regex("model.*(not.*(found|exist)|unavailable)", RegexOption.IGNORE_CASE)) ->
+                "LLM 服务不可用：模型或地址不可用，进度已保留。请在设置中检查模型名与 Base URL。"
+            else -> null
+        }
+    }
+}
+
+/**
  * 游戏创作 Agent。流程按 game_generated 分流：
  * false（首次创建）：意图层(dev/chat) → 识别层(Game Schema JSON) → 策划草案 → 确认门 → 决策层 → Agent Loop；
  * true（已产出游戏）：dev 消息跳过识别/策划/确认门直达 Agent Loop（修复快车道为其中的状态特例）。
@@ -1058,7 +1109,7 @@ class GameAgent(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            failTurn("回复失败，请重试。", internalDetail = "对话 LLM 调用失败：${e.message}")
+            failTurn(LlmFailureClassifier.userMessage(e) ?: "回复失败，请重试。", internalDetail = "对话 LLM 调用失败：${e.message}")
             return
         }
         val text = HtmlExtractor.nonCodeText(reply).ifBlank { "（空回复）" }
@@ -1329,7 +1380,8 @@ class GameAgent(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                failTurn(USER_MSG_NETWORK, internalDetail = "LLM 调用失败：${e.message}")
+                // 账户额度/鉴权/模型类失败给出如实的"LLM 服务不可用"文案，不再误报为网络异常
+                failTurn(LlmFailureClassifier.userMessage(e) ?: USER_MSG_NETWORK, internalDetail = "LLM 调用失败：${e.message}")
                 return GenOutcome.Failed
             }
             currentCoroutineContext().ensureActive()
@@ -1818,7 +1870,7 @@ class GameAgent(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                failTurn(USER_MSG_NETWORK, internalDetail = "兼容模式 LLM 调用失败：${e.message}")
+                failTurn(LlmFailureClassifier.userMessage(e) ?: USER_MSG_NETWORK, internalDetail = "兼容模式 LLM 调用失败：${e.message}")
                 return GenOutcome.Failed
             }
 
@@ -2279,25 +2331,14 @@ class GameAgent(
                 // 停止键/调整取消 OkHttp 调用会表现为 IO 异常：协程已取消时
                 // 不再进入退避重试（实测 ADJUST 后白等 5s 并留下误导性重试日志）。
                 currentCoroutineContext().ensureActive()
-                if (attempt >= 3 || !isRetryableLlmError(e)) throw e
+                if (attempt >= 3 || !LlmFailureClassifier.isRetryable(e)) throw e
                 val waitMs = if (attempt == 1) 5_000L else 15_000L
-                alog("LLM 调用失败（第 $attempt 次），${waitMs / 1000}s 后自动重试：${e.message?.take(140)}")
+                alog("LLM 调用失败（第 $attempt 次），${waitMs / 1000}s 后自动重试：" +
+                    "${e.javaClass.simpleName}: ${e.message?.take(140)}")
                 _session.update { it.copy(agentStage = "网络波动，正在自动重试（第 $attempt/2 次）…") }
                 delay(waitMs)
             }
         }
-    }
-
-    /** 可重试判定：IO 异常、超时/连接类文本、服务端过载（5xx/429/overloaded）。 */
-    private fun isRetryableLlmError(e: Exception): Boolean {
-        if (e is IOException) return true
-        val msg = e.message ?: ""
-        if (Regex("API 错误 5\\d\\d").containsMatchIn(msg)) return true
-        if (msg.contains("429")) return true
-        // Anthropic SSE error 事件（529 overloaded_error 等）没有数字状态码，按类型识别。
-        if (msg.contains("overloaded_error", ignoreCase = true)) return true
-        return Regex("timeout|timed out|connection|reset|unreachable|broken pipe|EOF", RegexOption.IGNORE_CASE)
-            .containsMatchIn(msg)
     }
 
     private suspend fun callLlmOnce(
