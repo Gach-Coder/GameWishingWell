@@ -33,10 +33,13 @@ object ProviderPresets {
         // 智谱开放平台 OpenAI 兼容端点（Bearer 鉴权、/chat/completions、SSE、function calling 均兼容）；
         // 默认 glm-5.3-flash，模型名可在设置页直接改为其他 GLM 系列（如 glm-5.3 / glm-4.6 / glm-4-flash）。
         ProviderPreset("zhipu", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-5.3-flash", Protocol.OPENAI_COMPATIBLE, 16384),
-        // 小米 MiMo 开放平台（https://mimo.mi.com）：OpenAI 兼容端点（Bearer 鉴权、/chat/completions、
-        // SSE、function calling 均兼容）；默认 mimo-v2.5（V2 系列已于 2026-06-30 弃用，V2.5 为当前主推，
-        // 可在设置页改为 mimo-v2.5-pro）。
+        // 小米 MiMo 开放平台（https://mimo.mi.com）：OpenAI 兼容端点（Bearer 鉴权、/chat/completions、SSE、function calling 均兼容）；
+        // 默认 mimo-v2.5（V2 系列已于 2026-06-30 弃用，V2.5 为当前主推，可在设置页改为 mimo-v2.5-pro）。
         ProviderPreset("xiaomi", "小米 MiMo", "https://api.xiaomimimo.com/v1", "mimo-v2.5", Protocol.OPENAI_COMPATIBLE, 16384),
+        // OpenRouter 聚合网关（https://openrouter.ai）：OpenAI 兼容端点（Bearer 鉴权、/chat/completions、
+        // SSE 流式、function calling 均兼容）。默认模型暂缺：模型 ID 形如 "厂商/模型名"
+        // （如 deepseek/deepseek-chat-v3、anthropic/claude-sonnet-4），由用户在设置页自填。
+        ProviderPreset("openrouter", "OpenRouter", "https://openrouter.ai/api/v1", "", Protocol.OPENAI_COMPATIBLE, 16384),
         ProviderPreset("custom", "自定义", "", "", Protocol.OPENAI_COMPATIBLE, 8192)
     )
 

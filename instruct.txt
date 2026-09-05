@@ -36,7 +36,7 @@
 		  编辑对话的”立即游玩”预览编辑区最新版本（不入运行区）；重新进入编辑对话从编辑区续作（未保存修改不丢）。
 		- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
-   DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 自定义，
+   DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 小米 MiMo / OpenRouter / 自定义，
    支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”。
    页面最下方显示 版本号 + 软件编译时间（BUILD_TIME，构建时写入 BuildConfig）——
    用于确认设备上运行的构建版本（Android Studio Apply Changes 热更新不刷新系统安装时间，
@@ -314,6 +314,7 @@ Agent处理message流程如下：
   Claude		https://api.anthropic.com		claude-sonnet-4-6					ANTHROPIC           64000*     否
   智谱 GLM		https://open.bigmodel.cn/api/paas/v4	glm-5.3-flash					OPENAI_COMPATIBLE	不发送     否
   小米 MiMo		https://api.xiaomimimo.com/v1	mimo-v2.5							OPENAI_COMPATIBLE	不发送     否
+  OpenRouter		https://openrouter.ai/api/v1	（暂缺，自填"厂商/模型名"，如 deepseek/deepseek-chat-v3）	OPENAI_COMPATIBLE	不发送     否
   自定义         （留空自填）                    （留空自填）       						OPENAI_COMPATIBLE   不发送     否
 
 （*Anthropic API 强制要求 max_tokens 字段，发送模型输出上限使其不构成实际限制；

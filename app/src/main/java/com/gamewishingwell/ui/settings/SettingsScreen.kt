@@ -181,6 +181,13 @@ fun SettingsScreen() {
                 value = model,
                 onValueChange = { model = it },
                 label = { Text("模型名称") },
+                // 预设默认模型暂缺的服务商：占位提示模型 ID 格式（OpenRouter 用"厂商/模型名"，
+                // 自定义网关格式任意）；留空时 isConfigured 不通过，必须自填后才能测试与生成。
+                placeholder = when (providerId) {
+                    "openrouter" -> {{ Text("如 deepseek/deepseek-chat-v3（厂商/模型名）") }}
+                    "custom" -> {{ Text("自填该网关的模型名") }}
+                    else -> null
+                },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )

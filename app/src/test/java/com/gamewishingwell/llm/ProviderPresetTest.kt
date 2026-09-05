@@ -26,6 +26,13 @@ class ProviderPresetTest {
         assertEquals(16384, zhipu.maxTokens)
         assertFalse(zhipu.disableThinking)
 
+        // OpenRouter 聚合网关：OpenAI 兼容端点，默认模型暂缺（模型 ID 为"厂商/模型名"，用户自填）
+        val openrouter = ProviderPresets.byId("openrouter")!!
+        assertEquals("", openrouter.defaultModel)
+        assertEquals("https://openrouter.ai/api/v1", openrouter.baseUrl)
+        assertEquals(Protocol.OPENAI_COMPATIBLE, openrouter.protocol)
+        assertFalse(openrouter.disableThinking)
+
         assertEquals(8192, ProviderPresets.byId("custom")!!.maxTokens)
     }
 }
