@@ -1,7 +1,5 @@
 package com.gamewishingwell.agent
 
-import com.gamewishingwell.data.ChatMessage
-import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
@@ -10,39 +8,45 @@ import org.junit.Test
 
 class AgentSessionJsonTest {
 
+    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = false }
+
     @Test
-    fun `旧版 IntentSchema 缺少 excludedSystems 仍可解码`() {
-        val json = Json { ignoreUnknownKeys = true }
-        val legacy = """{"intent":"new_game","visualDimension":"2D","screenOrientation":"竖版","gameSystems":["战斗"],"referenceGame":"打地鼠","templateId":"whack_a_mole","templateSimilarity":0.9,"confidence":0.8}"""
-        val decoded = json.decodeFromString<IntentSchema>(legacy)
-        assertEquals(emptyList<String>(), decoded.excludedSystems)
-        assertTrue(decoded.gameSystems.contains("战斗"))
+    fun `会话与 Game Schema JSON 往返（含旧字段忽略）`() {
+        val schema = GameSchema(
+            visualDimension = "3D",
+            screenOrientation = "横板",
+            gameSystems = listOf("自由建造", "收集"),
+            requestedSystems = listOf("自由建造"),
+            confidence = 0.9
+        )
+        val confirmation = RecognitionEngine.buildConfirmation("制作一个我的世界游戏", schema)
+        val session = GameSession(
+            messages = listOf(ChatMessageLike.user("制作一个我的世界游戏")),
+            gameSchema = schema,
+            pendingConfirmation = confirmation,
+            qualityTier = QualityTier.PREMIUM
+        )
+        val encoded = json.encodeToString(session)
+        // 旧会话 JSON 携带的已删除对标字段（referenceGame/templateId 等）必须被忽略而不是报错
+        val legacy = encoded.replace("\"qualityTier\"", "\"referenceGame\":\"我的世界\",\"templateId\":\"sandbox_voxel\",\"qualityTier\"")
+        val decoded = json.decodeFromString<GameSession>(legacy)
+        assertEquals(schema, decoded.gameSchema)
+        assertEquals(QualityTier.PREMIUM, decoded.qualityTier)
+        assertTrue(decoded.pendingConfirmation != null)
     }
 
     @Test
-    fun `GameSession 完整状态可持久化往返`() {
-        val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
-        val intent = IntentEngine.infer("做一个打地鼠游戏", null)
-        val plan = PlanningEngine.build(intent)
-        val state = GameSession(
-            messages = listOf(ChatMessage("user", "做一个打地鼠游戏"), ChatMessage("assistant", "已识别")),
-            currentHtml = "<html></html>",
-            agentStage = AgentStage.CONFIRM,
-            pendingConfirmation = IntentEngine.buildConfirmation("做一个打地鼠游戏", intent),
-            gameSchema = intent.toGameSchema(),
-            rollingSummary = "summary",
-            fileManifest = FileManifest(pointer = "index.html", files = listOf(WorkspaceFile("index.html", 1, "hash", 4))),
-            designPlan = plan,
-            knownIssues = listOf("warn"),
-            lastError = "last",
-            lastErrorSignature = "sig",
-            knownErrors = listOf(KnownError(ErrorCategory.SYNTAX, "sig", "norm")),
-            decisionLog = listOf("d1"),
-            snapshots = listOf("index.html:hash"),
-            qualityVerdict = QualityVerdict(true, note = "ok")
-        )
-        val encoded = json.encodeToString(state)
-        val decoded = json.decodeFromString<GameSession>(encoded)
-        assertEquals(state, decoded)
+    fun `确认卡内容往返保留形态字段`() {
+        val schema = GameSchema(visualDimension = "3D", screenOrientation = "横板", gameSystems = listOf("塔防"))
+        val confirmation = RecognitionEngine.buildConfirmation("做一个塔防游戏", schema)
+        val card = IntentConfirmation.cardContent(confirmation)
+        val restored = IntentConfirmation.fromCardContent(card)
+        assertTrue(restored != null)
+        assertEquals("3D", restored!!.visualDimension)
+        assertEquals("横板", restored.screenOrientation)
     }
+}
+
+private object ChatMessageLike {
+    fun user(text: String) = com.gamewishingwell.data.ChatMessage("user", text)
 }

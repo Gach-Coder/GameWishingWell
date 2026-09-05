@@ -157,7 +157,11 @@ private fun FileRow(entry: GameFileEntry) {
 }
 
 private fun fileTypeOf(entry: GameFileEntry): String = when {
-    entry.isDirectory -> if (entry.name == ".versions") "版本归档文件夹" else "文件夹"
+    entry.isDirectory -> when (entry.name) {
+        ".versions" -> "版本归档文件夹"
+        ".savepoint" -> "保存点（撤销锚点）"
+        else -> "文件夹"
+    }
     entry.name.endsWith(".html") -> "HTML 网页"
     entry.name.endsWith(".json") -> "JSON 数据"
     entry.name.endsWith(".sha256") -> "SHA-256 校验"

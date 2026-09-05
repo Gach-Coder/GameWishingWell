@@ -95,12 +95,9 @@ fun WishwellApp() {
                     gameId = gameId,
                     resumeDraft = resumeDraft,
                     onPlay = {
-                        // 编辑已保存游戏时从游戏目录加载最新版本，草稿模式加载草稿
-                        if (gameId != null) {
-                            navController.navigate("game?source=game&gameId=$gameId")
-                        } else {
-                            navController.navigate("game?source=draft&gameId=-1")
-                        }
+                        // 立即游玩 = 预览当前编辑会话（编辑区）的最新版本：
+                        // 编辑区与运行区相互独立，未经保存按钮写入的修改不在运行区。
+                        navController.navigate("game?source=preview&gameId=${gameId ?: -1L}")
                     },
                     onOpenSettings = { navController.navigate("settings") },
                     onSaved = { navController.popBackStack("home", false) }

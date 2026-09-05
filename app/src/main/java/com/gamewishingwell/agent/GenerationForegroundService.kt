@@ -20,6 +20,7 @@ import com.gamewishingwell.MainActivity
 import com.gamewishingwell.WishwellApplication
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -50,8 +51,8 @@ class GenerationForegroundService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
-    @Volatile
-    private var observing = false
+    /** 会话观察协程；以存活状态判重（替代一次性 observing 标志）。 */
+    private var observerJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -89,13 +90,20 @@ class GenerationForegroundService : Service() {
     }
 
     private fun observeSession() {
-        if (observing) return
-        observing = true
-        scope.launch {
+        // 实例复用（上一回合 stopSelf 尚未销毁时新回合的 start 先到达）会让本方法在
+        // 同一实例上再次进入：旧观察协程已随上回合收尾取消，必须重新启动观察——
+        // 曾用一次性 observing 标志判重，导致复用实例永远不再观察会话（通知冻结、
+        // 服务无法收尾）。以协程存活状态判重即可。
+        if (observerJob?.isActive == true) return
+        observerJob = scope.launch {
             var lastStage: String? = null
             var lastUpdateAt = 0L
             container().gameAgent.session.collect { s ->
                 if (!s.isGenerating) {
+                    // 用最新状态复核后再收尾：回合间隙的 false 快照可能已被新一轮
+                    // 生成（true）覆盖——若按旧快照停服务，新一轮会在后台失去前台
+                    // 服务与 wakelock/WifiLock，表现为后台网络异常。
+                    if (container().gameAgent.session.value.isGenerating) return@collect
                     stopForegroundAndSelf()
                     cancel()
                     return@collect
@@ -108,6 +116,9 @@ class GenerationForegroundService : Service() {
                         notificationManager().notify(NOTIFICATION_ID, buildNotification(s.agentStage))
                     }
                 }
+                // wakelock 续约：PARTIAL_WAKE_LOCK 带 1h 超时，精品档长修复轮可能超过；
+                // 到期后 CPU 休眠会让后台 SSE 流停摆（读超时后整回合被判网络异常）。
+                if (wakeLock?.isHeld != true) acquireWakeLock()
             }
         }
     }

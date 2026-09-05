@@ -33,6 +33,8 @@ class HomeViewModel(
     fun deleteGame(id: Long) {
         viewModelScope.launch {
             repository.deleteGame(id)
+            // 编辑区（工作区）与运行区独立：游戏删除后同步清理其编辑文件夹，避免孤儿残留
+            agent.deleteWorkspace(id)
             refresh()
         }
     }

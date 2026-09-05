@@ -35,15 +35,33 @@ class GameViewModel(
 
     private val sessionJson = Json { ignoreUnknownKeys = true }
 
+    /** 当前游戏页的加载源（game=运行区 / preview=编辑区 / draft=草稿）。 */
+    private var playSource: String = "draft"
+
     fun load(source: String, gameId: Long) {
         viewModelScope.launch {
+            playSource = source
             val (html, id, landscape) = withContext(Dispatchers.IO) {
-                if (source == "game" && gameId > 0) {
-                    val h = repository.loadGameHtml(gameId)
-                    if (h != null) repository.touchPlay(gameId)
-                    Triple(h, gameId, sessionLandscape(repository.loadGameAgentState(gameId)))
-                } else {
-                    Triple(repository.loadDraftHtml(), null, sessionLandscape(repository.loadDraftAgentState()))
+                when {
+                    // 预览：直接播放当前编辑会话（编辑区）的最新版本。编辑区与运行区
+                    // 相互独立后，未按保存按钮写入的修改只存在于编辑区——立即游玩
+                    // 必须走会话内存版本，而不是运行区（games/<id>）的入库版本。
+                    source == "preview" -> {
+                        val s = agent.session.value
+                        Triple(
+                            s.currentHtml,
+                            gameId.takeIf { it > 0 },
+                            s.gameSchema?.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
+                        )
+                    }
+                    source == "game" && gameId > 0 -> {
+                        val h = repository.loadGameHtml(gameId)
+                        if (h != null) repository.touchPlay(gameId)
+                        Triple(h, gameId, sessionLandscape(repository.loadGameAgentState(gameId)))
+                    }
+                    else -> {
+                        Triple(repository.loadDraftHtml(), null, sessionLandscape(repository.loadDraftAgentState()))
+                    }
                 }
             }
             _html.value = html
@@ -76,13 +94,15 @@ class GameViewModel(
         _jsError.value = null
     }
 
-    /** 让 AI 修复运行时报错：先确保 agent 会话与当前游戏一致，再发起修复。 */
+    /** 让 AI 修复运行时报错：先确保 agent 会话与当前游戏一致，再发起修复。
+     *  运行区（game）游玩页的报障重载会话后修复；预览页（preview）本身就是
+     *  当前编辑会话的版本，直接在会话上修复，避免重载覆盖未保存的编辑状态。 */
     fun fixErrorAndGo() {
         val err = _jsError.value ?: return
         _jsError.value = null
         viewModelScope.launch {
             val id = _loadedGameId.value
-            if (id != null) agent.loadGameSession(id)
+            if (playSource == "game" && id != null) agent.loadGameSession(id)
             agent.fixWithError(err)
         }
     }

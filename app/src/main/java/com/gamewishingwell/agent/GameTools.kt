@@ -36,7 +36,7 @@ object GameTools {
         ),
         ToolSpec(
             name = WRITE_FILE,
-            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用，可写 index.html（游戏本体）或 scenarios.json（功能断言）。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段。写入后系统自动检查产品契约/断言格式并在结果中回传。",
+            description = "整量写入文件（内容为完整文件）：新建文件时使用（首次生成 index.html、编写 scenarios.json）。修改已有文件一律优先 editfile（改动最小、不回归未要求部分）或 appendfile（追加新代码段）。注意：修改/修复回合对已有 index.html 的整量重写会被直接拒绝（修改范围契约——除非用户明确要求重做，禁止改变未点名的游戏逻辑）；大范围改动请用 editfile 整段替换（old_string 取该段完整原文）。写入后系统自动检查产品契约/断言格式并在结果中回传。",
             parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"完整文件内容"}},"required":["content"]}"""
         ),
         ToolSpec(
@@ -71,14 +71,27 @@ data class ToolOutcome(
 )
 
 /**
+ * 入口文件（index.html）整量重写策略（修改范围契约的执行层）：
+ * - [FORBID] 修改/修复回合（默认）：一律拒绝——整量重写会重新生成全部代码，
+ *   未要求的游戏逻辑（放置/数值/布局等）随之漂移，用户不可接受；
+ * - [NUDGE_ONCE] 首次生成回合：中途结构性修复拦一次、重发放行（保留自愈能力）；
+ * - [ALLOW] 用户明确要求重做的回合（再试一次/重新制作）：直接放行。
+ */
+enum class EntryRewritePolicy { FORBID, NUDGE_ONCE, ALLOW }
+
+/**
  * 工具沙箱执行器：所有路径经 [GameFileWorkspace.resolve] 校验，严格限制在游戏文件夹内。
  * 写入类工具执行后自动运行 [GameValidator]，把结构化校验结果作为观察附在返回里——
  * 校验是“观察”而非“门”：模型看到报告自行决定下一步修复方式。
  */
 class GameToolExecutor(
     private val workspace: GameFileWorkspace,
-    private val validate: (String) -> ValidationReport = { GameValidator.validate(it) }
+    private val validate: (String) -> ValidationReport = { GameValidator.validate(it) },
+    private val entryRewritePolicy: EntryRewritePolicy = EntryRewritePolicy.FORBID
 ) {
+
+    /** NUDGE_ONCE 策略的拦截计次（同回合每文件只拦一次）。 */
+    private val rewriteNudgedPaths = mutableSetOf<String>()
 
     suspend fun execute(call: ToolCallData): ToolOutcome {
         val args = try {
@@ -147,8 +160,33 @@ class GameToolExecutor(
         if (existing != null && existing == content) {
             return outcome(call, ok = true, observation = "写入内容与当前版本完全一致，未产生变更。")
         }
+        // 修改范围契约的执行层（见 EntryRewritePolicy）：仅管入口文件——
+        // scenarios.json 等辅助文件的维护性整写不受影响。
+        if (existing != null && path == GameFileWorkspaceEntryPoint.DEFAULT) {
+            when (entryRewritePolicy) {
+                EntryRewritePolicy.FORBID -> return outcome(
+                    call, ok = false,
+                    observation = "已拒绝：修改回合禁止对已有入口文件 $path 做整量重写（修改范围契约：除非用户明确要求重做，" +
+                        "只允许改动用户点名的部分，既有游戏逻辑必须保持原样）。请把改动拆成 editfile 精确替换——" +
+                        "需要改动一大段时，old_string 直接取该段完整原文（如整个函数块），new_string 给出替换后的整段；" +
+                        "新增代码用 appendfile。若确需彻底重做，请在交付总结中向用户说明并等待确认。"
+                )
+                EntryRewritePolicy.NUDGE_ONCE -> if (path !in rewriteNudgedPaths) {
+                    rewriteNudgedPaths += path
+                    return outcome(
+                        call, ok = false,
+                        observation = "已拦截：writefile 试图整量重写已存在的入口文件 $path。整量重写会重新生成全部代码，" +
+                            "未要求修改的部分容易被一并改掉而产生回归。常规修改请改用 editfile 做精确替换" +
+                            "（old_string 取唯一的原文片段；多处互不依赖的修改可在同一轮并行发起多个 editfile），" +
+                            "新增代码段用 appendfile。确属结构性重构需要整量重写时，再次发起同样的 writefile 即直接放行" +
+                            "（本回合对 $path 仅拦截这一次）。"
+                    )
+                }
+                EntryRewritePolicy.ALLOW -> Unit
+            }
+        }
         // 一般 Agent 惯例：Write 新建或整量覆盖均可（版本化写入保底可回滚），
-        // 用 Write 还是 Edit 由模型按任务自行权衡，执行层不做策略门禁。
+        // 用 Write 还是 Edit 由模型按任务自行权衡，执行层不做硬门禁。
         val saved = if (existing == null) {
             workspace.writeInitial(path, content)
         } else {

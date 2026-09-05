@@ -70,7 +70,7 @@ object NoopSmokeTestRunner : SmokeTestRunner {
  * 驱动不经定时器队列，24 帧约 5 秒完成。DOMContentLoaded（游戏脚本注册 rAF）前不推进。
  * 任何帧内异常、全局异常（含事件回调）与 console error 都会被捕获；
  * 多点位触控派发（touchstart/touchend/click + 一次拖动）在首帧后与跑帧中段各一轮；
- * localStorage 替换为内存 stub；跑满帧后做白屏检测、顶部保留区扫描
+ * localStorage 替换为内存 stub；跑满帧后做白屏检测、顶部平台按钮角落扫描
  * 与可观测性不变量断言（__wwDebugState()：负血量实体/NaN 数值/实体泄漏）；
  * 内部超时仅作宿主失效时的看门狗。
  *
@@ -79,8 +79,10 @@ object NoopSmokeTestRunner : SmokeTestRunner {
 object SmokeTestProbe {
     /** 确定性 tick 帧数：每帧 50ms 游戏时间，共约 1.2s——覆盖出怪、数值变动、状态切换等早期玩法。 */
     const val MAX_FRAMES = 24
-    /** 平台顶部保留区高度（px）：区域内出现可交互元素即判失败（会被平台操作条遮挡）。 */
+    /** 平台按钮悬浮区高度（px）：左上"返回"与右上"设置"按钮悬浮在游戏画面之上。 */
     const val RESERVED_TOP_PX = 110
+    /** 平台按钮悬浮区宽度（px）：只执法两个角落——顶部其余区域可自由布局，无保留区留白。 */
+    const val RESERVED_CORNER_W = 140
     private const val MARKER = "__wwSmokeInstalled"
 
     fun inject(html: String, deep: Boolean = false, scenariosJson: String? = null, landscape: Boolean = false): String {
@@ -471,12 +473,14 @@ object SmokeTestProbe {
                   }
                 } catch (e) {}
               }
-              // 顶部保留区执法（平台契约）：约 ${RESERVED_TOP_PX}px 平台操作条区域（左返回/右设置）内
-              // 出现任何可交互元素即失败——会被平台顶栏遮挡而无法点击，报错文本直接可执行
-              // （提示移入安全区）。文字标签仅在中央允许、无法静态判定，由生成提示词约束。
+              // 平台按钮角落执法（平台契约）：左上/右上角各约 ${RESERVED_CORNER_W}x${RESERVED_TOP_PX}px 是
+              // 平台"返回/设置"按钮悬浮区——角落内出现任何可交互元素即失败（会被平台按钮遮挡而无法点击）。
+              // 顶部其余区域（含整条顶带）可自由布局画面/HUD/文字，无保留区留白要求。
               function reservedAreaCheck(){
                 try {
                   var bad = [];
+                  var vw = window.innerWidth || 360;
+                  var cornerW = ${RESERVED_CORNER_W};
                   var els = document.querySelectorAll('button,a,[role="button"],input,select,textarea,[onclick]');
                   for (var i = 0; i < els.length; i++) {
                     var el = els[i];
@@ -486,13 +490,13 @@ object SmokeTestProbe {
                     var st = null;
                     try { st = window.getComputedStyle(el); } catch (e0) {}
                     if (st && (st.display === 'none' || st.visibility === 'hidden' || st.pointerEvents === 'none')) continue;
-                    if (r.top < ${RESERVED_TOP_PX}) {
+                    if (r.top < ${RESERVED_TOP_PX} && (r.left < cornerW || r.right > vw - cornerW)) {
                       var label = ((el.innerText || el.value || el.getAttribute('aria-label') || el.tagName || '') + '').trim().slice(0, 16);
-                      bad.push(el.tagName.toLowerCase() + (label ? '(' + label + ')' : '') + '@top' + Math.round(r.top));
+                      bad.push(el.tagName.toLowerCase() + (label ? '(' + label + ')' : '') + '@' + Math.round(r.left) + ',' + Math.round(r.top));
                     }
                   }
                   if (bad.length) {
-                    window.__wwSmokeResult.errors.push('top-reserved-area: 顶部约${RESERVED_TOP_PX}px 平台保留区内出现可交互元素（会被平台操作条遮挡无法点击）：' + bad.slice(0, 3).join(' | ') + '；请将这些元素整体移到安全区（top 约 120px 以下）');
+                    window.__wwSmokeResult.errors.push('top-corner-reserved: 左上/右上角平台按钮悬浮区（约' + cornerW + 'x' + ${RESERVED_TOP_PX} + 'px）出现可交互元素（会被平台返回/设置按钮遮挡无法点击）：' + bad.slice(0, 3).join(' | ') + '；请将这些元素移出两个角落，顶部其余区域可自由布局');
                   }
                 } catch (e) {}
               }

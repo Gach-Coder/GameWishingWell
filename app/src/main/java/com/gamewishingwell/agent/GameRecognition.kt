@@ -28,11 +28,9 @@ data class IntentConfirmation(
     val userRequest: String,
     /** 新流程确认门共享的会话级 Game Schema JSON。 */
     val gameSchema: GameSchema? = null,
-    /** 旧流程遗留字段，新数据中通常为 null；保留仅为兼容历史会话。 */
-    val intent: IntentSchema? = null,
     /** 人话摘要，确认门回显用。 */
     val summary: String,
-    /** 由模板/策划默认值补出来的设计假设，必须逐条回显。 */
+    /** 由默认值/LLM 建议补出来的设计假设，必须逐条回显。 */
     val designAssumptions: List<String> = emptyList(),
     /** 确认门回显的每个系统一句话解释，供玩家逐项核对。 */
     val systemExplanations: List<String> = emptyList(),
@@ -40,7 +38,7 @@ data class IntentConfirmation(
     val modules: List<ModuleCard> = emptyList(),
     /** 玩家明确排除的系统，确认门同样要回显。 */
     val excludedSystems: List<String> = emptyList(),
-    /** 策划层在确认门前产出的草案；确认通过后由决策层定稿为 DesignPlan。 */
+    /** 策划层草案（确认时延迟产出）；确认通过后由决策层定稿为 DesignPlan。 */
     val draftPlan: DesignPlan? = null,
     /** 本确认门描述的是不是“首次制作”；false 表示在已锚定游戏上继续修改。 */
     val isNewGame: Boolean = true,
@@ -52,20 +50,26 @@ data class IntentConfirmation(
      */
     val uncheckedModules: List<String> = emptyList(),
     /** 质量档位（卡片四挡 fast/light/balanced/premium，默认均衡）；确认后写入会话驱动生成策略。 */
-    val qualityTier: String = "balanced"
+    val qualityTier: String = "balanced",
+    /**
+     * 卡片可改的画面形态（回显字段）：默认取 schema 值，玩家在卡上直接改——
+     * 方向/维度是一票否决下游的错误类型，必须有对位的修正入口（空串=旧卡未携带）。
+     */
+    val visualDimension: String = "",
+    val screenOrientation: String = ""
 ) {
-    /** 确认门实际共享的 Game Schema JSON（兼容旧版 intent 字段）。 */
-    val schema: GameSchema get() = gameSchema ?: intent?.toGameSchema() ?: GameSchema()
+    /** 确认门实际共享的 Game Schema JSON。 */
+    val schema: GameSchema get() = gameSchema ?: GameSchema()
 
     companion object {
         private val cardJson = Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = false }
 
         /**
-         * 卡片消息内容：剥离 draftPlan/gameSchema/intent 等非回显字段后序列化，
+         * 卡片消息内容：剥离 draftPlan/gameSchema 等非回显字段后序列化，
          * 聊天流中的 confirm_card 消息与 pendingConfirmation 用同一编码做匹配。
          */
         fun cardContent(confirmation: IntentConfirmation): String = cardJson.encodeToString(
-            confirmation.copy(intent = null, gameSchema = null, draftPlan = null)
+            confirmation.copy(gameSchema = null, draftPlan = null)
         )
 
         fun fromCardContent(content: String): IntentConfirmation? = runCatching {
@@ -74,22 +78,11 @@ data class IntentConfirmation(
     }
 }
 
-/** 内部模板库条目：著名对标游戏 → template_id + 特征建议。 */
-@Serializable
-data class GameTemplateRef(
-    val id: String,
-    val title: String,
-    val aliases: List<String>,
-    val suggestedSystems: List<String>,
-    val suggestedDimension: String = GameSchema.DIMENSION_2D,
-    val suggestedOrientation: String = GameSchema.ORIENTATION_PORTRAIT
-)
-
 object GameSystemCatalog {
     val ALL: List<String> = listOf(
         "人物实体", "道具", "战斗", "技能", "属性等级", "关卡场景", "AI策略", "商店经济",
         "收集", "解谜", "物理", "音乐节奏", "塔防", "合成", "放置挂机", "经营模拟",
-        "竞速", "平台跳跃", "弹幕射击", "反应躲避"
+        "竞速", "平台跳跃", "弹幕射击", "反应躲避", "自由建造"
     )
 
     private val keywords: List<Pair<String, String>> = listOf(
@@ -108,11 +101,14 @@ object GameSystemCatalog {
         "塔防" to "塔防|防御塔|保卫萝卜",
         "合成" to "合成|合并|2048|大西瓜|消除",
         "放置挂机" to "放置|挂机|自动战斗|自动挂机",
-        "经营模拟" to "经营|模拟|建造|餐厅|农场",
+        // "建造"归自由建造（沙盒/体素玩法的核心动词）；经营模拟只保留经营类动词，
+        // 否则"建造类游戏"会被误吸进经营模拟、丢掉沙盒本质。
+        "经营模拟" to "经营|模拟|餐厅|农场",
         "竞速" to "竞速|赛车|跑道|冲刺",
         "平台跳跃" to "平台跳跃|横板跳跃|跳台|跑酷",
         "弹幕射击" to "射击|弹幕|飞机大战|子弹",
-        "反应躲避" to "反应|躲避|接水果|打地鼠"
+        "反应躲避" to "反应|躲避|接水果|打地鼠",
+        "自由建造" to "建造|搭建|盖房|方块|沙盒|创造模式|生存模式|挖矿"
     )
 
     fun extract(text: String): List<String> {
@@ -124,6 +120,30 @@ object GameSystemCatalog {
     }
 
     fun isValid(system: String): Boolean = ALL.contains(system)
+
+    /** 常见同义变体 → 规范系统名（LLM 自由抽取时的入口收敛）。 */
+    private val synonyms: Map<String, String> = mapOf(
+        "建造" to "自由建造", "搭建" to "自由建造", "沙盒建造" to "自由建造",
+        "建筑" to "自由建造", "挖掘" to "自由建造"
+    )
+
+    /**
+     * 系统准入：白名单从"过滤器"降级为"归一化器"——
+     * - 已知系统返回规范名；常见同义变体收敛（"建造"→"自由建造"）；
+     * - 清单外的合法自造名（2~8 字中英文/数字、无标点）原样放行；
+     * - 非法名（空白/超长/含标点）返回 null 丢弃。
+     *
+     * 领域知识的表达通道是识别 LLM 的常识（用户说"我的世界"它知道核心是自由建造），
+     * 注册表只负责收敛与兜底；此前 isValid 过滤把清单外玩法静默截断，"我的世界"
+     * 只能在[战斗/关卡/收集]里挑，正是产出跑偏的第一道封锁线。
+     */
+    fun admit(name: String): String? {
+        val n = name.trim()
+        if (n.isEmpty() || n.length > 8) return null
+        synonyms[n]?.let { return it }
+        if (isValid(n)) return n
+        return if (Regex("^[\\u4e00-\\u9fa5A-Za-z0-9]+$").matches(n)) n else null
+    }
 
     private val descriptions: Map<String, String> = mapOf(
         "人物实体" to "玩家可操作的角色，包含移动、朝向与基础状态。",
@@ -146,6 +166,7 @@ object GameSystemCatalog {
         "平台跳跃" to "跳跃与平台碰撞，以及失败重置。",
         "弹幕射击" to "玩家射击、敌方弹幕与命中判定。",
         "反应躲避" to "点按/滑动响应、失误判定与计分。",
+        "自由建造" to "开放世界里放置/破坏方块、自由改造地形与搭建建筑。",
     )
 
     /**
@@ -172,7 +193,13 @@ object GameSystemCatalog {
         "竞速" to listOf("速度与操控", "跑道/路线与完成条件", "名次或计时判定"),
         "平台跳跃" to listOf("跳跃与平台碰撞", "失败重置"),
         "弹幕射击" to listOf("玩家射击", "敌方弹幕生成", "命中判定"),
-        "反应躲避" to listOf("点按/滑动响应", "失误判定", "计分")
+        "反应躲避" to listOf("点按/滑动响应", "失误判定", "计分"),
+        "自由建造" to listOf(
+            "方块世界：地面/地形由可破坏的方块组成（体素网格，如 24×24 底盘）",
+            "破坏与放置：点按/长按移除目标方块，选中背包方块后点空位放置",
+            "背包与方块栏：多种方块（泥土/石头/木头等），破坏后拾取入包、放置时消耗",
+            "第一/第三人称视角，单指滑动旋转视角环视自己的建筑"
+        )
     )
 
     /** 业务验收边界：验收时只需确认这条玩家可感知的边界成立。 */
@@ -196,7 +223,8 @@ object GameSystemCatalog {
         "竞速" to "能操控竞速，完成条件与名次判定正确",
         "平台跳跃" to "跳跃/平台碰撞可靠，失败后能重置",
         "弹幕射击" to "射击与命中判定正确，敌弹幕有明确威胁",
-        "反应躲避" to "点按/滑动响应及时，失误判定与计分正确"
+        "反应躲避" to "点按/滑动响应及时，失误判定与计分正确",
+        "自由建造" to "至少能破坏一种方块并放置出来，建造结果在场景中持久可见，视角可旋转观察"
     )
 
     /** 每个系统的一句话解释，确认门逐项回显给玩家。 */
@@ -205,37 +233,32 @@ object GameSystemCatalog {
 
     /**
      * 该系统在指定画面维度/方向下的落地实现方法；确认门与策划层共用。
-     * 当用户需求命中对标游戏模板时，优先使用 [TemplateSystemCatalog] 中该模板的
-     * 具体玩法实现，保证对玩家解释与最终 prompt 注入的是同一套真实功能。
+     * 系统级实现完全来自通用矩阵与策划 LLM 的阐述——对标游戏的玩法理解
+     * 由生成/策划 LLM 按用户原话自行完成，平台不再维护模板种子。
      */
     fun implementationMethods(
         system: String,
         dimension: String,
-        orientation: String,
-        templateId: String? = null
+        orientation: String
     ): List<String> {
-        val templateSpecific = TemplateSystemCatalog.resolve(templateId, system)?.methods
-        val base = templateSpecific ?: implementationMethods[system] ?: return listOf("按基础规则实现")
+        val base = implementationMethods[system] ?: return listOf("按基础规则实现")
         val result = base.toMutableList()
-        if (templateSpecific == null) {
-            when (dimension) {
-                GameSchema.DIMENSION_2_5D -> result += "用 Canvas 2D 斜 45° 投影表现 2.5D"
-                GameSchema.DIMENSION_3D -> result += "用内置 three.js 引擎实现 3D（head 声明 ww-engine 由平台注入源码，几何纹理程序化生成）"
-                else -> result += "用 2D 精灵/几何图形绘制"
-            }
-            result += if (orientation == GameSchema.ORIENTATION_LANDSCAPE) {
-                "横板全屏布局，左右手横向操作"
-            } else {
-                "竖版布局，适配手机单手操作"
-            }
+        when (dimension) {
+            GameSchema.DIMENSION_2_5D -> result += "用 Canvas 2D 斜 45° 投影表现 2.5D"
+            GameSchema.DIMENSION_3D -> result += "用内置 three.js 引擎实现 3D（head 声明 ww-engine 由平台注入源码，几何纹理程序化生成）"
+            else -> result += "用 2D 精灵/几何图形绘制"
+        }
+        result += if (orientation == GameSchema.ORIENTATION_LANDSCAPE) {
+            "横板全屏布局，左右手横向操作"
+        } else {
+            "竖版布局，适配手机单手操作"
         }
         return result.distinct()
     }
 
     /** 业务验收边界：代码验收时把“能做”和“做到什么程度”分开。 */
-    fun acceptanceBoundary(system: String, templateId: String? = null): String =
-        TemplateSystemCatalog.resolve(templateId, system)?.acceptanceBoundary
-            ?: acceptanceBoundaries[system]
+    fun acceptanceBoundary(system: String): String =
+        acceptanceBoundaries[system]
             ?: "核心循环可玩，失败后可 restart() 完整重开"
 
     /**
@@ -247,10 +270,9 @@ object GameSystemCatalog {
         system: String,
         dimension: String,
         orientation: String,
-        templateId: String? = null,
         plannedMethods: List<String>? = null
     ): List<String> {
-        val methods = plannedMethods ?: implementationMethods(system, dimension, orientation, templateId)
+        val methods = plannedMethods ?: implementationMethods(system, dimension, orientation)
         val filtered = methods.filterNot { method ->
             TECHNICAL_IMPLEMENTATION_PHRASES.any { method.contains(it, ignoreCase = true) }
         }
@@ -262,11 +284,10 @@ object GameSystemCatalog {
         system: String,
         dimension: String,
         orientation: String,
-        templateId: String? = null,
         plannedMethods: List<String>? = null
     ): String {
-        val methods = playerFacingMethods(system, dimension, orientation, templateId, plannedMethods).joinToString("、")
-        return "$system：具体玩法为 $methods；验收边界：${acceptanceBoundary(system, templateId)}"
+        val methods = playerFacingMethods(system, dimension, orientation, plannedMethods).joinToString("、")
+        return "$system：具体玩法为 $methods；验收边界：${acceptanceBoundary(system)}"
     }
 
     private val TECHNICAL_IMPLEMENTATION_PHRASES = listOf(
@@ -276,71 +297,29 @@ object GameSystemCatalog {
     )
 }
 
-object TemplateLibrary {
-    val ALL: List<GameTemplateRef> = listOf(
-        GameTemplateRef("whack_a_mole", "打地鼠", listOf("打地鼠", "whack"), listOf("反应躲避", "战斗"), "2D", "竖版"),
-        GameTemplateRef("catch_fruit", "接水果", listOf("接水果", "水果忍者", "切水果"), listOf("收集", "反应躲避"), "2D", "竖版"),
-        GameTemplateRef("snake", "贪吃蛇", listOf("贪吃蛇", "snake"), listOf("人物实体", "收集", "属性等级"), "2D", "竖版"),
-        GameTemplateRef("merge_2048", "2048/合成", listOf("2048", "合成大西瓜", "合并"), listOf("合成", "商店经济"), "2D", "竖版"),
-        GameTemplateRef("tetris", "俄罗斯方块", listOf("俄罗斯方块", "tetris"), listOf("反应躲避", "属性等级"), "2D", "竖版"),
-        GameTemplateRef("brick_breaker", "打砖块", listOf("打砖块", "弹球", "breakout"), listOf("物理", "战斗", "关卡场景"), "2D", "竖版"),
-        GameTemplateRef("plane_shooter", "飞机大战", listOf("飞机大战", "雷电", "弹幕射击"), listOf("弹幕射击", "战斗", "关卡场景"), "2D", "竖版"),
-        GameTemplateRef("endless_runner", "跑酷", listOf("跑酷", "神庙逃亡", "地铁跑酷"), listOf("竞速", "平台跳跃", "收集"), "2D", "横板"),
-        GameTemplateRef("tower_defense", "塔防", listOf("塔防", "保卫萝卜"), listOf("塔防", "战斗", "AI策略", "商店经济"), "2D", "竖版"),
-        GameTemplateRef("match3", "消消乐", listOf("消消乐", "开心消消乐", "三消"), listOf("合成", "关卡场景"), "2D", "竖版"),
-        GameTemplateRef("gold_miner", "黄金矿工", listOf("黄金矿工", "挖矿"), listOf("物理", "道具", "商店经济"), "2D", "竖版"),
-        GameTemplateRef("piano_tiles", "别踩白块", listOf("别踩白块", "钢琴块"), listOf("音乐节奏", "反应躲避"), "2D", "竖版"),
-        GameTemplateRef("maze", "迷宫", listOf("迷宫", "maze"), listOf("解谜", "关卡场景"), "2D", "竖版"),
-        GameTemplateRef("racing", "赛车", listOf("赛车", "竞速", "卡丁车"), listOf("竞速", "AI策略"), "2D", "横板"),
-        GameTemplateRef("board_game", "棋类", listOf("五子棋", "井字棋", "象棋", "围棋"), listOf("AI策略", "属性等级"), "2D", "竖版")
-    )
-
-    fun findById(id: String): GameTemplateRef? = ALL.firstOrNull { it.id == id }
-
-    /**
-     * 把用户提到的著名游戏映射到模板库。映射不上返回 templateId=null，
-     * 相似度只做简单归一化（别名覆盖长度 / 用户文本长度）。
-     */
-    fun match(text: String): Pair<GameTemplateRef, Double>? {
-        val normalized = text.lowercase()
-        var best: Pair<GameTemplateRef, Double>? = null
-        for (ref in ALL) {
-            for (alias in ref.aliases) {
-                if (normalized.contains(alias.lowercase())) {
-                    val similarity = 0.75 + (alias.length.toDouble() / normalized.length.coerceAtLeast(1)).coerceAtMost(0.25)
-                    if (best == null || similarity > best!!.second) best = ref to similarity
-                }
-            }
-        }
-        return best
-    }
-}
-
 /**
  * 会话级 Game Schema JSON：一个对话框只制作一个游戏。
  *
  * 识别层首次抽取时创建该 JSON，之后每轮修改都在同一份 JSON 上补全/覆盖；
- * 策划层、确认门、决策层与生成层共享这同一份 Game Schema，不再依赖意图枚举
- * 推断“新建还是修改”。
+ * 策划层、确认门、决策层与生成层共享这同一份 Game Schema。
+ *
+ * 契约：游戏特性与系统只从用户纯文本提取（正则显式 + Lite LLM 语义理解），
+ * 不做对标游戏名匹配——"我的世界"这类对标理解完全由生成 LLM 按指令原话
+ * 自行理解执行（识别 LLM 的常识抽取仅作为参考注入，不构成硬约束）。
  */
 @Serializable
 data class GameSchema(
     val schemaVersion: Int = SCHEMA_VERSION,
     val visualDimension: String = DIMENSION_2D,
     val screenOrientation: String = ORIENTATION_PORTRAIT,
-    /** 最终要实现的系统集合（已合并用户明确系统与对标模板补全系统）。 */
+    /** 最终要实现的系统集合（用户显式点名 + Lite LLM 语义抽取建议）。 */
     val gameSystems: List<String> = emptyList(),
-    /** 用户明确点名的系统集合，用于区分模板/默认值补全的设计假设。 */
+    /** 用户明确点名的系统集合，用于区分 LLM 建议补全的设计假设。 */
     val requestedSystems: List<String> = emptyList(),
-    val referenceGame: String? = null,
-    val templateId: String? = null,
-    val templateSimilarity: Double? = null,
     val confidence: Double = 0.0,
     val excludedSystems: List<String> = emptyList(),
     /** 确认门取消勾选的系统：本轮不实现，但不算玩家明确排除；后续文本点名会自动恢复。 */
     val uncheckedSystems: List<String> = emptyList(),
-    /** true 表示模板解析已由玩家修正显式锁定，validate 不再反向重匹配。 */
-    val lockTemplateResolution: Boolean = false,
     /** 锚定该游戏的第一条用户需求，修改轮继续作为上下文。 */
     val firstUserRequest: String? = null,
     /** 最近一轮用户需求，策划层 LLM 按最新要求细化系统实现。 */
@@ -385,7 +364,7 @@ data class GameSchema(
 
     val hasMeaningfulFeatures: Boolean
         get() = gameSystems.isNotEmpty() || requestedSystems.isNotEmpty() ||
-            excludedSystems.isNotEmpty() || referenceGame != null || templateId != null
+            excludedSystems.isNotEmpty()
 }
 
 /**
@@ -400,20 +379,14 @@ data class GameSchemaPatch(
     val excludedSystems: List<String> = emptyList(),
     /** 玩家明确要求恢复/加回的系统。 */
     val reAddSystems: List<String> = emptyList(),
-    val referenceGame: String? = null,
-    val templateId: String? = null,
-    val templateSimilarity: Double? = null,
     val confidence: Double = 0.0,
-    /** 玩家明确表示不再参考对标游戏。 */
-    val dropReference: Boolean = false,
     /** 无实体但确实是“做一个游戏”类指令时置 true，避免误判成普通 chat。 */
     val hasGameCommand: Boolean = false
 ) {
     val hasEntities: Boolean
         get() = visualDimension != null || screenOrientation != null ||
             gameSystems.isNotEmpty() || excludedSystems.isNotEmpty() ||
-            reAddSystems.isNotEmpty() || referenceGame != null || templateId != null ||
-            dropReference
+            reAddSystems.isNotEmpty()
 }
 
 @Serializable
@@ -445,27 +418,20 @@ object GameSchemaValidator {
             ?: GameSchema.ORIENTATION_PORTRAIT
 
         val requested = schema.requestedSystems
-            .filter { GameSystemCatalog.isValid(it) }
+            .mapNotNull { GameSystemCatalog.admit(it) }
             .distinct()
         val excluded = schema.excludedSystems
-            .filter { GameSystemCatalog.isValid(it) }
+            .mapNotNull { GameSystemCatalog.admit(it) }
             .distinct()
         val systems = schema.gameSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in excluded }
             .distinct()
-        // 取消勾选的系统只做白名单过滤；已回到实现范围或被明确排除的自动移出。
+        // 取消勾选的系统只做准入归一；已回到实现范围或被明确排除的自动移出。
         val unchecked = schema.uncheckedSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in systems && it !in excluded }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in systems && it !in excluded }
             .distinct()
-
-        val template = schema.templateId?.let { TemplateLibrary.findById(it) }
-        val matched = if (schema.lockTemplateResolution) {
-            null
-        } else {
-            TemplateLibrary.match(schema.referenceGame.orEmpty())
-        }
-        val templateId = template?.id ?: matched?.first?.id
-        val templateSimilarity = template?.let { schema.templateSimilarity } ?: matched?.second
 
         return schema.copy(
             visualDimension = dimension,
@@ -474,8 +440,6 @@ object GameSchemaValidator {
             excludedSystems = excluded,
             uncheckedSystems = unchecked,
             gameSystems = systems,
-            templateId = templateId,
-            templateSimilarity = templateSimilarity?.coerceIn(0.0, 1.0),
             confidence = schema.confidence.coerceIn(0.0, 1.0)
         )
     }
@@ -504,11 +468,7 @@ object GameSchemaValidator {
             gameSystems = obj.stringList("gameSystems").filter { it.isNotBlank() },
             excludedSystems = obj.stringList("excludedSystems").filter { it.isNotBlank() },
             reAddSystems = obj.stringList("reAddSystems").filter { it.isNotBlank() },
-            referenceGame = obj.string("referenceGame")?.takeIf { it.isNotBlank() },
-            templateId = obj.string("templateId")?.takeIf { it.isNotBlank() },
-            templateSimilarity = obj.double("templateSimilarity"),
             confidence = obj.double("confidence") ?: 0.0,
-            dropReference = obj.boolean("dropReference"),
             hasGameCommand = obj.boolean("hasGameCommand")
         )
     }
@@ -549,8 +509,6 @@ object RecognitionEngine {
         val negated = IntentEngine.negatedSystems(text)
         val reAdd = IntentEngine.reAddSystems(text)
         val systems = GameSystemCatalog.extract(text).filterNot { it in negated }
-        val match = TemplateLibrary.match(text)
-        val dropReference = IntentEngine.negatesReference(text)
         val hasGameCommand = gameCommandPattern.containsMatchIn(text)
 
         val confidence = (
@@ -558,8 +516,7 @@ object RecognitionEngine {
                 (if (dimension != null) 0.1 else 0.0) +
                 (if (orientation != null) 0.1 else 0.0) +
                 (systems.size * 0.05).coerceAtMost(0.2) +
-                (if (negated.isNotEmpty() || reAdd.isNotEmpty()) 0.1 else 0.0) +
-                (if (match != null) 0.15 else 0.0)
+                (if (negated.isNotEmpty() || reAdd.isNotEmpty()) 0.1 else 0.0)
             ).coerceIn(0.0, 1.0)
 
         return GameSchemaPatch(
@@ -568,11 +525,7 @@ object RecognitionEngine {
             gameSystems = systems,
             excludedSystems = negated.toList(),
             reAddSystems = reAdd.toList(),
-            referenceGame = match?.first?.title,
-            templateId = match?.first?.id,
-            templateSimilarity = match?.second,
             confidence = confidence,
-            dropReference = dropReference,
             hasGameCommand = hasGameCommand
         )
     }
@@ -613,11 +566,7 @@ object RecognitionEngine {
             gameSystems = (lite.gameSystems + regexResult.gameSystems).distinct(),
             excludedSystems = (lite.excludedSystems + regexResult.excludedSystems).distinct(),
             reAddSystems = (lite.reAddSystems + regexResult.reAddSystems).distinct(),
-            referenceGame = lite.referenceGame ?: regexResult.referenceGame,
-            templateId = lite.templateId ?: regexResult.templateId,
-            templateSimilarity = lite.templateSimilarity ?: regexResult.templateSimilarity,
             confidence = maxOf(lite.confidence, regexResult.confidence),
-            dropReference = lite.dropReference || regexResult.dropReference,
             hasGameCommand = lite.hasGameCommand || regexResult.hasGameCommand
         )
     }
@@ -656,36 +605,26 @@ object RecognitionEngine {
         }
 
         val excluded = patch.excludedSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in patch.reAddSystems }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in patch.reAddSystems }
             .toSet()
         val requested = (patch.gameSystems + patch.reAddSystems)
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in excluded }
             .distinct()
-        val template = resolveTemplate(patch)
         val planned = plannedSystems(
             requested = requested,
-            templateId = template?.id,
             excluded = excluded
         )
 
         return GameRecognitionResult(
             gameSchema = GameSchema(
-                // 对标游戏特性做“无覆盖填补”：用户明确抽出的值优先，
-                // 空位由模板建议值初始化，最后才落到平台默认值。
-                visualDimension = patch.visualDimension
-                    ?: template?.suggestedDimension
-                    ?: GameSchema.DIMENSION_2D,
-                screenOrientation = patch.screenOrientation
-                    ?: template?.suggestedOrientation
-                    ?: GameSchema.ORIENTATION_PORTRAIT,
+                visualDimension = patch.visualDimension ?: GameSchema.DIMENSION_2D,
+                screenOrientation = patch.screenOrientation ?: GameSchema.ORIENTATION_PORTRAIT,
                 gameSystems = planned,
                 requestedSystems = requested,
-                referenceGame = patch.referenceGame?.takeIf { patch.dropReference.not() } ?: template?.title,
-                templateId = template?.id,
-                templateSimilarity = template?.let { patch.templateSimilarity ?: similarityOf(patch.referenceGame) },
                 confidence = patch.confidence,
                 excludedSystems = excluded.toList(),
-                lockTemplateResolution = false,
                 firstUserRequest = userText.trim(),
                 lastUserRequest = userText.trim()
             ),
@@ -707,76 +646,40 @@ object RecognitionEngine {
             )
         }
 
-        val reAdd = patch.reAddSystems.filter { GameSystemCatalog.isValid(it) }.toSet()
-        val removed = patch.excludedSystems.filter { GameSystemCatalog.isValid(it) }.toSet()
+        val reAdd = patch.reAddSystems.mapNotNull { GameSystemCatalog.admit(it) }.toSet()
+        val removed = patch.excludedSystems.mapNotNull { GameSystemCatalog.admit(it) }.toSet()
         val excluded = (current.excludedSystems.toSet() + removed - reAdd)
-            .filter { GameSystemCatalog.isValid(it) }
+            .mapNotNull { GameSystemCatalog.admit(it) }
             .toSet()
         // 取消勾选不是禁令：本轮文本点名的 module 视为恢复实现，自动移出 unchecked。
         val reactivated = (patch.gameSystems + reAdd).toSet()
         val unchecked = current.uncheckedSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in reactivated && it !in excluded }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in reactivated && it !in excluded }
             .toSet()
 
-        val template = resolveTemplate(patch)
-        val dropAndNoTemplate = patch.dropReference && template == null
-        val targetTemplateId = template?.id ?: if (dropAndNoTemplate) null else current.templateId
-
-        val requested = when {
-            template != null -> patch.gameSystems.filter { it !in excluded }
-            dropAndNoTemplate -> current.requestedSystems + patch.gameSystems
-            else -> current.requestedSystems + patch.gameSystems
-        }.plus(reAdd).filter { GameSystemCatalog.isValid(it) && it !in excluded }.distinct()
-
-        val baseline = when {
-            template != null -> template.suggestedSystems
-            dropAndNoTemplate -> current.requestedSystems.ifEmpty { DEFAULT_SYSTEMS }
-            else -> current.gameSystems
-        }
+        val requested = (current.requestedSystems + patch.gameSystems)
+            .plus(reAdd)
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in excluded }
+            .distinct()
 
         val planned = plannedSystems(
-            requested = (baseline + patch.gameSystems + reAdd).toList(),
-            templateId = targetTemplateId,
+            requested = (current.gameSystems + patch.gameSystems + reAdd).toList(),
             excluded = excluded,
             unchecked = unchecked
         )
 
-        val referenceGame: String?
-        val templateId: String?
-        val templateSimilarity: Double?
-        if (template != null) {
-            referenceGame = template.title
-            templateId = template.id
-            templateSimilarity = patch.templateSimilarity ?: similarityOf(patch.referenceGame)
-        } else if (dropAndNoTemplate) {
-            referenceGame = null
-            templateId = null
-            templateSimilarity = null
-        } else {
-            referenceGame = current.referenceGame
-            templateId = current.templateId
-            templateSimilarity = current.templateSimilarity
-        }
-
         return GameRecognitionResult(
             gameSchema = current.copy(
-                // 修改轮换上新对标模板时，模板建议值同样只填补空位：
-                // 用户本轮明确指定的值优先，其次新模板建议，最后保留原值。
-                visualDimension = patch.visualDimension
-                    ?: template?.suggestedDimension
-                    ?: current.visualDimension,
-                screenOrientation = patch.screenOrientation
-                    ?: template?.suggestedOrientation
-                    ?: current.screenOrientation,
+                // 修改轮形态/系统：用户本轮明确指定的值优先，其余保留原值。
+                visualDimension = patch.visualDimension ?: current.visualDimension,
+                screenOrientation = patch.screenOrientation ?: current.screenOrientation,
                 gameSystems = planned,
                 requestedSystems = requested,
-                referenceGame = referenceGame,
-                templateId = templateId,
-                templateSimilarity = templateSimilarity,
                 confidence = maxOf(current.confidence, patch.confidence),
                 excludedSystems = excluded.toList(),
                 uncheckedSystems = unchecked.toList(),
-                lockTemplateResolution = true,
                 firstUserRequest = current.firstUserRequest ?: userText.trim(),
                 lastUserRequest = userText.trim()
             ),
@@ -785,32 +688,21 @@ object RecognitionEngine {
         )
     }
 
-    private fun resolveTemplate(patch: GameSchemaPatch): GameTemplateRef? {
-        patch.templateId?.let { id -> TemplateLibrary.findById(id)?.let { return it } }
-        if (patch.dropReference) return null
-        return patch.referenceGame?.let { reference -> TemplateLibrary.match(reference)?.first }
-    }
-
-    private fun similarityOf(referenceGame: String?): Double? =
-        referenceGame?.let { TemplateLibrary.match(it)?.second }
-
-    /** 识别层最终要实现的系统：用户点名 + 模板补全；已排除/未勾选系统不得自动加回。 */
+    /** 识别层最终要实现的系统：用户点名 + Lite LLM 语义建议；已排除/未勾选系统不得自动加回。 */
     fun plannedSystems(schema: GameSchema): List<String> = plannedSystems(
         requested = schema.gameSystems,
-        templateId = schema.templateId,
         excluded = schema.excludedSystems.toSet(),
         unchecked = schema.uncheckedSystems.toSet()
     )
 
     private fun plannedSystems(
         requested: List<String>,
-        templateId: String?,
         excluded: Set<String>,
         unchecked: Set<String> = emptySet()
     ): List<String> {
-        val templateSystems = templateId?.let { TemplateLibrary.findById(it)?.suggestedSystems } ?: emptyList()
-        val merged = (requested + templateSystems)
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded && it !in unchecked }
+        val merged = requested
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filterNot { it in excluded || it in unchecked }
             .distinct()
         return merged.ifEmpty { DEFAULT_SYSTEMS.filterNot { it in excluded || it in unchecked } }
     }
@@ -821,16 +713,21 @@ object RecognitionEngine {
         {
           "visualDimension": "2D | 2.5D | 3D 或 null",
           "screenOrientation": "横板 | 竖版 或 null",
-          "gameSystems": ["人物实体","道具","战斗","技能","属性等级","关卡场景","AI策略","商店经济","收集","解谜","物理","音乐节奏","塔防","合成","放置挂机","经营模拟","竞速","平台跳跃","弹幕射击","反应躲避"],
+          "gameSystems": ["参考清单选取或自创系统名"],
           "excludedSystems": ["玩家明确不要的系统"],
           "reAddSystems": ["玩家明确要求恢复的系统"],
-          "referenceGame": "著名游戏名或 null",
-          "templateId": "可匹配到的模板 id 或 null",
-          "templateSimilarity": 0.0,
           "confidence": 0.0,
-          "dropReference": false,
           "hasGameCommand": false
         }
+        关键规则：
+        1. 用户提到知名游戏（如 我的世界/塞尔达/GTA/星露谷物语/宝可梦）时，visualDimension、
+           screenOrientation、gameSystems 一律按该游戏的真实形态回答——先回想这款游戏实际长什么样、
+           核心玩法是什么，再作答（例："我的世界"→ "3D"、"横板"、["自由建造","收集","合成","人物实体"]），
+           不要泛化成通用清单；仅当用户明确要求不同形态时才偏离。
+        2. gameSystems 参考清单：["人物实体","道具","战斗","技能","属性等级","关卡场景","AI策略",
+           "商店经济","收集","解谜","物理","音乐节奏","塔防","合成","放置挂机","经营模拟","竞速",
+           "平台跳跃","弹幕射击","反应躲避","自由建造"]——清单没覆盖的玩法可自创系统名
+           （2~6 字玩法名词，如"开放探索""潜行暗杀""恋爱养成"），紧扣这款游戏的核心体验。
         用户消息：$userText
     """.trimIndent()
 
@@ -856,17 +753,6 @@ object RecognitionEngine {
         } else {
             sb.append("未明确指定游戏系统，默认按核心玩法补全：${plannedSystems(schema).joinToString("、")}。")
         }
-        if (schema.referenceGame != null) {
-            sb.append("参考对标游戏：${schema.referenceGame}")
-            if (schema.templateId != null) {
-                sb.append("（已映射模板 ${schema.templateId}，相似度 ${((schema.templateSimilarity ?: 0.0) * 100).toInt()}%）")
-            } else if (schema.lockTemplateResolution) {
-                sb.append("（已按你的修正改为自定义系统组合，不再套用原模板默认值）")
-            } else {
-                sb.append("（模板库无对应条目，template:null）")
-            }
-            sb.append("。")
-        }
         if (schema.excludedSystems.isNotEmpty()) {
             sb.append("已明确排除系统：${schema.excludedSystems.joinToString("、")}（本轮不会实现）。")
         }
@@ -881,7 +767,6 @@ object RecognitionEngine {
         return IntentConfirmation(
             userRequest = userRequest,
             gameSchema = schema,
-            intent = null,
             summary = sb.toString(),
             designAssumptions = assumptions,
             systemExplanations = explanations,
@@ -889,7 +774,28 @@ object RecognitionEngine {
             excludedSystems = schema.excludedSystems,
             draftPlan = draftPlan,
             isNewGame = isNewGame,
-            revised = revised
+            revised = revised,
+            visualDimension = schema.visualDimension,
+            screenOrientation = schema.screenOrientation
+        )
+    }
+
+    /**
+     * 确认卡上的形态覆盖（方向/维度选择器 → schema）：非法或未选择返回原值，
+     * 合法值（含同义归一，如"横屏"→横板）生效——识别层的一票否决型错误
+     * （方向/维度）从此有了卡片上的直接修正入口。
+     */
+    fun applyOrientationDimension(
+        schema: GameSchema,
+        orientation: String?,
+        dimension: String?
+    ): GameSchema {
+        val o = orientation?.let { GameSchema.normalizeOrientation(it) } ?: schema.screenOrientation
+        val d = dimension?.let { GameSchema.normalizeDimension(it) } ?: schema.visualDimension
+        if (o == schema.screenOrientation && d == schema.visualDimension) return schema
+        return schema.copy(
+            screenOrientation = o ?: schema.screenOrientation,
+            visualDimension = d ?: schema.visualDimension
         )
     }
 
@@ -912,10 +818,9 @@ object RecognitionEngine {
             implementation = GameSystemCatalog.playerFacingMethods(
                 system = system,
                 dimension = schema.visualDimension,
-                orientation = schema.screenOrientation,
-                templateId = schema.templateId
+                orientation = schema.screenOrientation
             ).joinToString("、"),
-            acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system, schema.templateId)
+            acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system)
         )
     }
 
@@ -932,7 +837,6 @@ object RecognitionEngine {
             system = impl.system,
             dimension = plan.visualDimension,
             orientation = plan.screenOrientation,
-            templateId = schema.templateId,
             plannedMethods = impl.methods
         ).joinToString("、")
     }
@@ -946,33 +850,16 @@ object RecognitionEngine {
         "碰撞检测", "状态机", "算法", "引擎", "WebGL", "矩形判定", "路径点"
     )
 
-    /** 被模板/默认值补全的设计假设，逐条回显。 */
+    /** 默认值/LLM 建议补全的设计假设，逐条回显。 */
     fun buildAssumptions(schema: GameSchema): List<String> {
         val result = mutableListOf<String>()
-        val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
-        val requested = schema.requestedSystems.toSet()
-        val excluded = schema.excludedSystems.toSet()
-
-        if (ref != null) {
-            if (schema.visualDimension == ref.suggestedDimension) {
-                result.add("参考「${ref.title}」模板，画面维度按 ${ref.suggestedDimension} 实现")
-            }
-            if (schema.screenOrientation == ref.suggestedOrientation) {
-                result.add("参考「${ref.title}」模板，画面方向按 ${ref.suggestedOrientation} 实现")
-            }
-            val added = schema.gameSystems.filterNot { it in requested || it in excluded }
-            if (added.isNotEmpty()) {
-                result.add("参考「${ref.title}」模板，将补全系统：${added.joinToString("、")}")
-            }
-        } else {
-            if (schema.visualDimension == GameSchema.DIMENSION_2D) {
-                result.add("画面维度默认假设为 2D")
-            }
-            if (schema.screenOrientation == GameSchema.ORIENTATION_PORTRAIT) {
-                result.add("画面方向默认假设为竖版（手机单手操作）")
-            }
+        if (schema.visualDimension == GameSchema.DIMENSION_2D) {
+            result.add("画面维度默认假设为 2D")
         }
-        if (schema.gameSystems.isEmpty() && ref == null) {
+        if (schema.screenOrientation == GameSchema.ORIENTATION_PORTRAIT) {
+            result.add("画面方向默认假设为竖版（手机单手操作）")
+        }
+        if (schema.gameSystems.isEmpty()) {
             result.add("未指定游戏系统，将按“反应躲避 + 收集”的默认轻量框架补全")
         }
         if (schema.excludedSystems.isNotEmpty()) {

@@ -19,16 +19,17 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -93,9 +94,16 @@ fun ChatScreen(
 
     var input by remember { mutableStateOf("") }
     var showSaveDialog by remember { mutableStateOf(false) }
+    // 撤销确认：丢弃未保存的修改不可恢复，须二次确认。
+    var showUndoDialog by remember { mutableStateOf(false) }
     // 确认卡质量档位的屏幕级持有：修正回合重建卡片时不丢失用户已选择的档位；
     // 新的首张确认卡（非重组）出现时清空，避免跨局残留。
     var pendingTier by remember { mutableStateOf<String?>(null) }
+    // 新契约：首次对话在输入框周围直接确定游戏基本信息——维度/方向（"自动"=
+    // 跟随识别与 LLM 推导）与质量档位（默认均衡）；随发送消息一并生效。
+    var formDimension by remember { mutableStateOf<String?>(null) }
+    var formOrientation by remember { mutableStateOf<String?>(null) }
+    var formTier by remember { mutableStateOf(QualityTier.BALANCED) }
     val listState = rememberLazyListState()
 
     // 列表总条目数 = 消息（含确认卡） + 生成中占位 + 错误卡片占位
@@ -170,7 +178,9 @@ fun ChatScreen(
                                 enabled = index == enabledCardIndex && !session.isGenerating,
                                 tier = if (index == enabledCardIndex) pendingTier ?: card.qualityTier else card.qualityTier,
                                 onTierChange = { pendingTier = it },
-                                onConfirm = { unchecked, tier -> vm.confirmIntent(unchecked, tier) }
+                                onConfirm = { unchecked, tier, orientation, dimension ->
+                                    vm.confirmIntent(unchecked, tier, orientation, dimension)
+                                }
                             )
                         } else {
                             MessageBubble(msg)
@@ -183,10 +193,52 @@ fun ChatScreen(
             if (session.currentHtml != null && !session.isGenerating && session.error == null && session.pendingConfirmation == null) {
                 ActionBar(
                     lastWarning = session.lastWarning,
+                    // 撤销＝保存的逆操作（保存区覆盖编辑区+上下文回滚），只对已保存游戏的编辑会话有意义
+                    canUndo = gameId != null,
                     onPlay = onPlay,
                     onSave = { showSaveDialog = true },
-                    onRegenerate = { vm.regenerate() }
+                    onUndo = { showUndoDialog = true }
                 )
+            }
+            // 新契约：首次对话（还没有任何用户消息）在输入框上方常驻形态/档位选择，
+            // 随发送消息一并确定游戏基本信息；发送后收起。
+            val firstTurn = session.messages.none { it.isUser } &&
+                session.pendingConfirmation == null && !session.isGenerating
+            if (firstTurn) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp)) {
+                    Text(
+                        "游戏基本信息（随发送生效，可留“自动”由 AI 推断）：",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        (listOf<String?>(null) + listOf("2D", "2.5D", "3D")).forEach { d ->
+                            FilterChip(
+                                selected = formDimension == d,
+                                onClick = { formDimension = d },
+                                label = { Text(d ?: "自动") }
+                            )
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        (listOf<String?>(null) + listOf("横板", "竖版")).forEach { o ->
+                            FilterChip(
+                                selected = formOrientation == o,
+                                onClick = { formOrientation = o },
+                                label = { Text(o ?: "自动") }
+                            )
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        QualityTier.ALL.forEach { t ->
+                            FilterChip(
+                                selected = formTier == t,
+                                onClick = { formTier = t },
+                                label = { Text(QualityTier.label(t)) }
+                            )
+                        }
+                    }
+                }
             }
             // 停止键动态计时：Agent 生成中每秒刷新本轮已运行时长（发送/确认/修复/再试一次起算）。
             var elapsedMs by remember { mutableStateOf(0L) }
@@ -206,8 +258,14 @@ fun ChatScreen(
                 placeholder = inputPlaceholder,
                 onValueChange = { input = it },
                 onSend = {
-                    // 确认卡待确认期间发送文本＝修正：携带当前质量档位，重建卡不丢失用户选择。
-                    vm.send(input.trim(), session.pendingConfirmation?.let { pendingTier })
+                    // 确认卡待确认期间发送文本＝修正：携带当前质量档位，重建卡不丢失用户选择；
+                    // 首次发送携带输入区形态/档位选择（新契约的基本信息前置确定）。
+                    vm.send(
+                        input.trim(),
+                        session.pendingConfirmation?.let { pendingTier } ?: formTier.takeIf { firstTurn },
+                        formDimension.takeIf { firstTurn },
+                        formOrientation.takeIf { firstTurn }
+                    )
                     input = ""
                 },
                 onStop = { vm.stopGeneration() }
@@ -232,6 +290,31 @@ fun ChatScreen(
             }
         )
     }
+
+    if (showUndoDialog) {
+        AlertDialog(
+            onDismissRequest = { showUndoDialog = false },
+            title = { Text("撤销未保存的修改") },
+            text = {
+                Text("保存区（上次保存的版本）将覆盖编辑区，本次保存之后的修改与对话记录会被丢弃。此操作不可恢复。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showUndoDialog = false
+                    vm.undoToSaved { ok ->
+                        Toast.makeText(
+                            context,
+                            if (ok) "已撤销到上次保存的版本" else "当前没有可撤销的保存点",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }) { Text("撤销") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUndoDialog = false }) { Text("取消") }
+            }
+        )
+    }
 }
 
 @Composable
@@ -249,7 +332,12 @@ private fun MessageBubble(msg: ChatMessage) {
             shape = RoundedCornerShape(16.dp),
             modifier = Modifier.widthIn(max = 320.dp)
         ) {
-            Text(msg.content, Modifier.padding(horizontal = 12.dp, vertical = 10.dp))
+            // 气泡文本可选中复制：长按起选、拖动扩选，系统选择工具栏提供"复制"。
+            // 逐气泡独立 SelectionContainer——跨懒加载条目的选择本身不可行，
+            // 单气泡内的选择与列表滚动互不干扰。
+            SelectionContainer {
+                Text(msg.content, Modifier.padding(horizontal = 12.dp, vertical = 10.dp))
+            }
         }
     }
 }
@@ -279,7 +367,7 @@ private fun IntentConfirmationCard(
     enabled: Boolean,
     tier: String,
     onTierChange: (String) -> Unit,
-    onConfirm: (Set<String>, String) -> Unit
+    onConfirm: (unchecked: Set<String>, tier: String, orientation: String, dimension: String) -> Unit
 ) {
     // 勾选状态默认全选；确认时锁定进卡片消息（uncheckedModules），历史卡重显不复位。
     // 质量档位 tier 由调用方（ChatScreen）持有：修正回合重建卡片不丢失用户已选择的档位。
@@ -287,6 +375,15 @@ private fun IntentConfirmationCard(
         mutableStateMapOf<String, Boolean>().apply {
             confirmation.modules.forEach { put(it.module, it.module !in confirmation.uncheckedModules) }
         }
+    }
+    // 画面形态选择器（方向/维度一票否决下游，识别错了玩家在卡上直接改）：
+    // 初值取卡片回显字段（旧卡空串时回退 schema 值）；确认时随 onConfirm 回传。
+    val schema = confirmation.schema
+    var selectedOrientation by remember(confirmation) {
+        mutableStateOf(confirmation.screenOrientation.ifBlank { schema.screenOrientation })
+    }
+    var selectedDimension by remember(confirmation) {
+        mutableStateOf(confirmation.visualDimension.ifBlank { schema.visualDimension })
     }
     val selectedTier = QualityTier.normalize(tier)
     Surface(
@@ -305,6 +402,33 @@ private fun IntentConfirmationCard(
                 confirmation.summary,
                 style = MaterialTheme.typography.bodySmall
             )
+            // 画面形态：识别结果可就地修正（错误类型 ↔ 修正入口对位）。
+            Spacer(Modifier.size(6.dp))
+            Text(
+                "画面形态（识别不符可直接点选修改）：",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.75f)
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("2D", "2.5D", "3D").forEach { d ->
+                    FilterChip(
+                        selected = selectedDimension == d,
+                        onClick = { if (enabled) selectedDimension = d },
+                        enabled = enabled,
+                        label = { Text(d) }
+                    )
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("横板", "竖版").forEach { o ->
+                    FilterChip(
+                        selected = selectedOrientation == o,
+                        onClick = { if (enabled) selectedOrientation = o },
+                        enabled = enabled,
+                        label = { Text(o) }
+                    )
+                }
+            }
             if (confirmation.modules.isNotEmpty()) {
                 Spacer(Modifier.size(6.dp))
                 Text(
@@ -458,7 +582,7 @@ private fun IntentConfirmationCard(
             }
             Spacer(Modifier.size(10.dp))
             Button(
-                onClick = { onConfirm(checkedModules.filterValues { !it }.keys, selectedTier) },
+                onClick = { onConfirm(checkedModules.filterValues { !it }.keys, selectedTier, selectedOrientation, selectedDimension) },
                 enabled = enabled,
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -479,9 +603,10 @@ private fun IntentConfirmationCard(
 @Composable
 private fun ActionBar(
     lastWarning: String?,
+    canUndo: Boolean,
     onPlay: () -> Unit,
     onSave: () -> Unit,
-    onRegenerate: () -> Unit
+    onUndo: () -> Unit
 ) {
     Column(
         Modifier
@@ -510,10 +635,11 @@ private fun ActionBar(
             FilledTonalButton(onClick = onSave, modifier = Modifier.weight(1f)) {
                 Text("保存")
             }
-            FilledTonalButton(onClick = onRegenerate, modifier = Modifier.weight(1f)) {
-                Icon(Icons.Filled.Refresh, contentDescription = null, Modifier.size(16.dp))
-                Spacer(Modifier.width(2.dp))
-                Text("重做")
+            // 撤销＝保存的逆操作：保存区覆盖编辑区、上下文回滚到保存点；草稿会话无保存点不显示
+            if (canUndo) {
+                FilledTonalButton(onClick = onUndo, modifier = Modifier.weight(1f)) {
+                    Text("撤销")
+                }
             }
         }
     }

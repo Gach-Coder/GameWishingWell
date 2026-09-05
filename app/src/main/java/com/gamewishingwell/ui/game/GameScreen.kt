@@ -295,7 +295,8 @@ fun GameScreen(
             },
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (source == "draft") {
+                    // 运行区（game，首页游玩入口）不提供保存；预览/草稿页可把编辑区版本保存入库。
+                    if (source != "game") {
                         OutlinedButton(onClick = {
                             closeSettings()
                             showSaveDialog = true

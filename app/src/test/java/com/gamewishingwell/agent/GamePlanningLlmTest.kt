@@ -78,7 +78,7 @@ class GamePlanningLlmTest {
 
     @Test
     fun `策划层用 LLM 阐述每个系统在具体游戏中的实现方式`() = runBlocking {
-        val schema = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val schema = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
         val plan = PlanningEngine.draftWithLlm(schema, FakeLlmClient(goldMinerReply))
 
         assertEquals(schema.gameSystems, plan.gameSystems)
@@ -101,27 +101,33 @@ class GamePlanningLlmTest {
 
     @Test
     fun `策划层 LLM 输出非法时回退静态模板实现`() = runBlocking {
-        val schema = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val schema = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
         val fallback = PlanningEngine.draftWithLlm(schema, FakeLlmClient("这不是 JSON"))
 
+        // 对标模板种子已删除：回退到系统矩阵的通用实现（不再有黄金矿工专属文案）
         val item = fallback.implementations.first { it.system == "道具" }
-        assertTrue(item.methods.any { it.contains("黄金") })
-        assertTrue(item.methods.any { it.contains("钩子前端") })
+        assertTrue(item.methods.any { it.contains("道具") || it.contains("拾取") })
+        assertTrue(item.methods.isNotEmpty())
         assertTrue(fallback.acceptanceChecklist.any { it.contains("业务验收") })
     }
 
     @Test
-    fun `策划层 LLM JSON 解析拒绝白名单外系统`() {
+    fun `策划层 LLM JSON 解析归一化系统名且清洗非法名`() {
+        // 白名单从过滤器降级为归一化器：合法自造系统（领域知识的主要表达通道）保留，
+        // 同义变体收敛，非法名（标点/超长）仍拒绝。
         val designs = PlanningEngine.parseLlmSystemDesigns(
-            """{"systems":[{"system":"道具","implementation":"合法"},{"system":"外星科技","implementation":"非法"}]}"""
+            """{"systems":[{"system":"道具","implementation":"合法"},{"system":"外星科技","implementation":"自造保留"},{"system":"建造","implementation":"归一"},{"system":"打怪,升级","implementation":"非法"}]}"""
         )
-        assertEquals(1, designs.size)
-        assertEquals("道具", designs.single().system)
+        assertEquals(3, designs.size)
+        assertTrue(designs.any { it.system == "道具" })
+        assertTrue(designs.any { it.system == "外星科技" })
+        assertTrue(designs.any { it.system == "自由建造" })
+        assertFalse(designs.any { it.system.contains(",") })
     }
 
     @Test
     fun `重组时删除module直接移除且不调用LLM`() = runBlocking {
-        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
         val plan1 = PlanningEngine.draftWithLlm(schema1, FakeLlmClient(goldMinerReply))
 
         val second = RecognitionEngine.recognize("不要道具", schema1)
@@ -153,7 +159,7 @@ class GamePlanningLlmTest {
 
     @Test
     fun `重组时新增或修改的module由LLM重新策划其余沿用上一版`() = runBlocking {
-        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
         val plan1 = PlanningEngine.draftWithLlm(schema1, FakeLlmClient(goldMinerReply))
 
         val second = RecognitionEngine.recognize("加一个技能系统，大招要炫酷", schema1)
@@ -194,7 +200,7 @@ class GamePlanningLlmTest {
 
     @Test
     fun `修改已有module时只重新策划被点名的module`() = runBlocking {
-        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
         val plan1 = PlanningEngine.draftWithLlm(schema1, FakeLlmClient(goldMinerReply))
 
         val second = RecognitionEngine.recognize("把道具改成只有黄金和石头", schema1)
@@ -226,7 +232,7 @@ class GamePlanningLlmTest {
 
     @Test
     fun `确认时取消勾选的module移出范围不视作排除且不注入prompt`() = runBlocking {
-        val schema = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val schema = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
         val draft = PlanningEngine.draftWithLlm(schema, FakeLlmClient(goldMinerReply))
 
         val applied = PlanningEngine.schemaApplyingUnchecked(schema, setOf("物理"))
@@ -256,7 +262,7 @@ class GamePlanningLlmTest {
 
     @Test
     fun `取消勾选的module不会被模板自动复活且文本点名可恢复`() {
-        val first = RecognitionEngine.recognize("做一个黄金矿工游戏", null).gameSchema
+        val first = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
         val confirmed = PlanningEngine.schemaApplyingUnchecked(first, setOf("物理"))
         assertFalse("物理" in confirmed.gameSystems)
 

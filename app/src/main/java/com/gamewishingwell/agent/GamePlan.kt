@@ -96,14 +96,6 @@ object PlanningEngine {
         "requestAnimationFrame 主循环", "全局 restart() 完整重置"
     )
 
-    // ---------- 旧 IntentSchema 兼容入口：新流程不应再从这里进入 ----------
-
-    fun draft(intent: IntentSchema, existingTitle: String? = null): DesignPlan =
-        build(intent.toGameSchema(), existingTitle)
-
-    fun finalize(intent: IntentSchema, existingTitle: String? = null): DesignPlan =
-        build(intent.toGameSchema(), existingTitle)
-
     // ---------- 新流程：策划层输入/输出共享同一份 Game Schema ----------
 
     fun draft(schema: GameSchema, existingTitle: String? = null): DesignPlan =
@@ -131,7 +123,8 @@ object PlanningEngine {
         // 生成层只是“不在本轮范围内”，不是“禁止实现”。
         val implByModule = base.implementations.associateBy { it.system }
         val remaining = effectiveSchema.gameSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in uncheckedModules }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in uncheckedModules }
             .distinct()
         val implementations = remaining.map { module ->
             implByModule[module] ?: staticImplementation(effectiveSchema, module)
@@ -148,7 +141,7 @@ object PlanningEngine {
      */
     fun schemaApplyingUnchecked(schema: GameSchema, uncheckedModules: Set<String>): GameSchema {
         if (uncheckedModules.isEmpty()) return schema
-        val valid = uncheckedModules.filter { GameSystemCatalog.isValid(it) }.toSet()
+        val valid = uncheckedModules.mapNotNull { GameSystemCatalog.admit(it) }.toSet()
         if (valid.isEmpty()) return schema
         return GameSchemaValidator.validate(
             schema.copy(
@@ -192,11 +185,8 @@ object PlanningEngine {
         existingTitle: String? = null
     ): DesignPlan {
         val target = schema.gameSystems
-            .filter {
-                GameSystemCatalog.isValid(it) &&
-                    it !in schema.excludedSystems &&
-                    it !in schema.uncheckedSystems
-            }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in schema.excludedSystems && it !in schema.uncheckedSystems }
             .distinct()
         val replan = modulesNeedingReplan(schema, previousPlan, touchedModules)
 
@@ -236,44 +226,6 @@ object PlanningEngine {
     }
 
     /**
-     * 修改已有游戏时，意图层可能只识别出局部修改词（如“加连击计分”）。
-     * 这里继承上一版策划方案中的系统，并叠加本轮明确新增/排除的系统；
-     * 玩家明确换了对标模板时不继承旧方案，避免新旧范围混在一起。
-     */
-    fun inheritExistingDesign(
-        intent: IntentSchema,
-        previous: DesignPlan?,
-        userText: String? = null
-    ): IntentSchema {
-        if (intent.intent != IntentSchema.INTENT_MODIFY_GAME || previous == null) return intent
-        if (intent.templateId != null || intent.referenceGame != null) return intent
-
-        val excluded = intent.excludedSystems.toSet()
-        val inherited = previous.gameSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
-        val merged = (inherited + intent.gameSystems)
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
-            .distinct()
-
-        val dimension = if (userText != null && !IntentEngine.explicitlySpecifiesDimension(userText)) {
-            previous.visualDimension
-        } else {
-            intent.visualDimension
-        }
-        val orientation = if (userText != null && !IntentEngine.explicitlySpecifiesOrientation(userText)) {
-            previous.screenOrientation
-        } else {
-            intent.screenOrientation
-        }
-
-        return intent.copy(
-            gameSystems = merged,
-            visualDimension = dimension,
-            screenOrientation = orientation
-        )
-    }
-
-    /**
      * Game Schema 版本的系统范围继承：用于旧会话迁移或识别层尚未补全的边界场景。
      * 新流程正常由 [RecognitionEngine.recognize] 在同一份 Game Schema 上补全。
      */
@@ -283,11 +235,11 @@ object PlanningEngine {
         userText: String? = null
     ): GameSchema {
         if (previous == null) return schema
-        if (schema.templateId != null || schema.referenceGame != null) return schema
 
         val excluded = schema.excludedSystems.toSet()
         val merged = (previous.gameSystems + schema.gameSystems)
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in excluded }
             .distinct()
         val dimension = if (userText != null && !IntentEngine.explicitlySpecifiesDimension(userText)) {
             previous.visualDimension
@@ -306,29 +258,23 @@ object PlanningEngine {
         )
     }
 
-    /** 模板 class = 画面维度 × 画面方向 × 主类型，只允许出现特征矩阵里的系统。 */
-    fun build(intent: IntentSchema, existingTitle: String? = null): DesignPlan =
-        build(intent.toGameSchema(), existingTitle)
-
-    /** 新流程核心构建：Game Schema 中已经包含最终系统集合。 */
-    fun build(schema: GameSchema, existingTitle: String? = null): DesignPlan {
+    /** 新流程核心构建：Game Schema 中已经包含最终系统集合。
+     *  allowEmptySystems=true 时不做默认系统兜底（直接制作路径：系统由生成
+     *  LLM 按用户需求与指令原话自行推导，硬塞"反应躲避+收集"反而框住设计）。 */
+    fun build(schema: GameSchema, existingTitle: String? = null, allowEmptySystems: Boolean = false): DesignPlan {
         val excluded = schema.excludedSystems.toSet()
         val unchecked = schema.uncheckedSystems.toSet()
         val fallbackSystems = listOf("反应躲避", "收集").filterNot { it in excluded || it in unchecked }
         val selected = schema.gameSystems
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded && it !in unchecked }
+            .mapNotNull { GameSystemCatalog.admit(it) }
+            .filter { it !in excluded && it !in unchecked }
             .distinct()
-            .ifEmpty { fallbackSystems }
 
-        val templateRef = schema.templateId?.let { TemplateLibrary.findById(it) }
-        // 模板补全同样尊重取消勾选：未勾选 module 不因模板建议值自动回到范围。
-        val merged = (selected + (templateRef?.suggestedSystems ?: emptyList()))
-            .filter { GameSystemCatalog.isValid(it) && it !in excluded && it !in unchecked }
-            .distinct()
-            .ifEmpty { fallbackSystems }
+        val merged = selected
+        val effective = if (allowEmptySystems) merged else merged.ifEmpty { fallbackSystems }
 
-        val implementations = merged.map { staticImplementation(schema, it) }
-        return assemblePlan(schema, existingTitle ?: defaultTitle(schema), merged, implementations)
+        val implementations = effective.map { staticImplementation(schema, it) }
+        return assemblePlan(schema, existingTitle ?: defaultTitle(schema), effective, implementations)
     }
 
     /** 模板库/系统矩阵给出的静态实现：LLM 策划的种子与回退。 */
@@ -339,11 +285,12 @@ object PlanningEngine {
             methods = GameSystemCatalog.implementationMethods(
                 system = system,
                 dimension = schema.visualDimension,
-                orientation = schema.screenOrientation,
-                templateId = schema.templateId
+                orientation = schema.screenOrientation
             ),
-            layer = TemplateSystemCatalog.resolve(schema.templateId, system)?.layer ?: spec?.layer ?: 2,
-            acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system, schema.templateId)
+            // 未知系统默认 P1（类型常见标配）：识别 LLM 抽出的核心玩法不因不在
+            // 注册表就被当成锦上添花的打磨项。
+            layer = spec?.layer ?: 1,
+            acceptanceBoundary = GameSystemCatalog.acceptanceBoundary(system)
         )
     }
 
@@ -358,8 +305,7 @@ object PlanningEngine {
         systems: List<String>,
         implementations: List<SystemImplementation>
     ): DesignPlan {
-        val templateRef = schema.templateId?.let { TemplateLibrary.findById(it) }
-        val primary = derivePrimarySystem(systems, schema.templateId)
+        val primary = derivePrimarySystem(systems)
         val matrixClass = "${schema.visualDimension}×${schema.screenOrientation}×${primary}"
 
         val p0 = linkedSetOf<String>()
@@ -390,12 +336,12 @@ object PlanningEngine {
             p0Features = p0.toList(),
             p1Features = p1.toList(),
             p2Features = p2.toList(),
-            acceptanceChecklist = buildAcceptance(schema, implementations, templateRef),
+            acceptanceChecklist = buildAcceptance(schema, implementations),
             complexityBudget = ComplexityBudget(estimatedLines = lines, estimatedScripts = scripts),
             designAssumptions = RecognitionEngine.buildAssumptions(schema),
             implementations = implementations,
             excludedSystems = buildExcludedSystems(schema),
-            excludedApproaches = buildExcludedApproaches(schema, templateRef)
+            excludedApproaches = buildExcludedApproaches(schema)
         )
     }
 
@@ -453,7 +399,7 @@ object PlanningEngine {
             else -> emptyList()
         }
         return rawDesigns
-            .filter { GameSystemCatalog.isValid(it.system) }
+            .mapNotNull { d -> GameSystemCatalog.admit(d.system)?.let { d.copy(system = it) } }
             .distinctBy { it.system }
     }
 
@@ -526,7 +472,7 @@ object PlanningEngine {
         if (designs.isEmpty()) return base
 
         val validBySystem = designs
-            .filter { GameSystemCatalog.isValid(it.system) && it.system in base.gameSystems }
+            .filter { it.system in base.gameSystems }
             .associateBy { it.system }
 
         val implementations = base.implementations.map { old ->
@@ -536,21 +482,17 @@ object PlanningEngine {
         return assemblePlan(schema, base.title, base.gameSystems, implementations)
     }
 
-    private fun derivePrimarySystem(systems: List<String>, templateId: String?): String {
+    private fun derivePrimarySystem(systems: List<String>): String {
         val priority = listOf("塔防", "弹幕射击", "平台跳跃", "竞速", "音乐节奏", "解谜", "合成", "战斗", "收集", "反应躲避")
-        val byTemplate = templateId?.let { id ->
-            TemplateLibrary.findById(id)?.suggestedSystems?.firstOrNull { systems.contains(it) }
-        }
         // 空系统时的回退必须是中性标签而不是某个具体系统名：伪装成系统名会同时
         // 污染阶段条展示（"正在生成「反应躲避」"）与 design_schema 的 primary_system，
         // 把生成往用户从未选择的系统上带。
-        return byTemplate ?: priority.firstOrNull { systems.contains(it) } ?: systems.firstOrNull() ?: "核心玩法"
+        return priority.firstOrNull { systems.contains(it) } ?: systems.firstOrNull() ?: "核心玩法"
     }
 
     private fun buildAcceptance(
         schema: GameSchema,
-        implementations: List<SystemImplementation>,
-        templateRef: GameTemplateRef?
+        implementations: List<SystemImplementation>
     ): List<String> {
         val result = mutableListOf(
             "基础校验 0 error（JS 语法 / HTML 配对 / no-undef / 资源与代码契约）",
@@ -562,7 +504,6 @@ object PlanningEngine {
             impl.methods.firstOrNull()?.let { result += "已实现：${impl.system}·$it" }
             result += "业务验收：${impl.system}·${impl.acceptanceBoundary}"
         }
-        if (templateRef != null) result += "对标「${templateRef.title}」的核心体验成立"
         result += "${schema.visualDimension} / ${schema.screenOrientation} 呈现正确"
         return result
     }
@@ -574,10 +515,10 @@ object PlanningEngine {
      * 取消勾选 ≠ 禁止实现（后续文本点名该系统自动恢复）。
      */
     private fun buildExcludedSystems(schema: GameSchema): List<String> =
-        schema.excludedSystems.filter { GameSystemCatalog.isValid(it) }.distinct()
+        schema.excludedSystems.mapNotNull { GameSystemCatalog.admit(it) }.distinct()
 
     /** 由已确认的画面维度/方向推导必须排除的实现方案，并追加平台硬约束。 */
-    private fun buildExcludedApproaches(schema: GameSchema, templateRef: GameTemplateRef?): List<String> {
+    private fun buildExcludedApproaches(schema: GameSchema): List<String> {
         val result = linkedSetOf<String>()
         when (schema.visualDimension) {
             GameSchema.DIMENSION_2D -> {
@@ -614,9 +555,7 @@ object PlanningEngine {
         result += "外部图片、音频、字体、CDN 与第三方 JS 库"
         result += "eval / new Function / 动态 require / import()"
         result += "多文件工程化构建（本轮只交付单个 index.html）"
-        if (templateRef == null) {
-            result += "照搬未授权商业游戏的美术素材与源码"
-        }
+        result += "照搬未授权商业游戏的美术素材与源码"
         return result.toList()
     }
 
@@ -642,11 +581,9 @@ object PlanningEngine {
         </design_schema>
     """.trimIndent()
 
-    private fun defaultTitle(schema: GameSchema): String {
-        val ref = schema.templateId?.let { TemplateLibrary.findById(it) }
-        if (ref != null) return ref.title
-        return schema.requestedSystems.firstOrNull()?.let { "$it 小游戏" }
+    private fun defaultTitle(schema: GameSchema): String =
+        schema.requestedSystems.firstOrNull()?.let { "$it 小游戏" }
             ?: schema.gameSystems.firstOrNull()?.let { "$it 小游戏" }
             ?: "我的小游戏"
-    }
+
 }

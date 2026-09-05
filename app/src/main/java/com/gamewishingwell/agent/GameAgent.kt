@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -201,6 +202,10 @@ class GameAgent(
          * + 常规修复轮次后仍有余量。
          */
         const val LEGACY_MAX_ROUNDS = 30
+
+        /** 确认后策划 LLM 的独立超时：超时回退静态种子继续生成（策划只是辅助，
+         *  有回退；不该让玩家在网络断时盯着"策划中"等满 5 分钟读超时）。 */
+        const val PLANNING_TIMEOUT_MS = 90_000L
     }
 
     /**
@@ -234,8 +239,10 @@ class GameAgent(
     private fun trackGenerationJob(job: Job): Job {
         // 后台保活（前台服务）：生成任务开始即启动 dataSync 前台服务（进度通知 + 停止入口 + wakelock）；
         // 服务自行观察 isGenerating 收尾，Agent 侧不主动 stop——避免上回合取消回调与下回合启动的
-        // 竞态把新回合的服务关掉。启动失败绝不影响生成本体。
+        // 竞态把新回合的服务关掉。启动失败绝不影响生成本体，但必须留痕（后台保活降级
+        // 直接表现为后台网络受限，诊断时需要这条线索）。
         runCatching { GenerationForeground.start(appContext) }
+            .onFailure { alog("前台服务启动失败（后台保活降级，后台网络可能受限）：${it.message}") }
         activeGenerationJob = job
         job.invokeOnCompletion {
             if (activeGenerationJob === job) activeGenerationJob = null
@@ -291,14 +298,17 @@ class GameAgent(
     suspend fun loadGameSession(gameId: Long) {
         if (_session.value.isGenerating) return
         withContext(Dispatchers.IO) {
-            val html = repository.loadGameHtml(gameId)
+            val savedHtml = repository.loadGameHtml(gameId)
             val messages = repository.loadGameSession(gameId)
             val persisted = repository.loadGameAgentState(gameId)
             val decoded = decodeSession(persisted)
             editingGameId = gameId
+            // 编辑区优先：编辑文件夹（agent/workspace/game-<id>）里可能有未保存的修改，
+            // 重新进入编辑对话从编辑区续作；运行区（games/<id>）只被保存按钮覆盖。
+            val editingHtml = editingWorkspaceHtml(gameId)
             _session.value = decoded.copy(
                 messages = messages.ifEmpty { decoded.messages },
-                currentHtml = html ?: decoded.currentHtml
+                currentHtml = editingHtml ?: savedHtml ?: decoded.currentHtml
             )
         }
     }
@@ -323,7 +333,12 @@ class GameAgent(
      * 独立协程中执行用户回合；调用方协程被取消（例如用户切走页面）时，
      * agentScope 中的任务继续运行，保证“生成任务在全局 GameAgent 中继续”。
      */
-    suspend fun sendUserMessage(text: String, qualityTier: String? = null) {
+    suspend fun sendUserMessage(
+        text: String,
+        qualityTier: String? = null,
+        dimensionOverride: String? = null,
+        orientationOverride: String? = null
+    ) {
         val current = _session.value
         if (current.isGenerating) return
         val trimmed = text.trim()
@@ -339,6 +354,8 @@ class GameAgent(
         val duplicate = last != null && last.isUser && last.content == trimmed
 
         val messages = if (duplicate) current.messages else current.messages + ChatMessage("user", trimmed)
+        // 输入区形态/档位选择（新契约：首次对话在输入框周围直接确定游戏基本信息）：
+        // 档位即时写入会话；形态作为玩家显式指定在识别结果之上覆盖（玩家主权）。
         _session.update {
             it.copy(
                 messages = messages,
@@ -346,48 +363,56 @@ class GameAgent(
                 error = null,
                 streamingText = null,
                 agentStage = AgentStage.INTENT,
+                qualityTier = qualityTier?.let { q -> QualityTier.normalize(q) } ?: it.qualityTier,
                 qualityVerdict = null
             )
         }
         markTurnStart()
         val job = trackGenerationJob(agentScope.launch {
-            runUserTurn(trimmed, priorConfirmation)
+            runUserTurn(trimmed, priorConfirmation, dimensionOverride, orientationOverride)
         })
         job.join()
     }
 
     /**
-     * 确认门唯一入口：“按此方案生成”按钮；点击后进入决策层并开始生成代码。
+     * 确认门唯一入口：“按此方案生成”按钮；点击后执行策划 LLM（延迟到此刻——
+     * 玩家确认后的范围才是策划输入，改主意不再白跑策划）并开始生成代码。
      * [uncheckedModules] 为卡片上被取消勾选的 module：本轮不实现、直接从方案中
      * 剔除（无 LLM 调用），但不视作玩家明确排除——不进任何“禁止实现”清单，
      * 后续文本点名该系统会自动恢复到范围。
+     * [orientationOverride]/[dimensionOverride] 为卡片上的画面形态选择器：识别
+     * 错了方向/维度（一票否决下游的错误）玩家在卡上直接改，优先级高于识别结果。
      */
-    suspend fun confirmIntent(uncheckedModules: Set<String> = emptySet(), qualityTier: String = QualityTier.BALANCED) {
+    suspend fun confirmIntent(
+        uncheckedModules: Set<String> = emptySet(),
+        qualityTier: String = QualityTier.BALANCED,
+        orientationOverride: String? = null,
+        dimensionOverride: String? = null
+    ) {
         val pending = _session.value.pendingConfirmation ?: return
         if (_session.value.isGenerating) return
         val safeTier = QualityTier.normalize(qualityTier)
 
-        // 决策层：以确认门共享的同一份 Game Schema JSON 为输入，把已确认的
-        // 策划草案定稿为最终 DesignPlan；明确排除的系统/方案继续硬性生效。
-        val session = _session.value
-        val baseSchema = pending.gameSchema
-            ?: pending.intent?.toGameSchema()
-            ?: session.gameSchema
-            ?: legacyAnchoredSchema(session)
-            ?: GameSchema()
-        val schema = PlanningEngine.schemaApplyingUnchecked(baseSchema, uncheckedModules)
-        val finalPlan = PlanningEngine.finalize(
-            schema = schema,
-            confirmedDraft = pending.draftPlan,
-            existingTitle = session.designPlan?.title,
-            uncheckedModules = uncheckedModules
+        // 卡片形态选择器优先（玩家主权）：同值 no-op、同义归一（"横屏"→横板）、非法值忽略。
+        val baseSchema = RecognitionEngine.applyOrientationDimension(
+            pending.schema,
+            orientationOverride,
+            dimensionOverride
         )
+        val schema = PlanningEngine.schemaApplyingUnchecked(baseSchema, uncheckedModules)
 
-        // 勾选状态锁进对应的卡片消息：确认/游玩/退出后卡片回显保持取消勾选，
-        // 不因页面重组（remember 重置）恢复成默认全选。
+        // 立即生效：确认点击的第一时间翻转生成状态并锁定卡片——策划 LLM 需要
+        // 2~40 秒，此前这段时间（isGenerating 仍 false、卡片仍 enabled、会话无
+        // 任何变化）用户感知"点了没反应"并连点，造成多个确认回合并发（实测 4 连点
+        // 启动了 4 个生成任务）。翻转后按钮即时禁用、聊天流出现"策划中"气泡。
         val pendingKey = IntentConfirmation.cardContent(pending)
         val lockedContent = IntentConfirmation.cardContent(
-            pending.copy(uncheckedModules = uncheckedModules.sorted().distinct(), qualityTier = safeTier)
+            pending.copy(
+                uncheckedModules = uncheckedModules.sorted().distinct(),
+                qualityTier = safeTier,
+                visualDimension = schema.visualDimension,
+                screenOrientation = schema.screenOrientation
+            )
         )
         _session.update { s ->
             s.copy(
@@ -397,17 +422,50 @@ class GameAgent(
                 isGenerating = true,
                 error = null,
                 streamingText = null,
-                agentStage = AgentStage.PLANNING,
+                agentStage = "游戏策划中：正在定稿每个系统的实现方案",
                 pendingConfirmation = null,
                 gameSchema = schema,
-                designPlan = finalPlan,
                 qualityTier = safeTier,
                 qualityVerdict = null
             )
         }
-        alog("confirm: unchecked=[${uncheckedModules.joinToString(",")}] systems=${schema.gameSystems.joinToString(",")} tier=$safeTier")
-        // 确认点击即重新起算：卡片等待用户思考的时间不属于生成回合耗时。
+        alog("confirm: unchecked=[${uncheckedModules.joinToString(",")}] systems=${schema.gameSystems.joinToString(",")} tier=$safeTier form=${schema.visualDimension}/${schema.screenOrientation}")
+        // 确认点击即起算（在即时翻转处，而非策划完成后）：策划属于本生成回合的
+        // 耗时；若放在策划后重置，停止键计时会在策划完成瞬间跳回 0 秒。
         markTurnStart()
+
+        // 策划延迟到此刻执行：LLM 异常时 draftWithLlm 内部回退静态种子，不阻塞生成。
+        val llm = createClient()
+        if (llm == null) {
+            failTurn("请先在「设置」中配置 API Key、地址和模型")
+            return
+        }
+        val draftPlan = withTimeoutOrNull(PLANNING_TIMEOUT_MS) {
+            PlanningEngine.draftWithLlm(
+                schema = schema,
+                llm = llm,
+                existingTitle = _session.value.designPlan?.title,
+                currentUserRequest = pending.userRequest
+            )
+        } ?: run {
+            // 策划只是辅助步骤（有静态种子回退）：网络断/网关挂时读超时长达 5 分钟，
+            // 不该让玩家盯着"策划中"干等——超时即回退静态方案继续生成。
+            alog("planning LLM timed out after ${PLANNING_TIMEOUT_MS / 1000}s, fallback to static seeds")
+            null
+        }
+        currentCoroutineContext().ensureActive()
+        val finalPlan = PlanningEngine.finalize(
+            schema = schema,
+            confirmedDraft = draftPlan,
+            existingTitle = _session.value.designPlan?.title,
+            uncheckedModules = uncheckedModules
+        )
+        _session.update { s ->
+            s.copy(
+                agentStage = AgentStage.PLANNING,
+                designPlan = finalPlan
+            )
+        }
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
                 generateFromIntent(pending.userRequest, schema, _session.value.currentHtml, finalPlan)
@@ -458,7 +516,9 @@ class GameAgent(
                     intent = schema,
                     existingHtml = html,
                     forcePlan = s.designPlan ?: PlanningEngine.finalize(schema),
-                    fixTurn = false
+                    fixTurn = false,
+                    // 用户主动要求的整体重做：修改范围契约对此放行。
+                    allowEntryRewrite = true
                 )
             }
         })
@@ -516,24 +576,129 @@ class GameAgent(
 
     // ---------- 保存 ----------
 
+    /**
+     * 保存按钮：把编辑区（工作区）的游戏文件整体覆盖到运行区。
+     * - 编辑已保存游戏：overwriteGameFiles 覆盖 games/<id>（版本化保留回滚历史）；
+     * - 草稿入库：saveGame 新建 games/<id>。
+     * 入口文件以会话当前发布版本为准（兼容回环的候选不经过工作区文件），
+     * 其余工作区文件（scenarios.json 等回归断言）随保存一并入库。
+     * 同时把当前会话上下文冻结为保存点（.savepoint），供"撤销"恢复。
+     */
     suspend fun saveCurrentGame(title: String): GameMeta? {
         val s = _session.value
         val html = s.currentHtml ?: return null
         val editingId = editingGameId
         val cleanTitle = title.trim().ifBlank { defaultTitle(s) }
+        // 先取编辑区文件（必须在切换 editingGameId 之前：草稿入库后工作区路径随 id 变化）
+        val files = withContext(Dispatchers.IO) { currentWorkspaceFiles() } +
+            (GameFileWorkspaceEntryPoint.DEFAULT to html)
+        val savedState = s.copy(designPlan = s.designPlan?.copy(title = cleanTitle))
         if (editingId != null) {
-            repository.updateGameHtml(editingId, html, s.messages, cleanTitle)
-            persistAgentState(editingId, s.copy(designPlan = s.designPlan?.copy(title = cleanTitle)))
+            repository.overwriteGameFiles(editingId, files, s.messages, cleanTitle)
+            persistAgentState(editingId, savedState)
+            repository.writeSavepoint(editingId, s.messages, sessionJson.encodeToString(savedState))
             return repository.listGames().firstOrNull { it.id == editingId }
         }
         val description = s.messages.firstOrNull {
             it.isUser && !it.content.contains("推荐的游戏框架")
         }?.content?.trim()?.replace(Regex("\\s+"), " ")?.take(60) ?: ""
-        val meta = repository.saveGame(cleanTitle, description, html, s.messages)
+        val meta = repository.saveGame(cleanTitle, description, files, s.messages)
         editingGameId = meta.id
         repository.clearDraft()
-        persistAgentState(meta.id, s.copy(designPlan = s.designPlan?.copy(title = cleanTitle)))
+        persistAgentState(meta.id, savedState)
+        repository.writeSavepoint(meta.id, s.messages, sessionJson.encodeToString(savedState))
         return meta
+    }
+
+    /**
+     * 撤销（保存的逆操作）：把保存区（games/<id>）的游戏文件覆盖回编辑区（工作区），
+     * 会话上下文回滚到保存点（保存时冻结的快照）——未保存的修改与其后的对话记录被丢弃。
+     * 仅对已保存游戏的编辑会话有意义（草稿没有保存点）。
+     */
+    suspend fun undoToSaved(): Boolean {
+        val editingId = editingGameId ?: return false
+        if (_session.value.isGenerating) return false
+        val ok = withContext(Dispatchers.IO) {
+            val savedHtml = repository.loadGameHtml(editingId) ?: return@withContext false
+            restoreWorkspaceFromSaved(editingId)
+            // 上下文回滚到保存点；旧版本保存的游戏没有 .savepoint 时回退到保存区实时副本（尽力而为）。
+            val spMessages = repository.loadSavepointSession(editingId) ?: repository.loadGameSession(editingId)
+            val spState = repository.loadSavepointAgentState(editingId) ?: repository.loadGameAgentState(editingId)
+            val decoded = decodeSession(spState)
+            _session.value = decoded.copy(
+                messages = spMessages.ifEmpty { decoded.messages },
+                currentHtml = savedHtml,
+                isGenerating = false,
+                streamingText = null,
+                error = null,
+                agentStage = AgentStage.IDLE,
+                pendingConfirmation = null,
+                lastWarning = "已撤销未保存的修改，回到上次保存的版本。"
+            )
+            true
+        }
+        if (ok) {
+            alog("undo: workspace + context restored to savepoint (game-$editingId)")
+            // 撤销结果同步进保存区实时会话副本：应用若在撤销后立即重启，重进编辑对话看到的也是回滚后的上下文。
+            persistSessionMessages(_session.value)
+        }
+        return ok
+    }
+
+    /**
+     * 保存区文件整体覆盖编辑区工作区：保存区不存在的编辑区文件（未保存修改新增的
+     * scenarios.json 等）一并清除，保证编辑区与保存区完全一致。
+     */
+    private suspend fun restoreWorkspaceFromSaved(gameId: Long) {
+        val root = editingWorkspaceDir(gameId)
+        val workspace = GameFileWorkspace(root)
+        val savedNames = repository.listGameFiles(gameId)
+            .filter { !it.isDirectory }
+            .map { it.name }
+            // 排除簿记与会话文件：current.txt/.sha256 是保存区平台的版本化簿记，
+            // session/agent_state 是实时上下文（不是游戏文件）。
+            .filter {
+                it != "session.json" && it != "agent_state.json" &&
+                    it != GameFileWorkspace.POINTER_FILE && !it.endsWith(".sha256")
+            }
+            .toSet()
+        root.walkTopDown()
+            .filter { it.isFile }
+            .map { it.relativeTo(root).invariantSeparatorsPath }
+            .filter { rel -> rel != GameFileWorkspace.POINTER_FILE && !rel.startsWith(".versions/") }
+            .forEach { rel -> if (rel !in savedNames) workspace.delete(rel) }
+        savedNames.forEach { name ->
+            val content = repository.loadGameFile(gameId, name) ?: return@forEach
+            if (name == GameFileWorkspaceEntryPoint.DEFAULT) {
+                val current = workspace.read(name)
+                when {
+                    current == null -> workspace.writeInitial(name, content)
+                    current != content -> workspace.writeUpdated(name, content)
+                }
+            } else {
+                val f = File(root, name)
+                f.parentFile?.mkdirs()
+                f.writeText(content, Charsets.UTF_8)
+            }
+        }
+    }
+
+    /** 编辑区（工作区）的全部游戏文件；排除平台簿记（.versions 归档与 current.txt 指针）。 */
+    private fun currentWorkspaceFiles(): Map<String, String> {
+        val root = gameWorkspaceDir()
+        val workspace = GameFileWorkspace(root)
+        return root.walkTopDown()
+            .filter { it.isFile }
+            .map { it.relativeTo(root).invariantSeparatorsPath }
+            .filter { rel -> rel != GameFileWorkspace.POINTER_FILE && !rel.startsWith(".versions/") }
+            .associateWith { rel -> workspace.read(rel) ?: "" }
+    }
+
+    /** 游戏被删除后清理其编辑区目录，避免孤儿编辑文件夹残留。 */
+    suspend fun deleteWorkspace(gameId: Long) {
+        withContext(Dispatchers.IO) {
+            runCatching { editingWorkspaceDir(gameId).deleteRecursively() }
+        }
     }
 
     suspend fun testConnection(): String {
@@ -549,7 +714,12 @@ class GameAgent(
 
     // ---------- Agent Loop 内部 ----------
 
-    private suspend fun runUserTurn(instruction: String, priorConfirmation: IntentConfirmation?) {
+    private suspend fun runUserTurn(
+        instruction: String,
+        priorConfirmation: IntentConfirmation?,
+        dimensionOverride: String? = null,
+        orientationOverride: String? = null
+    ) {
         turnMutex.withLock {
             alog("turn start: ${instruction.take(120)} priorConfirm=${priorConfirmation != null}")
 
@@ -626,42 +796,55 @@ class GameAgent(
                 generateChatReply(s, instruction, llm)
                 return@withLock
             }
-            val schema = if (recognition.emptyEntities) {
+            val baseSchema = if (recognition.emptyEntities) {
                 priorConfirmation?.schema ?: recognition.gameSchema
             } else {
                 recognition.gameSchema
             }
             // 识别结果先写回会话，后续策划/确认/生成都共享同一份 JSON。
+            // 输入区形态选择器（玩家显式）优先于识别结果。
+            val schema = RecognitionEngine.applyOrientationDimension(
+                baseSchema, orientationOverride, dimensionOverride
+            )
             _session.update { it.copy(gameSchema = schema) }
 
-            // 3) 策划层：策划子 Agent 拿到识别层共享的 module_list，逐项策划每个
-            //    module 在这款游戏中的具体实现方式（业务验收边界）。
-            //    确认门修正回合走重组：删除的 module 直接移除（无 LLM），
-            //    追加/修改的 module 才重新 LLM 策划，未涉及的沿用上一版结果；
-            //    修正回合没抽到新实体时直接沿用上一版草案，省去一次策划 LLM 调用。
-            val priorPlan = priorConfirmation?.draftPlan
-            val touchedModules = recognition.appliedPatch
-                ?.let { patch -> (patch.gameSystems + patch.reAddSystems).filter { GameSystemCatalog.isValid(it) } }
-                .orEmpty()
-                .distinct()
-            val draftPlan = when {
-                recognition.emptyEntities && priorPlan != null -> priorPlan
-                priorPlan == null -> draftPlanWithLlm(schema, s, instruction, llm)
-                else -> reorganizePlanWithLlm(schema, priorPlan, touchedModules, instruction, llm)
+            // 契约分流：消息里没有显性的游戏特征系统（如"制作一个我的世界游戏"——
+            // 只有对标名/裸需求）→ 直接开始制作，系统由生成 LLM 按档位与指令原话
+            // 自行推导（识别层/Lite 的抽取仅作参考附注，不构成硬清单）；提到了
+            // 具体机制和系统（如"塔防游戏，塔台4种，可升级和回收"）→ 走确认门，
+            // 针对点名机制策划并用卡片回显确认。
+            val explicitSystems = GameSystemCatalog.extract(instruction)
+            if (explicitSystems.isEmpty() && priorConfirmation == null) {
+                alog("route: direct-make (no explicit systems, ${schema.gameSystems.size} suggestions as reference)")
+                val directSchema = schema.copy(gameSystems = emptyList(), requestedSystems = emptyList())
+                val reference = schema.gameSystems.takeIf { it.isNotEmpty() }?.joinToString("、")
+                val directInstruction = if (reference != null) {
+                    instruction + "\n（识别层推测的游戏系统仅供参考、非实现清单：" + reference +
+                        "。请按用户需求与指令原话自行推导最合适的系统组合并实现。）"
+                } else {
+                    instruction
+                }
+                generateFromIntent(
+                    instruction = directInstruction,
+                    intent = directSchema,
+                    existingHtml = null,
+                    forcePlan = PlanningEngine.build(directSchema, allowEmptySystems = true)
+                )
+                return@withLock
             }
-            currentCoroutineContext().ensureActive()
 
+            // 确认门（策划延迟）：卡片只回显识别结果与静态玩法说明，玩家确认后
+            // 才执行策划 LLM——此前策划在确认前跑，玩家改主意/全不勾时这次策划
+            // 就白跑了；修正回合的重组策划同样合并到确认时的一次调用里。
             // 确认门期间的任何文字输入都视为补充/修正；直到点击确认按钮才进入决策层。
             val effectiveRequest = if (priorConfirmation != null) {
                 priorConfirmation.userRequest + "\n补充/修正：" + instruction
             } else {
                 instruction
             }
-            // 修正回合重建卡片时继承用户已拨动的轮次预算（否则滑条会被重置回默认 5）。
             val confirmation = RecognitionEngine.buildConfirmation(
                 userRequest = effectiveRequest,
                 schema = schema,
-                draftPlan = draftPlan,
                 isNewGame = recognition.isNewGame,
                 revised = priorConfirmation != null
             ).let { built ->
@@ -671,9 +854,9 @@ class GameAgent(
             // 仅最后一张与 pendingConfirmation 匹配的卡片可交互，其余只读回显。
             currentCoroutineContext().ensureActive()
             alog("gate card built: systems=${schema.gameSystems.joinToString(",")}")
-            val next = updateSession { s ->
-                s.copy(
-                    messages = s.messages + ChatMessage(
+            val next = updateSession { s2 ->
+                s2.copy(
+                    messages = s2.messages + ChatMessage(
                         ChatMessage.ROLE_CONFIRM_CARD,
                         IntentConfirmation.cardContent(confirmation)
                     ),
@@ -683,7 +866,6 @@ class GameAgent(
                     streamingText = null,
                     agentStage = AgentStage.CONFIRM,
                     error = null,
-                    designPlan = draftPlan,
                     qualityVerdict = null
                 )
             }
@@ -814,50 +996,6 @@ class GameAgent(
         return GameSchemaValidator.parseLiteLlmReply(reply ?: "")
     }
 
-    /** 策划层草案：由 LLM 逐项细化系统实现；LLM 异常时回退模板库/系统矩阵。 */
-    private suspend fun draftPlanWithLlm(
-        schema: GameSchema,
-        session: GameSession,
-        currentUserRequest: String,
-        llm: LlmClient
-    ): DesignPlan {
-        _session.update { it.copy(agentStage = AgentStage.PLANNING) }
-        return PlanningEngine.draftWithLlm(
-            schema = schema,
-            llm = llm,
-            existingTitle = session.designPlan?.title,
-            currentUserRequest = currentUserRequest
-        )
-    }
-
-    /**
-     * 确认门重组：追加/修改的 module 由策划子 Agent 重新策划，删除的直接移除，
-     * 未涉及的沿用上一版结果（无 LLM 调用）。
-     */
-    private suspend fun reorganizePlanWithLlm(
-        schema: GameSchema,
-        priorPlan: DesignPlan,
-        touchedModules: List<String>,
-        instruction: String,
-        llm: LlmClient
-    ): DesignPlan {
-        val replan = PlanningEngine.modulesNeedingReplan(schema, priorPlan, touchedModules)
-        val stage = if (replan.isEmpty()) {
-            "游戏策划中：已按你的修正直接增删系统，无需重新策划"
-        } else {
-            "游戏策划中：正在重新策划（${replan.joinToString("、")}），其余系统沿用已确认方案"
-        }
-        _session.update { it.copy(agentStage = stage) }
-        return PlanningEngine.reorganizeWithLlm(
-            schema = schema,
-            previousPlan = priorPlan,
-            touchedModules = touchedModules,
-            llm = llm,
-            currentUserRequest = instruction,
-            existingTitle = _session.value.designPlan?.title
-        )
-    }
-
     /** 兼容旧会话：没有 gameSchema 但已有设计稿或代码时，视为已经锚定了一个游戏。 */
     private fun legacyAnchoredSchema(session: GameSession): GameSchema? {
         session.gameSchema?.let { return it }
@@ -869,12 +1007,11 @@ class GameAgent(
                 gameSystems = plan.gameSystems,
                 requestedSystems = plan.gameSystems,
                 excludedSystems = plan.excludedSystems,
-                confidence = 1.0,
-                lockTemplateResolution = true
+                confidence = 1.0
             )
         }
         return if (!session.currentHtml.isNullOrBlank() || editingGameId != null) {
-            GameSchema(confidence = 1.0, lockTemplateResolution = true)
+            GameSchema(confidence = 1.0)
         } else {
             null
         }
@@ -941,7 +1078,9 @@ class GameAgent(
         intent: GameSchema,
         existingHtml: String?,
         forcePlan: DesignPlan?,
-        fixTurn: Boolean = false
+        fixTurn: Boolean = false,
+        /** 用户明确要求重做的回合（再试一次）：入口文件允许整量重写。 */
+        allowEntryRewrite: Boolean = false
     ) {
         val llm = createClient()
         if (llm == null) {
@@ -983,15 +1122,32 @@ class GameAgent(
         // 工具沙箱工作区：会话级目录（草稿或已保存游戏），种子为当前代码版本。
         val workspace = GameFileWorkspace(gameWorkspaceDir())
         seedWorkspace(workspace, existingHtml)
+        // 回归断言随保存入库、随编辑恢复：编辑会话的工作区缺失 scenarios.json 时
+        // 从保存区带回（保存后继续编辑不丢断言套件——"修好新问题弄坏旧功能"的回归保护）。
+        val editingIdForWs = editingGameId
+        if (editingIdForWs != null && workspace.read(GameScenarios.FILE) == null) {
+            repository.loadGameFile(editingIdForWs, GameScenarios.FILE)?.let { saved ->
+                runCatching { workspace.writeInitial(GameScenarios.FILE, saved) }
+            }
+        }
         // 条件引入机制：本轮允许的内置引擎只算一次（提示词/执行器/写入校验/验收同源共用）。
         val allowedEngines = GameEngines.allowedFor(
             plan.visualDimension,
             plan.gameSystems,
             QualityTier.normalize(_session.value.qualityTier)
         )
+        // 修改范围契约的执行层：修改/修复回合禁止整量重写入口文件（未点名的游戏逻辑
+        // 必须保持原样）；首次生成拦一次放行；用户明确要求重做（allowEntryRewrite）直接放行。
+        val scopeFence = existingHtml != null && !allowEntryRewrite
+        val rewritePolicy = when {
+            allowEntryRewrite -> EntryRewritePolicy.ALLOW
+            existingHtml == null -> EntryRewritePolicy.NUDGE_ONCE
+            else -> EntryRewritePolicy.FORBID
+        }
         val executor = GameToolExecutor(
             workspace,
-            validate = { GameValidator.validate(it, allowedEngines) }
+            validate = { GameValidator.validate(it, allowedEngines) },
+            entryRewritePolicy = rewritePolicy
         )
 
         var outcome = runToolLoop(
@@ -1003,7 +1159,8 @@ class GameAgent(
             firstGeneration = existingHtml.isNullOrBlank(),
             seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
             allowedEngines = allowedEngines,
-            fixTurn = isFixTurn
+            fixTurn = isFixTurn,
+            scopeFence = scopeFence
         )
         if (outcome is GenOutcome.LegacyFallback) {
             outcome = runLegacyRewriteLoop(
@@ -1011,7 +1168,8 @@ class GameAgent(
                 seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
                 startRound = outcome.roundsConsumed,
                 allowedEngines = allowedEngines,
-                fixTurn = isFixTurn
+                fixTurn = isFixTurn,
+                scopeFence = scopeFence
             )
         }
         val accepted = when (outcome) {
@@ -1019,6 +1177,10 @@ class GameAgent(
             is GenOutcome.LegacyFallback -> return // 不可达：上面已消费
             GenOutcome.Failed -> return
         }
+
+        // 编辑区与发布版本对齐：兼容回环的候选不经过工作区文件，验收通过后写回工作区——
+        // 保证编辑文件夹始终持有当前版本（保存按钮从编辑区整体覆盖运行区）。
+        syncWorkspaceToPublished(accepted.html)
 
         currentCoroutineContext().ensureActive()
         val elapsedMs = turnElapsedMs()
@@ -1084,12 +1246,14 @@ class GameAgent(
         /** 本轮允许的内置引擎集合（generateFromIntent 一次算好传入，验收与写入校验同源）。 */
         allowedEngines: Set<String> = GameEngines.BUNDLED.keys,
         /** 修复轮（运行报错回传/修复快车道）：自检降为一轮回归检查，且不参与预算复核。 */
-        fixTurn: Boolean = false
+        fixTurn: Boolean = false,
+        /** 修改范围契约：修改回合且未获重做授权时注入提示词（与执行层 EntryRewritePolicy 双保险）。 */
+        scopeFence: Boolean = false
     ): GenOutcome {
         val customSystem = settingsRepository.settings.value.systemPrompt.trim()
         val messages = mutableListOf(
             ChatMessage("system", GamePrompt.systemPrompt(customSystem.ifBlank { null }, toolMode = true)),
-            ChatMessage("user", buildToolContextMessage(instruction, plan, firstGeneration))
+            ChatMessage("user", buildToolContextMessage(instruction, plan, firstGeneration, scopeFence))
         )
 
         var round = 0
@@ -1182,8 +1346,18 @@ class GameAgent(
                 }
 
                 // 中途退化：模型在正文直接给出整份代码 → 按隐式写入处理（等价 overwrite 写入）。
+                // 修改范围契约：正文整份代码＝变相整量重写，与 writefile 整量重写同罪——
+                // 拒绝写入并引导 editfile（完全不会用工具的模型由上面的 LegacyFallback 分流）。
                 var content = current
                 if (directHtml != null && directHtml != current) {
+                    if (scopeFence && current != null) {
+                        messages += ChatMessage(
+                            "user",
+                            "修改范围契约：禁止以正文输出整份 HTML 的方式整量重写已有游戏（与 writefile 整量重写同罪，" +
+                                "未点名的游戏逻辑必须保持原样）。请改用 editfile 精确替换实现用户诉求：$instruction"
+                        )
+                        continue
+                    }
                     val saved = if (current == null) {
                         workspace.writeInitial(GameFileWorkspaceEntryPoint.DEFAULT, directHtml)
                     } else {
@@ -1481,7 +1655,9 @@ class GameAgent(
         /** 本轮允许的内置引擎集合（generateFromIntent 一次算好传入，与写入校验同源）。 */
         allowedEngines: Set<String> = GameEngines.BUNDLED.keys,
         /** 修复轮：自检降为一轮回归检查，且不参与预算复核（与工具模式同规则）。 */
-        fixTurn: Boolean = false
+        fixTurn: Boolean = false,
+        /** 修改范围契约：修改回合且未获重做授权时注入提示词。 */
+        scopeFence: Boolean = false
     ): GenOutcome {
         var workingHtml = existingHtml
         var feedback = ""
@@ -1619,7 +1795,8 @@ class GameAgent(
                         instruction = instruction,
                         plan = plan,
                         existingHtml = workingHtml,
-                        feedback = feedback
+                        feedback = feedback,
+                        scopeFence = scopeFence
                     ),
                     emptyList(),
                     stageLabel = genStage,
@@ -1667,7 +1844,9 @@ class GameAgent(
     private fun buildToolContextMessage(
         instruction: String,
         plan: DesignPlan,
-        firstGeneration: Boolean
+        firstGeneration: Boolean,
+        /** 修改范围契约：修改回合且用户未明确要求重做时注入（提示词与执行层 EntryRewritePolicy 双保险）。 */
+        scopeFence: Boolean = false
     ): String = buildString {
         if (firstGeneration) {
             append("参考模板（这是可读取的 game_template.html，不是用户需求）：\n\n<game_template>\n")
@@ -1685,6 +1864,15 @@ class GameAgent(
                 append("【上一轮遗留问题（未解决，本轮最优先处理）】\n$leftovers\n\n")
             }
             append("游戏工作区已有 index.html，最新内容请通过 readfile 获取（上下文中的代码可能已过期）。\n\n")
+        }
+        // 知名游戏忠实度规则先于指令：对标的理解由 LLM 按指令原话自行完成，
+        // 但"它实际怎么玩就做什么"的纪律必须显式注入，防通用清单把它拉偏。
+        append(GamePrompt.KNOWN_GAME_FIDELITY_RULE)
+        append("\n\n")
+        // 修改范围契约（硬性）：修改回合只允许动用户点名的部分，既有逻辑保持原样。
+        if (scopeFence) {
+            append(GamePrompt.SCOPE_FENCE_RULE)
+            append("\n\n")
         }
         append("用户指令：$instruction\n\n")
         append(gameContractBlock(plan))
@@ -1708,9 +1896,32 @@ class GameAgent(
         }
     }.trim()
 
-    /** 工具沙箱根目录：草稿会话与已保存游戏各自独立，路径仍严格限制在该目录内。 */
+    /** 工具沙箱根目录（编辑区）：草稿会话与已保存游戏各自独立，路径仍严格限制在该目录内。 */
     private fun gameWorkspaceDir(): File =
-        File(appContext.filesDir, "agent/workspace/" + (editingGameId?.let { "game-$it" } ?: "draft"))
+        editingGameId?.let { editingWorkspaceDir(it) }
+            ?: File(appContext.filesDir, "agent/workspace/draft")
+
+    /** 已保存游戏对应的编辑区目录。 */
+    private fun editingWorkspaceDir(gameId: Long): File =
+        File(appContext.filesDir, "agent/workspace/game-$gameId")
+
+    /** 编辑区当前的入口文件内容（无编辑区或未写过文件时为 null）。 */
+    private fun editingWorkspaceHtml(gameId: Long): String? =
+        runCatching {
+            GameFileWorkspace(editingWorkspaceDir(gameId)).read(GameFileWorkspaceEntryPoint.DEFAULT)
+        }.getOrNull()
+
+    /** 把发布版本写回编辑区工作区（内容一致则跳过）。 */
+    private suspend fun syncWorkspaceToPublished(html: String) {
+        val workspace = GameFileWorkspace(gameWorkspaceDir())
+        val current = workspace.read(GameFileWorkspaceEntryPoint.DEFAULT)
+        if (current == html) return
+        if (current == null) {
+            workspace.writeInitial(GameFileWorkspaceEntryPoint.DEFAULT, html)
+        } else {
+            workspace.writeUpdated(GameFileWorkspaceEntryPoint.DEFAULT, html)
+        }
+    }
 
     /**
      * 工作区与当前代码版本对齐：内容哈希一致则跳过，否则重置后写入 v1 种子。
@@ -1834,11 +2045,11 @@ class GameAgent(
             )
             signatureRepeat == 6 -> messages += ChatMessage(
                 "user",
-                "$kind 错误$detail 已连续出现 6 轮，局部修补已失效。请停止打补丁：用 writefile 重写包含该问题的整个模块段落，或换一种完全不同的实现方式。"
+                "$kind 错误$detail 已连续出现 6 轮，局部修补已失效。请停止打补丁：换一种完全不同的实现方式重写包含该问题的整个模块段落（修改回合用 editfile 整段替换，old_string 取该模块完整原文），而不是重复同样的修改。"
             )
             signatureRepeat > 6 && signatureRepeat % 3 == 0 -> messages += ChatMessage(
                 "user",
-                "$kind 错误$detail 仍未解决（已连续 $signatureRepeat 轮）。请再次更换实现策略；反复失败时用 writefile 对问题模块做整体重写。"
+                "$kind 错误$detail 仍未解决（已连续 $signatureRepeat 轮）。请再次更换实现策略；反复失败时对问题模块做整体重写（修改回合用 editfile 整段替换），未涉及的部分仍保持原样。"
             )
         }
     }
@@ -1903,12 +2114,14 @@ class GameAgent(
 
     private suspend fun persistSession(s: GameSession) {
         withContext(Dispatchers.IO) {
-            val html = s.currentHtml ?: return@withContext
             val editingId = editingGameId
             if (editingId != null) {
-                repository.updateGameHtml(editingId, html, s.messages)
+                // 编辑会话期间运行区（games/<id>，首页保存的游戏）不被未保存的修改覆盖：
+                // 只同步会话簿记与 Agent 状态；游戏文件由保存按钮（saveCurrentGame）整体写入。
+                repository.updateGameSessionOnly(editingId, s.messages)
                 repository.saveGameAgentState(editingId, sessionJson.encodeToString(s))
             } else {
+                val html = s.currentHtml ?: return@withContext
                 repository.saveDraft(html, s.messages)
                 repository.saveDraftAgentState(sessionJson.encodeToString(s))
             }
@@ -1969,7 +2182,9 @@ class GameAgent(
         instruction: String,
         plan: DesignPlan,
         existingHtml: String?,
-        feedback: String
+        feedback: String,
+        /** 修改范围契约：修改回合且未获重做授权时注入提示词。 */
+        scopeFence: Boolean = false
     ): List<ChatMessage> {
         val customSystem = settingsRepository.settings.value.systemPrompt.trim()
         val msgs = mutableListOf(ChatMessage("system", GamePrompt.systemPrompt(customSystem.ifBlank { null })))
@@ -1992,6 +2207,13 @@ class GameAgent(
         }
 
         val body = buildString {
+            append(GamePrompt.KNOWN_GAME_FIDELITY_RULE)
+            append("\n\n")
+            // 修改范围契约（硬性）：兼容回环的修改回合同样只允许动用户点名的部分。
+            if (scopeFence) {
+                append(GamePrompt.SCOPE_FENCE_RULE)
+                append("\n\n")
+            }
             append("用户指令：$instruction\n\n")
             append(gameContractBlock(plan))
             val leftovers = leftoverIssues()
@@ -2041,6 +2263,9 @@ class GameAgent(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                // 停止键/调整取消 OkHttp 调用会表现为 IO 异常：协程已取消时
+                // 不再进入退避重试（实测 ADJUST 后白等 5s 并留下误导性重试日志）。
+                currentCoroutineContext().ensureActive()
                 if (attempt >= 3 || !isRetryableLlmError(e)) throw e
                 val waitMs = if (attempt == 1) 5_000L else 15_000L
                 alog("LLM 调用失败（第 $attempt 次），${waitMs / 1000}s 后自动重试：${e.message?.take(140)}")

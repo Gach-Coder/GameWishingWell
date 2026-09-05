@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>许愿井 · 铁壁防线（塔防）</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0c1a12;
+    touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;overscroll-behavior:none;}
+  #g{display:block;width:100vw;height:100vh;background:#0c1a12;}
+</style>
+</head>
+<body>
+<canvas id="g"></canvas>
+<script>
+'use strict';
+/* ================= 全局变量（集中顶部声明） ================= */
+var canvas = document.getElementById('g');
+var ctx = canvas ? canvas.getContext('2d') : null;
+var W = 0, H = 0;
+var TOP_RES = 110;                        /* 顶部平台保留区 */
+var BASE_TOP = 166;                       /* 场地网格基准顶（HUD 在其上） */
+var BAR_H = 128;                          /* 底部建造栏高度 */
+var GRID_TOP = 170, BUT_Y = 0;            /* 网格顶部 / 建造栏顶部(实际Y) */
+var CELL = 64, COLS = 6, ROWS = 7;
+var state = 'menu';                       /* menu / playing / pause / over */
+var score = 0, gold = 190, lives = 18, wave = 0, kills = 0;
+var enemies = [], towers = [], bullets = [], parts = [];
+var path = [], pathLen = [], totalLen = 0;
+var spawnQ = [], spawnT = 0, restT = 1.2, wstate = 'rest', spawnInt = 1.0;
+var armed = 0, selT = -1;                 /* 0无 / 1炮塔 / 2冰塔 ; 选中塔索引 */
+var bannerT = 0, bannerMsg = '';
+var nid = 1;                              /* 敌人唯一编号 */
+var last = 0, actx = null, lastTouchT = 0;
+var TDEF = [
+  null,
+  {name:'炮塔', cost:40, dmg:14, cd:0.82, range:128, color:'#ffb03a', up:[0,55,95], tip:'高伤单体'},
+  {name:'冰塔', cost:32, dmg:4,  cd:0.60, range:112, color:'#49d7ff', up:[0,50,85], tip:'减速控场'}
+];
+var EDEF = {
+  grunt : {r:13, hp:30, spd:70,  arm:0, g:7,  color:'#ff5f56'},
+  runner: {r:10, hp:16, spd:158, arm:0, g:9,  color:'#ffd166'},
+  brute : {r:19, hp:150,spd:42,  arm:2, g:20, color:'#c77bff'}
+};
+var barBtns = [];                         /* 底部按钮布局 */
+var SELCO = '#ffffff';
+
+/* ================= 工具函数 ================= */
+function clamp(v,a,b){ return v<a?a:(v>b?b:v); }
+function rnd(a,b){ return a+Math.random()*(b-a); }
+function dist2(x1,y1,x2,y2){ var dx=x2-x1, dy=y2-y1; return dx*dx+dy*dy; }
+function segDist(px,py,ax,ay,bx,by){
+  var dx=bx-ax, dy=by-ay, l2=dx*dx+dy*dy;
+  if (l2<=0.0001) return Math.sqrt(dist2(px,py,ax,ay));
+  var t=clamp(((px-ax)*dx+(py-ay)*dy)/l2,0,1);
+  return Math.sqrt(dist2(px,py,ax+dx*t,ay+dy*t));
+}
+function roadDist(cx,cy){
+  var m=1e9;
+  for (var i=1;i<path.length;i++){
+    var d=segDist(cx,cy,path[i-1][0],path[i-1][1],path[i][0],path[i][1]);
+    if (d<m) m=d;
+  }
+  return m;
+}
+function ptAt(d){
+  if (path.length<2) return {x:0,y:0};
+  d=clamp(d,0,totalLen); var i=0;
+  while (i<path.length-2 && d>pathLen[i+1]) i++;
+  var a=path[i], b=path[i+1];
+  var seg=(pathLen[i+1]-pathLen[i])||1, t=(d-pathLen[i])/seg;
+  return {x:a[0]+(b[0]-a[0])*t, y:a[1]+(b[1]-a[1])*t};
+}
+function towerAt(c,r){
+  for (var i=0;i<towers.length;i++) if (towers[i].c===c && towers[i].r===r) return i;
+  return -1;
+}
+function cellXY(c,r){ return {x:(c+0.5)*CELL, y:GRID_TOP+(r+0.5)*CELL}; }
+function cellFree(c,r){
+  if (c<0||r<0||c>=COLS||r>=ROWS) return false;
+  var p=cellXY(c,r);
+  if (roadDist(p.x,p.y) < CELL*0.56) return false;
+  if (towerAt(c,r)>=0) return false;
+  return true;
+}
+function inRect(x,y,rx,ry,rw,rh,pad){
+  pad = (pad===undefined)? 14 : pad;
+  return x>=rx-pad && x<=rx+rw+pad && y>=ry-pad && y<=ry+rh+pad;
+}
+
+/* ================= 音效(WebAudio 振荡器) ================= */
+function beep(f,dur,type,vol){
+  try{
+    if (!actx) actx = new (window.AudioContext||window.webkitAudioContext)();
+    if (actx.state==='suspended') actx.resume();
+    var o=actx.createOscillator(), g=actx.createGain();
+    o.type=type||'square'; o.frequency.value=f;
+    o.connect(g); g.connect(actx.destination);
+    var t0=actx.currentTime;
+    g.gain.setValueAtTime(vol||0.11,t0);
+    g.gain.exponentialRampToValueAtTime(0.001,t0+(dur||0.12));
+    o.start(t0); o.stop(t0+(dur||0.13));
+  }catch(e){}
+}
+function sfx(k){
+  if (k==='kill') beep(620,0.07,'square',0.07);
+  else if (k==='place') beep(330,0.12,'sawtooth',0.09);
+  else if (k==='coin') beep(940,0.08,'triangle',0.08);
+  else if (k==='hit') beep(190,0.05,'square',0.05);
+  else if (k==='over') { beep(140,0.5,'sawtooth',0.13); }
+  else if (k==='tap') beep(660,0.05,'triangle',0.07);
+  else if (k==='err') beep(115,0.16,'square',0.09);
+  else if (k==='fire') beep(880,0.04,'triangle',0.03);
+  else if (k==='leak') beep(180,0.22,'sawtooth',0.11);
+}
+
+/* ================= 场地几何 ================= */
+function buildPath(){
+  var t=GRID_TOP, b=GRID_TOP+ROWS*CELL, h=b-t;
+  var cx=W*0.5, amp=Math.min(W*0.15, CELL*1.28);
+  var ys=[0.14,0.30,0.46,0.62,0.78,0.92];
+  path=[];
+  function P(x,y){ path.push([x,y]); }
+  P(cx, t+CELL*0.35);
+  P(cx, t+ys[0]*h);
+  P(cx-amp, t+ys[0]*h); P(cx-amp, t+ys[1]*h);
+  P(cx+amp, t+ys[1]*h); P(cx+amp, t+ys[2]*h);
+  P(cx-amp, t+ys[2]*h); P(cx-amp, t+ys[3]*h);
+  P(cx+amp, t+ys[3]*h); P(cx+amp, t+ys[4]*h);
+  P(cx-amp, t+ys[4]*h); P(cx-amp, t+ys[5]*h);
+  P(cx, t+ys[5]*h);
+  P(cx, b+26);
+  pathLen=[0]; totalLen=0;
+  for (var j=1;j<path.length;j++){
+    totalLen+=Math.sqrt(dist2(path[j-1][0],path[j-1][1],path[j][0],path[j][1]));
+    pathLen.push(totalLen);
+  }
+}
+function layout(){
+  W = window.innerWidth||360;
+  H = window.innerHeight||640;
+  if (canvas){ canvas.width=W; canvas.height=H; }
+  BUT_Y = H - BAR_H;
+  CELL = clamp(W/COLS, 42, 88);
+  var avail = H - BAR_H - BASE_TOP - 8;
+  if (avail < 180) avail = 180;
+  var maxRows = Math.floor(avail/CELL);
+  ROWS = clamp(maxRows, 5, 9);
+  var used = ROWS*CELL;
+  if (used > avail) CELL = Math.max(38, avail/ROWS);
+  GRID_TOP = BASE_TOP + Math.round((avail - ROWS*CELL)/2);
+  buildPath();
+  /* 底部建造栏按钮 */
+  barBtns = [];
+  var kinds = ['t1','t2','up','pause'];
+  var pad=10, gap=8, n=kinds.length;
+  var bw=(W-pad*2-gap*(n-1))/n, bh=76;
+  var by=BUT_Y + Math.round((BAR_H-bh)/2)+6;
+  for (var i=0;i<n;i++){
+    barBtns.push({kind:kinds[i], x:pad+i*(bw+gap), y:by, w:bw, h:bh});
+  }
+}
+
+/* ================= 重置 / 开局 ================= */
+function resetRun(){
+  score=0; gold=190; lives=18; wave=0; kills=0;
+  enemies=[]; towers=[]; bullets=[]; parts=[];
+  spawnQ=[]; spawnT=0; restT=1.4; wstate='rest'; spawnInt=1.0;
+  armed=0; selT=-1; bannerT=0; bannerMsg='';
+  if (path.length===0) buildPath();
+}
+function startGame(){ resetRun(); state='playing'; bannerT=1.6; bannerMsg='守住防线！'; beep(440,0.18,'triangle',0.12); }
+function restart(){ resetRun(); state='menu'; }
+
+/* ================= 波次生成 ================= */
+function buildWaveQueue(w){
+  var q=[], i;
+  var nG=Math.min(3+Math.ceil(w*1.9), 26);
+  for (i=0;i<nG;i++) q.push('grunt');
+  if (w>=3){ var nR=Math.min(Math.floor((w-2)*1.4), 15); for (i=0;i<nR;i++) q.push('runner'); }
+  if (w>=5){ var nB=Math.min(Math.floor((w-3)/2), 13);  for (i=0;i<nB;i++) q.push('brute'); }
+  for (i=q.length-1;i>0;i--){ var j=Math.floor(Math.random()*(i+1)), tt=q[i]; q[i]=q[j]; q[j]=tt; }
+  return q;
+}
+function beginWave(w){
+  wave=w; kills=0;
+  spawnQ=buildWaveQueue(w);
+  spawnInt=Math.max(0.42, 1.02-w*0.045);
+  spawnT=0.8; wstate='spawn';
+  bannerT=1.6; bannerMsg='第 '+w+' 波来袭';
+  sfx('tap');
+}
+function spawnEnemy(type){
+  var d=EDEF[type];
+  var mult=1+(wave-1)*0.16;
+  var spdScale=Math.max(0.82, 1-(wave-1)*0.018);
+  var p=ptAt(0);
+  enemies.push({
+    uid:nid++, type:type, d:0, x:p.x, y:p.y,
+    hp:Math.round(d.hp*mult), maxhp:Math.round(d.hp*mult),
+    spd:d.spd*spdScale, r:d.r, arm:d.arm, color:d.color,
+    slow:0, slowF:1
+  });
+}
+
+/* ================= 塔 / 子弹 ================= */
+function placeTower(c,r,type){
+  var p=cellXY(c,r);
+  towers.push({
+    c:c, r:r, x:p.x, y:p.y, type:type, lvl:1,
+    dmg:TDEF[type].dmg, range:TDEF[type].range, cd:TDEF[type].cd, t:0
+  });
+}
+function towerStats(t){
+  t.dmg=TDEF[t.type].dmg*(1+0.55*(t.lvl-1));
+  t.range=TDEF[t.type].range+(t.lvl-1)*18;
+  t.cd=TDEF[t.type].cd*(1-0.08*(t.lvl-1));
+}
+function tryUpgrade(){
+  if (selT<0 || selT>=towers.length){ sfx('err'); return; }
+  var t=towers[selT], def=TDEF[t.type];
+  if (t.lvl>=3){ sfx('err'); return; }
+  var cost=def.up[t.lvl];
+  if (gold<cost){ sfx('err'); return; }
+  gold-=cost; t.lvl++; towerStats(t);
+  parts.push({x:t.x, y:t.y-20, vx:0, vy:-28, life:0.9, max:0.9, txt:'升级 Lv'+t.lvl, color:'#ffe28a'});
+  sfx('place');
+}
+function killEnemy(e){
+  var gv=EDEF[e.type].g;
+  gold+=gv; score+=gv; kills+=1;
+  parts.push({x:e.x, y:e.y-8, vx:0, vy:-34, life:0.8, max:0.8, txt:'+'+gv, color:'#ffe28a'});
+  for (var p=0;p<7;p++){
+    parts.push({x:e.x, y:e.y, vx:rnd(-70,70), vy:rnd(-80,20), life:rnd(0.3,0.5), max:0.5, txt:'', color:e.color});
+  }
+  sfx('kill');
+}
+function hitEnemy(e, dmg, ice){
+  var real=Math.max(1, dmg-(e.arm||0));
+  e.hp-=real;
+  if (ice && e.hp>0){ e.slow=1.0; e.slowF=0.4; }
+  parts.push({x:e.x, y:e.y-10, vx:0, vy:-22, life:0.4, max:0.4, txt:'-'+real, color:ice?'#8fe8ff':'#ffc48a'});
+  sfx('hit');
+  if (e.hp<=0){
+    var idx=enemies.indexOf(e);
+    if (idx>=0){ enemies.splice(idx,1); killEnemy(e); }
+  }
+}
+
+/* ================= 主更新 ================= */
+function update(dt){
+  if (state!=='playing') return;
+  if (bannerT>0) bannerT-=dt;
+  /* 波次控制 */
+  if (wstate==='rest'){
+    restT-=dt;
+    if (restT<=0){ beginWave(wave+1); }
+  } else if (wstate==='spawn'){
+    spawnT-=dt;
+    while (spawnT<=0 && spawnQ.length>0){
+      spawnEnemy(spawnQ.shift()); spawnT+=spawnInt;
+    }
+    if (spawnQ.length===0) wstate='finish';
+  } else if (wstate==='finish'){
+    if (enemies.length===0){
+      var bonus=12+wave*2;
+      gold+=bonus; score+=bonus; kills=0;
+      parts.push({x:W*0.5, y:GRID_TOP+40, vx:0, vy:0, life:1.1, max:1.1, txt:'清波奖励 +'+bonus, color:'#ffe28a'});
+      sfx('coin');
+      wstate='rest'; restT=2.4;
+    }
+  }
+  /* 敌人移动 */
+  for (var i=enemies.length-1;i>=0;i--){
+    var e=enemies[i];
+    if (e.slow>0){ e.slow-=dt; if (e.slow<=0){ e.slow=0; e.slowF=1; } else e.slowF=0.4; }
+    else e.slowF=1;
+    e.d+=e.spd*e.slowF*dt;
+    if (e.d>=totalLen){
+      lives-=1; sfx('leak');
+      parts.push({x:W*0.5, y:BUT_Y-20, vx:0, vy:0, life:0.9, max:0.9, txt:'漏敌！', color:'#ff7a6b'});
+      enemies.splice(i,1);
+      if (lives<=0){
+        lives=0; state='over'; bannerT=0; sfx('over');
+        return;
+      }
+    } else {
+      var pp=ptAt(e.d); e.x=pp.x; e.y=pp.y;
+    }
+  }
+  /* 塔攻击(射程内最靠前的敌人) */
+  for (var ti=0;ti<towers.length;ti++){
+    var t=towers[ti];
+    if (t.t>0) t.t-=dt;
+    if (t.t<=0){
+      var best=-1, bd=-1e9;
+      for (var k=0;k<enemies.length;k++){
+        var e2=enemies[k];
+        if (dist2(t.x,t.y,e2.x,e2.y)<=t.range*t.range){
+          if (e2.d>bd){ best=k; bd=e2.d; }
+        }
+      }
+      if (best>=0){
+        var tar=enemies[best];
+        if (bullets.length<140){
+          bullets.push({x:t.x, y:t.y-6, tgt:tar.uid, dmg:t.dmg, ice:(t.type===2), spd:460});
+        }
+        t.t=t.cd;
+        sfx('fire');
+      }
+    }
+  }
+  /* 子弹飞行 */
+  for (var bi=bullets.length-1;bi>=0;bi--){
+    var b=bullets[bi], te=null;
+    for (var kk=0;kk<enemies.length;kk++){
+      if (enemies[kk].uid===b.tgt){ te=enemies[kk]; break; }
+    }
+    if (!te){ bullets.splice(bi,1); continue; }
+    var dx=te.x-b.x, dy=te.y-b.y;
+    var dd=Math.sqrt(dx*dx+dy*dy);
+    if (dd<=0.001){ dd=0.001; }
+    var step=b.spd*dt;
+    if (dd<=step+te.r+3){
+      bullets.splice(bi,1);
+      hitEnemy(te, b.dmg, b.ice);
+    } else {
+      b.x+=dx/dd*step; b.y+=dy/dd*step;
+    }
+  }
+  /* 粒子 */
+  for (var pi=parts.length-1;pi>=0;pi--){
+    var pa=parts[pi];
+    pa.life-=dt; pa.x+=pa.vx*dt; pa.y+=pa.vy*dt;
+    if (pa.txt==='' && pa.vy){ pa.vy+=300*dt; }
+    if (pa.life<=0) parts.splice(pi,1);
+  }
+}
+
+/* ================= 绘制辅助 ================= */
+function rr(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+function tracePath(){
+  if (path.length<2) return;
+  ctx.beginPath();
+  ctx.moveTo(path[0][0],path[0][1]);
+  for (var i=1;i<path.length;i++) ctx.lineTo(path[i][0],path[i][1]);
+  ctx.stroke();
+}
+function drawHUD(){
+  ctx.save();
+  /* 顶部信息带(120 安全区之下) */
+  var bandH=42, bandY=TOP_RES+12;
+  ctx.fillStyle='rgba(6,14,12,0.62)';
+  rr(6, bandY, W-12, bandH, 12); ctx.fill();
+  ctx.fillStyle='#ffe28a'; ctx.font='bold 15px sans-serif';
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.fillText('❤ '+lives, 20, bandY+21);
+  ctx.textAlign='center';
+  ctx.fillStyle='#d9f2e0';
+  var mid='第 '+wave+' 波';
+  if (wave===0) mid='备战中';
+  else if (wstate==='spawn') mid='第 '+wave+' 波 · 敌 '+enemies.length+'/'+(enemies.length+spawnQ.length);
+  ctx.fillText(mid, W/2, bandY+21);
+  ctx.textAlign='right';
+  ctx.fillStyle='#7ee8a8';
+  ctx.fillText('金 '+gold, W-20, bandY+14);
+  ctx.fillStyle='#bfe3ff';
+  ctx.fillText('分 '+score, W-20, bandY+29);
+  ctx.restore();
+}
+function drawBar(){
+  ctx.save();
+  var by=BUT_Y;
+  ctx.fillStyle='#14261d';
+  ctx.fillRect(0, by, W, H-by);
+  ctx.fillStyle='rgba(255,255,255,0.08)';
+  ctx.fillRect(0, by, W, 2);
+  /* 顶部小字提示 */
+  ctx.font='12px sans-serif'; ctx.textBaseline='alphabetic';
+  ctx.textAlign='left'; ctx.fillStyle='#9fd8b4';
+  var tip='';
+  if (armed>0) tip='点空地建造 / 点塔升级';
+  else if (selT>=0 && selT<towers.length) tip=TDEF[towers[selT].type].name+' Lv'+towers[selT].lvl+' · 再点建造';
+  else tip='选炮塔或冰塔，拦截敌人';
+  ctx.fillText(tip, 12, by+16);
+  /* 按钮 */
+  for (var i=0;i<barBtns.length;i++){
+    var b=barBtns[i], x=b.x, y=b.y, w=b.w, h=b.h;
+    var kind=b.kind, active=false, label='', sub='', disable=false, col='#2c4a3a';
+    if (kind==='t1'){ active=(armed===1); label=TDEF[1].name; sub=TDEF[1].cost+' 金'; col=TDEF[1].color; }
+    else if (kind==='t2'){ active=(armed===2); label=TDEF[2].name; sub=TDEF[2].cost+' 金'; col=TDEF[2].color; }
+    else if (kind==='up'){
+      label='升级';
+      if (selT>=0 && selT<towers.length){
+        var t=towers[selT];
+        if (t.lvl<3){ sub=TDEF[t.type].up[t.lvl]+' 金'; col=TDEF[t.type].color; }
+        else { sub='已满级'; disable=true; col='#888'; }
+      } else { sub='选塔'; disable=true; col='#888'; }
+    } else if (kind==='pause'){
+      label=(state==='playing')?'暂停':((state==='pause')?'继续':'暂停');
+      col='#7fa3ff';
+    }
+    ctx.fillStyle='rgba(255,255,255,0.10)';
+    rr(x, y, w, h, 12); ctx.fill();
+    if (active){ ctx.strokeStyle='#fff'; ctx.lineWidth=3; rr(x-3,y-3,w+6,h+6,14); ctx.stroke(); }
+    else { ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=2; rr(x,y,w,h,12); ctx.stroke(); }
+    ctx.fillStyle=col;
+    ctx.beginPath();
+    ctx.arc(x+w/2, y+20, 8, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle=active?'#fff':'#d9f2e0';
+    ctx.font='bold 16px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(label, x+w/2, y+40);
+    ctx.fillStyle=disable?'#888':'#ffe28a';
+    ctx.font='11px sans-serif';
+    ctx.fillText(sub, x+w/2, y+59);
+  }
+  ctx.restore();
+}
+function drawField(){
+  ctx.save();
+  var gy0=GRID_TOP, gy1=GRID_TOP+ROWS*CELL;
+  /* 棋盘底色 */
+  ctx.fillStyle='rgba(26,54,40,0.25)';
+  ctx.fillRect(0, gy0, W, gy1-gy0+14);
+  for (var r=0;r<ROWS;r++){
+    for (var c=0;c<COLS;c++){
+      var px=(c+0.5)*CELL, py=gy0+(r+0.5)*CELL;
+      var fx=px-CELL/2, fy=py-CELL/2;
+      ctx.fillStyle=((c+r)%2===0)?'rgba(120,180,140,0.05)':'rgba(0,0,0,0.05)';
+      ctx.fillRect(fx, fy, CELL, CELL);
+    }
+  }
+  /* 道路 */
+  ctx.lineCap='round'; ctx.lineJoin='round';
+  ctx.strokeStyle='rgba(0,0,0,0.5)'; ctx.lineWidth=CELL*0.78; tracePath();
+  ctx.strokeStyle='#c9a264'; ctx.lineWidth=CELL*0.62; tracePath();
+  ctx.strokeStyle='rgba(120,84,40,0.55)'; ctx.lineWidth=CELL*0.10;
+  ctx.setLineDash([12,16]); tracePath(); ctx.setLineDash([]);
+  /* 出入口 */
+  var p0=ptAt(0), p1=ptAt(totalLen);
+  ctx.strokeStyle='#7ef0b8'; ctx.lineWidth=4;
+  ctx.beginPath(); ctx.arc(p0.x, p0.y, 16, 0, Math.PI*2); ctx.stroke();
+  ctx.strokeStyle='#ff7a6b';
+  ctx.beginPath(); ctx.arc(p1.x, p1.y, 15, 0, Math.PI*2); ctx.stroke();
+  ctx.restore();
+}
+function drawTowers(){
+  ctx.save();
+  for (var i=0;i<towers.length;i++){
+    var t=towers[i], def=TDEF[t.type];
+    var col=t.color;
+    var r=CELL*0.34;
+    /* 高亮选中的塔 */
+    if (i===selT){
+      ctx.fillStyle='rgba(255,255,255,0.10)';
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.range, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.range, 0, Math.PI*2); ctx.stroke();
+    }
+    /* 阴影 */
+    ctx.fillStyle='rgba(0,0,0,0.35)';
+    ctx.beginPath(); ctx.ellipse(t.x+2, t.y+3, r*0.9, r*0.6, 0, 0, Math.PI*2); ctx.fill();
+    /* 底座 */
+    ctx.fillStyle='#333f38';
+    ctx.beginPath(); ctx.arc(t.x, t.y, r*0.86, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,0.4)'; ctx.lineWidth=2; ctx.stroke();
+    /* 塔身 */
+    ctx.fillStyle=col;
+    ctx.beginPath(); ctx.arc(t.x, t.y-2, r*0.62, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,0.55)';
+    ctx.beginPath(); ctx.arc(t.x-3, t.y-6, r*0.22, 0, Math.PI*2); ctx.fill();
+    /* 等级点 */
+    ctx.fillStyle='#fff';
+    for (var l=0;l<t.lvl;l++){
+      ctx.beginPath();
+      ctx.moveTo(t.x+l*7-8, t.y-r*0.72-8); ctx.lineTo(t.x+l*7-4, t.y-r*0.72-13);
+      ctx.lineTo(t.x+l*7,   t.y-r*0.72-8); ctx.closePath(); ctx.fill();
+    }
+    if (i===selT){
+      ctx.strokeStyle=SELCO; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(t.x, t.y-2, r*0.66, 0, Math.PI*2); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+function drawEnemies(){
+  ctx.save();
+  for (var i=0;i<enemies.length;i++){
+    var e=enemies[i];
+    /* 影子 */
+    ctx.fillStyle='rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.ellipse(e.x, e.y+e.r*0.72, e.r*0.95, e.r*0.42, 0, 0, Math.PI*2); ctx.fill();
+    /* 身体 */
+    var g=ctx.createRadialGradient(e.x-4, e.y-6, 2, e.x, e.y, e.r+2);
+    var c1=e.color, c2='#7a2733';
+    if (e.type==='runner') c2='#8a6a1a';
+    if (e.type==='brute') c2='#5b2d86';
+    g.addColorStop(0,'#ffffff'); g.addColorStop(0.25,c1); g.addColorStop(1,c2);
+    ctx.fillStyle=g;
+    ctx.beginPath(); ctx.arc(e.x, e.y-2, e.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,0.45)'; ctx.lineWidth=2; ctx.stroke();
+    /* 冰冻效果 */
+    if (e.slow>0){
+      ctx.strokeStyle='rgba(140,230,255,0.85)'; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(e.x, e.y-2, e.r+3, 0, Math.PI*2); ctx.stroke();
+    }
+    /* 血条 */
+    if (e.hp<e.maxhp){
+      var bw=e.r*2.3, bh=5, bx=e.x-bw/2, byy=e.y-e.r-12;
+      ctx.fillStyle='rgba(0,0,0,0.6)';
+      ctx.fillRect(bx, byy, bw, bh);
+      ctx.fillStyle=e.type==='brute'?'#c77bff':(e.type==='runner'?'#ffd166':'#6bff8e');
+      ctx.fillRect(bx, byy, bw*clamp(e.hp/e.maxhp,0,1), bh);
+    }
+  }
+  ctx.restore();
+}
+function drawBullets(){
+  ctx.save();
+  for (var i=0;i<bullets.length;i++){
+    var b=bullets[i];
+    if (b.ice){
+      ctx.strokeStyle='rgba(140,230,255,0.8)'; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(b.x, b.y, 4.5, 0, Math.PI*2); ctx.stroke();
+      ctx.fillStyle='#bfefff'; ctx.fill();
+    } else {
+      ctx.fillStyle='#ffd27a';
+      ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle='#fff';
+      ctx.beginPath(); ctx.arc(b.x-1, b.y-1, 1.6, 0, Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+function drawParts(){
+  ctx.save();
+  for (var i=0;i<parts.length;i++){
+    var p=parts[i];
+    var a=clamp(p.life/p.max, 0, 1);
+    ctx.globalAlpha=a;
+    if (p.txt){
+      ctx.font='bold 15px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillStyle=p.color;
+      ctx.fillText(p.txt, p.x, p.y);
+    } else {
+      ctx.fillStyle=p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 3.5*a+1, 0, Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.globalAlpha=1;
+  ctx.restore();
+}
+function drawBanner(){
+  if (bannerT<=0) return;
+  var a=clamp(bannerT/0.4, 0, 1);
+  if (bannerT>1.2) a=1;
+  ctx.save();
+  ctx.globalAlpha=Math.min(1,a);
+  ctx.font='bold 30px sans-serif';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  ctx.fillText(bannerMsg, W/2+2, GRID_TOP+80+2);
+  ctx.fillStyle='#ffe28a';
+  ctx.fillText(bannerMsg, W/2, GRID_TOP+80);
+  ctx.restore();
+}
+function bigBtn(cx,cy,w,h,label,sub){
+  var x=cx-w/2, y=cy-h/2;
+  ctx.fillStyle='rgba(8,20,14,0.82)';
+  rr(x, y, w, h, 14); ctx.fill();
+  ctx.strokeStyle='#7ee8a8'; ctx.lineWidth=2; ctx.stroke();
+  ctx.fillStyle='#7ee8a8'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.font='bold 21px sans-serif';
+  ctx.fillText(label, cx, y+ (sub? h*0.34 : h/2));
+  if (sub){
+    ctx.fillStyle='#9fd8b4'; ctx.font='13px sans-serif';
+    ctx.fillText(sub, cx, y+h*0.72);
+  }
+  return {x:x, y:y, w:w, h:h};
+}
+function drawMenu(){
+  ctx.save();
+  ctx.fillStyle='rgba(4,12,9,0.72)';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#ffe28a'; ctx.font='bold 34px sans-serif';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('铁壁防线', W/2, H*0.30);
+  ctx.fillStyle='#bfe3ff'; ctx.font='14px sans-serif';
+  ctx.fillText('建造炮塔，拦截沿路来袭的敌人', W/2, H*0.30+30);
+  ctx.fillText('炮塔高伤 · 冰塔减速 · 点击塔可升级', W/2, H*0.30+52);
+  bigBtn(W/2, H*0.58, Math.min(W*0.6,260), 74, '开 始', '第1波准备就绪');
+  ctx.restore();
+}
+function drawOver(){
+  ctx.save();
+  ctx.fillStyle='rgba(10,6,4,0.78)';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#ff6b5e'; ctx.font='bold 30px sans-serif';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('防线失守', W/2, H*0.30);
+  ctx.fillStyle='#ffe28a'; ctx.font='17px sans-serif';
+  ctx.fillText('撑到第 '+wave+' 波', W/2, H*0.30+40);
+  ctx.fillStyle='#bfe3ff';
+  ctx.fillText('得分 '+score+'    金币 '+gold, W/2, H*0.30+68);
+  bigBtn(W/2, H*0.56, Math.min(W*0.6,260), 74, '回到标题', '可从新的一局开始');
+  ctx.restore();
+}
+function drawPause(){
+  ctx.save();
+  ctx.fillStyle='rgba(4,12,9,0.6)';
+  ctx.fillRect(0,0,W,H);
+  bigBtn(W/2, H*0.5, Math.min(W*0.6,260), 74, '继 续', '点击恢复作战');
+  ctx.restore();
+}
+function draw(){
+  if (!ctx) return;
+  ctx.clearRect(0,0,W,H);
+  var g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0e2a1e'); g.addColorStop(0.6,'#123024'); g.addColorStop(1,'#0a1912');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  drawField();
+  drawTowers();
+  drawEnemies();
+  drawBullets();
+  drawParts();
+  drawBar();
+  drawHUD();
+  drawBanner();
+  if (state==='menu') drawMenu();
+  else if (state==='pause') drawPause();
+  else if (state==='over') drawOver();
+}
+
+/* ================= 输入 ================= */
+function handleTap(x,y){
+  try{
+    if (y < TOP_RES+6) return;            /* 平台保留区不响应 */
+    if (state==='menu'){
+      var b=bigBtn(W/2, H*0.58, Math.min(W*0.6,260), 74, '', '');
+      if (inRect(x,y,b.x,b.y,b.w,b.h,0)){ startGame(); }
+      return;
+    }
+    if (state==='over'){
+      var o=bigBtn(W/2, H*0.56, Math.min(W*0.6,260), 74, '', '');
+      if (inRect(x,y,o.x,o.y,o.w,o.h,0)){ restart(); }
+      return;
+    }
+    if (state==='pause'){
+      var r=bigBtn(W/2, H*0.5, Math.min(W*0.6,260), 74, '', '');
+      if (inRect(x,y,r.x,r.y,r.w,r.h,0)){ state='playing'; sfx('tap'); }
+      return;
+    }
+    /* playing */
+    if (y>=BUT_Y){
+      for (var i=0;i<barBtns.length;i++){
+        var b2=barBtns[i];
+        if (inRect(x,y,b2.x,b2.y,b2.w,b2.h,10)){
+          if (b2.kind==='t1'||b2.kind==='t2'){
+            var id=(b2.kind==='t1')?1:2;
+            if (armed===id){ armed=0; sfx('tap'); }
+            else {
+              if (gold>=TDEF[id].cost){ armed=id; selT=-1; sfx('tap'); }
+              else { armed=0; sfx('err'); }
+            }
+          } else if (b2.kind==='up'){ tryUpgrade(); }
+          else if (b2.kind==='pause'){
+            if (state==='playing'){ state='pause'; sfx('tap'); }
+            else { state='playing'; sfx('tap'); }
+          }
+          return;
+        }
+      }
+      return;
+    }
+    if (y>=GRID_TOP-8 && x>=0 && x<W && y<=GRID_TOP+ROWS*CELL+8){
+      var c=Math.floor(x/CELL), r=Math.floor((y-GRID_TOP)/CELL);
+      if (c<0||c>=COLS||r<0||r>=ROWS) return;
+      var idx=towerAt(c,r);
+      if (armed>0){
+        if (idx>=0){
+          selT=idx; sfx('tap');           /* 选中已有塔 */
+        } else if (cellFree(c,r)){
+          if (gold>=TDEF[armed].cost){
+            gold-=TDEF[armed].cost;
+            placeTower(c,r,armed);
+            sfx('place');
+          } else { armed=0; sfx('err'); }
+        } else { sfx('err'); }
+      } else if (idx>=0){
+        selT=(selT===idx)?-1:idx; sfx('tap');
+      } else {
+        selT=-1; sfx('err');
+      }
+    }
+  }catch(err){}
+}
+function onTouch(ev){
+  try{
+    ev.preventDefault();
+    lastTouchT=Date.now();
+    var t=ev.changedTouches;
+    for (var i=0;i<t.length;i++){
+      handleTap(t[i].clientX, t[i].clientY);
+    }
+  }catch(e){}
+}
+function onMouse(ev){
+  try{
+    if (Date.now()-lastTouchT<900) return;   /* 触屏后的合成点击忽略 */
+    handleTap(ev.clientX, ev.clientY);
+  }catch(e){}
+}
+
+/* ================= 调试快照 ================= */
+function debugState(){
+  var ents=[];
+  for (var i=0;i<enemies.length;i++){
+    var e=enemies[i];
+    ents.push({type:'enemy', hp:Math.max(0,Math.round(e.hp)), x:Math.round(e.x), y:Math.round(e.y)});
+  }
+  for (var j=0;j<towers.length;j++){
+    var t=towers[j];
+    ents.push({type:'tower', hp:1, x:Math.round(t.x), y:Math.round(t.y), lvl:t.lvl});
+  }
+  return {
+    state: state,
+    score: Math.round(score),
+    gold: Math.round(gold),
+    lives: Math.round(lives),
+    wave: wave,
+    kills: kills,
+    phase: wstate,
+    remaining: spawnQ.length,
+    entities: ents
+  };
+}
+window.__wwDebugState = debugState;
+window.restart = restart;
+
+/* ================= 初始化与主循环 ================= */
+function onResize(){
+  try{
+    layout();
+    if (state==='playing' || state==='pause' || state==='over'){
+      /* 保持场地重建后画面同步 */
+    }
+    draw();
+  }catch(e){}
+}
+function frame(ts){
+  try{
+    if (!last){ last=ts; }
+    var dt=(ts-last)/1000;
+    if (dt>0.05) dt=0.05;
+    if (dt<0) dt=0;
+    last=ts;
+    if (state==='playing') update(dt);
+    draw();
+  }catch(e){}
+  requestAnimationFrame(frame);
+}
+if (canvas){
+  canvas.addEventListener('touchstart', onTouch, {passive:false});
+  canvas.addEventListener('touchmove', function(ev){ ev.preventDefault(); }, {passive:false});
+  canvas.addEventListener('touchend', function(ev){ ev.preventDefault(); }, {passive:false});
+  canvas.addEventListener('mousedown', onMouse);
+  canvas.addEventListener('contextmenu', function(ev){ ev.preventDefault(); });
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
+  layout();
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
