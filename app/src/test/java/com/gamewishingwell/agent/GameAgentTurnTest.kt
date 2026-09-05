@@ -16,6 +16,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.mockito.ArgumentMatchers.anyString
@@ -193,5 +194,21 @@ function restart(){}
         assertEquals("你能做什么", secondCallMessages.last { it.isUser }.content)
         dir.deleteRecursively()
         Unit
+    }
+    @Test
+    fun `正文流预览取末两行非空行并截断长行`() {
+        // 常规：末两行非空行
+        assertEquals("第二行还在写\n第三行", formatStreamPreview("第一行\n\n第二行还在写\n第三行"))
+        // 单行
+        assertEquals("只有一行", formatStreamPreview("只有一行"))
+        // 空白输入返回 null（无可见内容不占 UI 空间）
+        assertNull(formatStreamPreview(""))
+        assertNull(formatStreamPreview("   \n  "))
+        // 超长行截断到上限
+        assertEquals(96, formatStreamPreview("x".repeat(300))!!.length)
+        // 超出尾部窗口只看末尾
+        val long = (1..100).joinToString("\n") { "行$it" }
+        assertTrue(formatStreamPreview(long)!!.contains("行100"))
+        assertFalse(formatStreamPreview(long)!!.contains("行1\n"))
     }
 }

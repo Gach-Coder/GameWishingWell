@@ -54,6 +54,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
@@ -154,7 +155,9 @@ fun ChatScreen(
                     }
                 }
                 if (session.isGenerating) {
-                    item(key = "typing") { TypingBubble(stage = session.agentStage) }
+                    item(key = "typing") {
+                        TypingBubble(stage = session.agentStage, streamPreview = session.streamPreview)
+                    }
                 }
                 // 确认卡随聊天流保留；仅最后一张与 pendingConfirmation 匹配的卡片
                 // 可交互（生成中临时禁用），历史卡片永久只读回显（勾选框与按钮 disabled）。
@@ -343,7 +346,7 @@ private fun MessageBubble(msg: ChatMessage) {
 }
 
 @Composable
-private fun TypingBubble(stage: String) {
+private fun TypingBubble(stage: String, streamPreview: String? = null) {
     Row(
         modifier = Modifier.padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -357,6 +360,18 @@ private fun TypingBubble(stage: String) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            // 阶段条下方的两行正文流预览（临时动态"打字机"）：只在 SSE 接收期间
+            // 非空（Agent 侧节流写入、流结束即清空）；兼容回环的整 HTML 流不回显。
+            if (!streamPreview.isNullOrBlank()) {
+                Text(
+                    streamPreview,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 2.dp)
+                )
+            }
         }
     }
 }

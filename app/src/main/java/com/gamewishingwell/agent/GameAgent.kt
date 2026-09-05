@@ -68,7 +68,13 @@ data class GameSession(
     val snapshots: List<String> = emptyList(),
     val schemaVersion: Int = 2,
     /** 质量档位（确认门四挡 fast/light/balanced/premium），默认均衡：驱动档位提示词、自检轮数与沙箱深度。 */
-    val qualityTier: String = QualityTier.BALANCED
+    val qualityTier: String = QualityTier.BALANCED,
+    /**
+     * SSE 正文流预览（最近两行，时间节流）：只在流式接收进行期间非空——
+     * 阶段条下方临时动态显示（打字机），调用结束（正常/异常/取消）即清空。
+     * 兼容回环（整 HTML 流）不回显：正文即源代码，前端纪律禁止复述代码。
+     */
+    val streamPreview: String? = null
 ) {
     /** 兼容旧会话：持久化标志为 false 但已存在游戏代码时，同样视为已生成。 */
     fun effectiveGameGenerated(): Boolean = gameGenerated || !currentHtml.isNullOrBlank()
@@ -99,6 +105,30 @@ internal fun formatAgentDuration(ms: Long): String {
         totalSec < 3600 -> "${totalSec / 60} 分 ${totalSec % 60} 秒"
         else -> "${totalSec / 3600} 小时 ${(totalSec % 3600) / 60} 分"
     }
+}
+
+/**
+ * SSE 正文流的末两行预览（阶段条下方临时动态显示的"打字机"窗口）：
+ * 取尾部窗口、剔除空行、每行截断；无可见内容返回 null。
+ * 尾部窗口可能从行中间开始——首段视为半行，属滚动预览的正常形态。
+ */
+internal fun formatStreamPreview(
+    received: String,
+    maxLines: Int = 2,
+    lineMaxChars: Int = 96,
+    tailWindowChars: Int = 400
+): String? {
+    if (received.isBlank()) return null
+    val tail = if (received.length > tailWindowChars) received.takeLast(tailWindowChars) else received
+    val lines = tail.split('\n')
+    val picked = ArrayList<String>(maxLines)
+    for (i in lines.indices.reversed()) {
+        val line = lines[i].trim()
+        if (line.isEmpty()) continue
+        picked.add(0, line.take(lineMaxChars))
+        if (picked.size >= maxLines) break
+    }
+    return picked.joinToString("\n").ifBlank { null }
 }
 
 /**
@@ -332,6 +362,9 @@ class GameAgent(
          */
         val LLM_RETRY_BACKOFF_MS = longArrayOf(5_000L, 15_000L, 30_000L, 60_000L)
 
+        /** SSE 正文流预览（阶段条下方两行打字机）的更新节流间隔。 */
+        const val STREAM_PREVIEW_INTERVAL_MS = 400L
+
         /**
          * 兼容回环（每轮全量重写）的总轮次上限：最贵路径的止损熔断。工具模式靠
          * "连续 24 轮无文件修改"熔断（有写入即有进展），兼容模式每轮都产出新候选、
@@ -441,6 +474,7 @@ class GameAgent(
                 isGenerating = false,
                 agentStage = AgentStage.INTERRUPTED,
                 error = null,
+                streamPreview = null,
                 lastWarning = if (s.currentHtml != null) {
                     "已中断。你可以试玩当前版本，或继续描述需求。"
                 } else {
@@ -2575,6 +2609,7 @@ class GameAgent(
     ): LlmResponse {
         val sb = StringBuilder()
         var lastProgressMark = 0
+        var lastPreviewAt = 0L
         try {
             return llm.streamChat(
                 messages = messages,
@@ -2585,6 +2620,17 @@ class GameAgent(
                         // onDelta 运行在 OkHttp IO 线程，与 agent 协程/停止键并发写会话，
                         // 必须走原子 update（快照覆盖会丢其它线程刚写入的字段）。
                         _session.update { it.copy(agentStage = "$stageLabel 已接收 ${sb.length} 字符") }
+                    }
+                    // 阶段条下方的两行正文流预览（打字机）：时间节流，只在流式期间存在——
+                    // 调用结束（正常/异常/取消）由 finally 清空，形成"临时动态"语义。
+                    // 兼容回环（salvageHtmlOnCancel=true 的整 HTML 流）不回显：正文即源代码。
+                    if (!salvageHtmlOnCancel) {
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        if (now - lastPreviewAt >= STREAM_PREVIEW_INTERVAL_MS) {
+                            lastPreviewAt = now
+                            val preview = formatStreamPreview(sb.toString())
+                            _session.update { it.copy(streamPreview = preview) }
+                        }
                     }
                 },
                 onThinking = { /* 思考过程属于内部信号，不回显到前端 */ },
@@ -2606,6 +2652,11 @@ class GameAgent(
                 }
             }
             throw e
+        } finally {
+            // 临时性兜底：流结束（含异常/取消路径）立即清空预览，绝不跨阶段残留
+            if (_session.value.streamPreview != null) {
+                _session.update { it.copy(streamPreview = null) }
+            }
         }
     }
 
