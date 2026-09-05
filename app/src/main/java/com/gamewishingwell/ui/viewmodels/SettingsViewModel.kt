@@ -23,6 +23,11 @@ class SettingsViewModel(
     private val _testResult = MutableStateFlow<String?>(null)
     val testResult: StateFlow<String?> = _testResult.asStateFlow()
 
+    companion object {
+        /** 测试连接成功的固定前端提示：零模型返回内容（成功与否一眼可辨，成功态不掺杂回复文本）。 */
+        const val TEST_OK_MESSAGE = "✅连接成功"
+    }
+
     fun save(s: LlmSettings) {
         repository.save(s)
     }
@@ -41,8 +46,8 @@ class SettingsViewModel(
             _testResult.value = null
             repository.save(s)
             _testResult.value = try {
-                val r = agent.testConnection().trim()
-                if (r.isEmpty()) "连接成功（无返回内容）" else "连接成功：" + r.take(80)
+                agent.testConnection()
+                TEST_OK_MESSAGE
             } catch (e: Exception) {
                 "连接失败：" + (e.message?.take(160) ?: "未知错误")
             }

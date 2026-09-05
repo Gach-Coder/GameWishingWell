@@ -280,7 +280,7 @@ fun SettingsScreen() {
 
             val resultText = testResult
             if (resultText != null) {
-                val isOk = resultText.startsWith("连接成功")
+                val isOk = resultText == SettingsViewModel.TEST_OK_MESSAGE
                 Surface(
                     color = if (isOk) MaterialTheme.colorScheme.tertiaryContainer
                     else MaterialTheme.colorScheme.errorContainer,

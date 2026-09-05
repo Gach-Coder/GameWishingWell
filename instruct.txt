@@ -37,7 +37,7 @@
 		- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
    DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 小米 MiMo / MiniMax / OpenRouter / 自定义，
-   支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”；模型名称可自由编辑并带服务商下拉（可选清单=ProviderPreset.models，首位即默认，手输清单外模型同样有效）。
+   支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”；模型名称可自由编辑并带服务商下拉（可选清单=ProviderPreset.models，首位即默认，手输清单外模型同样有效）；测试连接成功时前端提示固定为「✅连接成功」（不回显模型返回内容），失败显示原因摘要。
    页面最下方显示 版本号 + 软件编译时间（BUILD_TIME，构建时写入 BuildConfig）——
    用于确认设备上运行的构建版本（Android Studio Apply Changes 热更新不刷新系统安装时间，
    不能靠"应用信息"的安装时间判断版本新旧）。
