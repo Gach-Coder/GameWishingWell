@@ -51,7 +51,8 @@ class OpenAiCompatibleClient(
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit,
         onDone: () -> Unit,
-        tools: List<ToolSpec>
+        tools: List<ToolSpec>,
+        onToolCallDelta: (Int) -> Unit
     ): LlmResponse {
         // runInterruptible + activeCall.cancel()：停止键取消协程时会中断阻塞中的 OkHttp SSE 读取。
         // 这里不设任何超时，默认用户可无限等待；只有用户主动停止才会取消底层网络调用。
@@ -71,7 +72,7 @@ class OpenAiCompatibleClient(
             try {
                 executeStream(
                     buildRequest(messages, includeThinking = true, tools = tools),
-                    guardedOnDelta, onThinking, onDone, activeCall
+                    guardedOnDelta, onThinking, onDone, activeCall, onToolCallDelta
                 )
             } catch (e: LlmError) {
                 if (Thread.currentThread().isInterrupted || deltasEmitted) throw e
@@ -81,13 +82,13 @@ class OpenAiCompatibleClient(
                     msg.contains("thinking", ignoreCase = true) ->
                         executeStream(
                             buildRequest(messages, includeThinking = false, tools = tools),
-                            guardedOnDelta, onThinking, onDone, activeCall
+                            guardedOnDelta, onThinking, onDone, activeCall, onToolCallDelta
                         )
                     // 网关不支持 function calling：去掉 tools 重试，由调用方按纯文本回复降级处理
                     tools.isNotEmpty() && msg.contains(Regex("tool|function", RegexOption.IGNORE_CASE)) ->
                         executeStream(
                             buildRequest(messages, includeThinking = true, tools = emptyList()),
-                            guardedOnDelta, onThinking, onDone, activeCall
+                            guardedOnDelta, onThinking, onDone, activeCall, onToolCallDelta
                         )
                     else -> throw e
                 }
@@ -122,7 +123,8 @@ class OpenAiCompatibleClient(
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit,
         onDone: () -> Unit,
-        activeCall: AtomicReference<Call?>
+        activeCall: AtomicReference<Call?>,
+        onToolCallDelta: (Int) -> Unit = {}
     ): LlmResponse {
         val call = okHttp.newCall(request)
         activeCall.set(call)
@@ -163,7 +165,14 @@ class OpenAiCompatibleClient(
                         val reasoning = delta?.get("reasoning_content")?.jsonPrimitive?.contentOrNull
                             ?: delta?.get("reasoning")?.jsonPrimitive?.contentOrNull
                         val toolCallDeltas = delta?.get("tool_calls")?.jsonArray
-                        if (toolCallDeltas != null) aggregator.accept(toolCallDeltas)
+                        if (toolCallDeltas != null) {
+                            // 参数分片上报（工具模式多数轮次正文为空，参数流是主要"正在工作"信号）：
+                            // 计真实字符数（aggregator 追加的 name/arguments 片段长度），
+                            // 不用整帧 JSON 长度——协议开销与转义膨胀会把计数夸大 1.3~2 倍，
+                            // 表现为"瞬间跳几万"的异常读感。
+                            val appended = aggregator.accept(toolCallDeltas)
+                            if (appended > 0) runCatching { onToolCallDelta(appended) }
+                        }
                         if (content != null) {
                             text.append(content)
                             contentChars += content.length
@@ -289,7 +298,9 @@ private class ToolCallAggregator {
 
     private val parts = LinkedHashMap<Int, Partial>()
 
-    fun accept(deltaArray: JsonArray) {
+    /** 聚合一帧 tool_calls 分片；返回本帧追加的真实字符数（name + arguments 片段长度）。 */
+    fun accept(deltaArray: JsonArray): Int {
+        var appended = 0
         for (element in deltaArray) {
             val obj = element as? JsonObject ?: continue
             val index = obj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
@@ -302,10 +313,17 @@ private class ToolCallAggregator {
             val partial = parts.getOrPut(index) { Partial() }
             obj["id"]?.jsonPrimitive?.contentOrNull?.let { partial.id = it }
             obj["function"]?.jsonObject?.let { fn ->
-                fn["name"]?.jsonPrimitive?.contentOrNull?.let { partial.name.append(it) }
-                fn["arguments"]?.jsonPrimitive?.contentOrNull?.let { partial.arguments.append(it) }
+                fn["name"]?.jsonPrimitive?.contentOrNull?.let {
+                    partial.name.append(it)
+                    appended += it.length
+                }
+                fn["arguments"]?.jsonPrimitive?.contentOrNull?.let {
+                    partial.arguments.append(it)
+                    appended += it.length
+                }
             }
         }
+        return appended
     }
 
     fun build(): List<com.gamewishingwell.data.ToolCallData> = parts.values

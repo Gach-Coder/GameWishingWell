@@ -53,7 +53,8 @@ class AnthropicClient(
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit,
         onDone: () -> Unit,
-        tools: List<ToolSpec>
+        tools: List<ToolSpec>,
+        onToolCallDelta: (Int) -> Unit
     ): LlmResponse {
         // runInterruptible + activeCall.cancel()：停止键取消协程时会中断阻塞中的 OkHttp SSE 读取。
         // 这里不设任何超时，默认用户可无限等待；只有用户主动停止才会取消底层网络调用。
@@ -113,7 +114,7 @@ class AnthropicClient(
                     val line = source.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val payload = line.removePrefix("data:").trim()
-                    if (handleEvent(payload, text, blocks, onDelta, onThinking)) sawMessageStop = true
+                    if (handleEvent(payload, text, blocks, onDelta, onThinking, onToolCallDelta)) sawMessageStop = true
                 }
                 // 连接被中途掐断时 readUtf8Line 返回 null 正常退出循环——零内容 + 零工具
                 // 调用 + 未收到 message_stop 属于"假成功"（会绕过统一重试），显性化为
@@ -154,7 +155,8 @@ class AnthropicClient(
         text: StringBuilder,
         blocks: HashMap<Int, PartialToolBlock>,
         onDelta: (String) -> Unit,
-        onThinking: (String) -> Unit
+        onThinking: (String) -> Unit,
+        onToolCallDelta: (Int) -> Unit = {}
     ): Boolean {
         val obj = try {
             Json.parseToJsonElement(payload).jsonObject
@@ -194,6 +196,7 @@ class AnthropicClient(
                     "input_json_delta" -> {
                         val chunk = delta["partial_json"]?.jsonPrimitive?.contentOrNull ?: return false
                         blocks[index]?.arguments?.append(chunk)
+                        runCatching { onToolCallDelta(chunk.length) }
                     }
                     "thinking_delta" -> {
                         val chunk = delta["thinking"]?.jsonPrimitive?.contentOrNull ?: return false

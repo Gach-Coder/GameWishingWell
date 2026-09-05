@@ -19,7 +19,8 @@ class GamePlanningLlmTest {
             onDelta: (String) -> Unit,
             onThinking: (String) -> Unit,
             onDone: () -> Unit,
-            tools: List<com.gamewishingwell.llm.ToolSpec>
+            tools: List<com.gamewishingwell.llm.ToolSpec>,
+            onToolCallDelta: (Int) -> Unit
         ): com.gamewishingwell.llm.LlmResponse {
             onDelta(reply)
             onDone()

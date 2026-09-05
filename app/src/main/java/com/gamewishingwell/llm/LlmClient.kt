@@ -23,8 +23,9 @@ data class LlmResponse(
 /**
  * 统一的流式 LLM 客户端接口。
  * 流式过程中通过 [onDelta] 逐个字符推送最终内容，[onThinking] 推送模型的思考过程
- * （推理模型如 deepseek-v4-flash 会先输出 reasoning_content；按 instruct.txt 约定，
- * 前端不展示源代码与思考原文，只把流用于内部进度判断），
+ * （推理模型如 deepseek-v4-flash 会先输出 reasoning_content；只作流式活性信号与
+ * 预览来源，不进入任何用户可见的错误细节），[onToolCallDelta] 推送工具调用参数
+ * 分片的字节量（工具模式下多数轮次正文为空，参数流是主要的"正在工作"信号），
  * 结束调用 [onDone]；网络/API 错误以异常抛出。
  *
  * [tools] 非空时请求携带工具定义，返回的 [LlmResponse.toolCalls] 为模型发起的调用；
@@ -38,7 +39,8 @@ interface LlmClient {
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit = {},
         onDone: () -> Unit,
-        tools: List<ToolSpec> = emptyList()
+        tools: List<ToolSpec> = emptyList(),
+        onToolCallDelta: (Int) -> Unit = {}
     ): LlmResponse
 }
 

@@ -43,7 +43,8 @@ class GameAgentTurnTest {
             onDelta: (String) -> Unit,
             onThinking: (String) -> Unit,
             onDone: () -> Unit,
-            tools: List<ToolSpec>
+            tools: List<ToolSpec>,
+            onToolCallDelta: (Int) -> Unit
         ): LlmResponse {
             calls += messages to tools
             val step = queue.removeFirstOrNull() ?: LlmResponse("", emptyList())
@@ -196,9 +197,9 @@ function restart(){}
         Unit
     }
     @Test
-    fun `正文流预览取末两行非空行并截断长行`() {
-        // 常规：末两行非空行
-        assertEquals("第二行还在写\n第三行", formatStreamPreview("第一行\n\n第二行还在写\n第三行"))
+    fun `正文流预览取末三行非空行并截断长行`() {
+        // 常规：末三行非空行（空行剔除后）
+        assertEquals("第一行\n第二行还在写\n第三行", formatStreamPreview("第一行\n\n第二行还在写\n第三行"))
         // 单行
         assertEquals("只有一行", formatStreamPreview("只有一行"))
         // 空白输入返回 null（无可见内容不占 UI 空间）
@@ -210,5 +211,43 @@ function restart(){}
         val long = (1..100).joinToString("\n") { "行$it" }
         assertTrue(formatStreamPreview(long)!!.contains("行100"))
         assertFalse(formatStreamPreview(long)!!.contains("行1\n"))
+    }
+    @Test
+    fun `流预览三级优先-正文优先于思考-思考优先于参数计数`() {
+        // 三者皆有：正文优先
+        assertEquals("正文一行", pickStreamPreview("正文一行", "思考中", 999))
+        // 无正文有思考：思考滚动窗口（不足三行时全显）
+        assertEquals("思考第一行\n思考第两行", pickStreamPreview("", "思考第一行\n思考第两行", 500))
+        // 仅参数流：只报进度计数（参数是 JSON+代码，不回显内容）
+        val argOnly = pickStreamPreview("", "", 4321)
+        assertTrue(argOnly!!.contains("4321"))
+        // 全空：null（不占 UI 空间）
+        assertNull(pickStreamPreview("", "", 0))
+    }
+    @Test
+    fun `参数流预览显示纯数字字符数`() {
+        val p = pickStreamPreview("", "", 62_300)
+        assertTrue(p!!.contains("62300"))
+    }
+    @Test
+    fun `断言对齐提示分档-3轮判定5轮强制仲裁`() {
+        // <3 轮：不注入提示
+        assertEquals("", alignmentHintFor(mapOf("战斗/击杀" to 2), null))
+        // ≥3 轮：判定提示（对照快照二选一）
+        val hint3 = alignmentHintFor(mapOf("塔防/波次" to 3), null)
+        assertTrue(hint3.contains("断言对齐判定"))
+        assertTrue(hint3.contains("3 轮"))
+        assertTrue(hint3.contains("scenarios.json"))
+        // ≥5 轮：强制仲裁，压过重写建议并禁改逻辑
+        val hint5 = alignmentHintFor(mapOf("塔防/基地" to 6), null)
+        assertTrue(hint5.contains("仲裁"))
+        assertTrue(hint5.contains("优先于"))
+        assertTrue(hint5.contains("禁止再修改 index.html"))
+        // 零活动快照（state=playing 且 enemyCount=0/entities 空）→ 帧预算定向线索
+        val snap = """scenario-fail[塔防/基地]: 断言不满足；实际快照 {"state":"playing","enemyCount":0,"entities":[]}"""
+        assertTrue(alignmentHintFor(mapOf("塔防/基地" to 6), snap).contains("大概率是帧预算不足"))
+        // 非零活动快照不给该线索（避免误导）
+        val activeSnap = """scenario-fail[x]: 实际快照 {"state":"playing","enemyCount":5,"entities":[{"type":"enemy"}]}"""
+        assertFalse(alignmentHintFor(mapOf("塔防/基地" to 6), activeSnap).contains("大概率是帧预算不足"))
     }
 }

@@ -70,7 +70,7 @@ data class GameSession(
     /** 质量档位（确认门四挡 fast/light/balanced/premium），默认均衡：驱动档位提示词、自检轮数与沙箱深度。 */
     val qualityTier: String = QualityTier.BALANCED,
     /**
-     * SSE 正文流预览（最近两行，时间节流）：只在流式接收进行期间非空——
+     * SSE 流预览（最近三行，时间节流）：只在流式接收进行期间非空——
      * 阶段条下方临时动态显示（打字机），调用结束（正常/异常/取消）即清空。
      * 兼容回环（整 HTML 流）不回显：正文即源代码，前端纪律禁止复述代码。
      */
@@ -108,13 +108,13 @@ internal fun formatAgentDuration(ms: Long): String {
 }
 
 /**
- * SSE 正文流的末两行预览（阶段条下方临时动态显示的"打字机"窗口）：
+ * SSE 流的末三行预览（阶段条下方临时动态显示的"打字机"窗口）：
  * 取尾部窗口、剔除空行、每行截断；无可见内容返回 null。
  * 尾部窗口可能从行中间开始——首段视为半行，属滚动预览的正常形态。
  */
 internal fun formatStreamPreview(
     received: String,
-    maxLines: Int = 2,
+    maxLines: Int = 3,
     lineMaxChars: Int = 96,
     tailWindowChars: Int = 400
 ): String? {
@@ -129,6 +129,52 @@ internal fun formatStreamPreview(
         if (picked.size >= maxLines) break
     }
     return picked.joinToString("\n").ifBlank { null }
+}
+
+/**
+ * 流预览的三级优先来源（工具模式多数轮次正文为空，必须有后备信号）：
+ * 1. 正文 content 流（模型的工作解说，最理想）；
+ * 2. 思考流（推理模型长时间思考的滚动窗口——是文字不是源代码，可回显）；
+ * 3. 工具调用参数字节计数（只报进度不回显内容——参数是 JSON+代码，属复述禁区）。
+ */
+internal fun pickStreamPreview(content: String, thinking: String, toolArgChars: Long): String? = when {
+    content.isNotBlank() -> formatStreamPreview(content)
+    thinking.isNotBlank() -> formatStreamPreview(thinking)
+    toolArgChars > 0 -> "正在生成工具调用（参数已接收 $toolArgChars 字符）"
+    else -> null
+}
+
+/**
+ * 断言对齐路由的提示构造（分档，单测锁定）：
+ * - 同一断言连续 ≥3 轮未通过：对齐判定提示（对照快照判断修断言还是修逻辑）；
+ * - ≥5 轮：升级为强制仲裁——多轮修逻辑无效即判定为断言/测试预算不对齐，本轮必须改
+ *   scenarios.json（steps 帧预算/expect），并显式压过"重写模块"类升级建议的冲突
+ *   （agent.log 实测：同断言连烧 90+ 轮，模型反复选择修逻辑而不肯对齐断言）；
+ * - 快照呈"零敌人/零实体 + state playing"特征时附定向线索（帧预算不足等到出怪）。
+ */
+internal fun alignmentHintFor(failCounts: Map<String, Int>, sampleError: String?): String {
+    val repeated = failCounts.filter { it.value >= 3 }
+    if (repeated.isEmpty()) return ""
+    val arbitrated = repeated.filter { it.value >= 5 }
+    val zeroActivity = sampleError?.let {
+        Regex(""""enemyCount":\s*0|"entities":\s*\[\]""").containsMatchIn(it) &&
+            Regex(""""state":\s*"playing"""").containsMatchIn(it)
+    } == true
+    return if (arbitrated.isNotEmpty()) {
+        val arbList = arbitrated.entries.joinToString("；") { "「${it.key}」（${it.value} 轮）" }
+        "\n【断言对齐仲裁（强制，优先于之前的任何重写/换思路建议）】$arbList 已连续多轮未通过，" +
+            "且此前多轮修改游戏逻辑均未解决——判定为断言与实现/测试预算不对齐：" +
+            "本轮必须修改 scenarios.json 对应条目（增加 steps 的 frames 帧预算让机制有时间发生，" +
+            "或修正 expect 的字段名/阈值以匹配实际快照），使断言可判定；" +
+            "禁止再修改 index.html，除非能明确指出快照中的行为缺陷。" +
+            (if (zeroActivity) "快照显示 enemyCount=0/entities 为空且 state=playing：大概率是帧预算不足以等到出怪/敌人到达——增加 frames，而不是继续改出怪逻辑。" else "")
+    } else {
+        val list = repeated.entries.joinToString("；") { "「${it.key}」已连续 ${it.value} 轮未通过" }
+        "\n【断言对齐判定】$list。请对照最近回传的实际快照重新判定：" +
+            "若游戏状态本身合理（其它断言通过、系统按验收行为运行），是断言字段名/阈值/steps 帧预算与实现不符——" +
+            "应修改 scenarios.json 对应条目（expect 或 steps），而不是继续改游戏逻辑；" +
+            "确属游戏行为缺陷才修 index.html。"
+    }
 }
 
 /**
@@ -362,7 +408,7 @@ class GameAgent(
          */
         val LLM_RETRY_BACKOFF_MS = longArrayOf(5_000L, 15_000L, 30_000L, 60_000L)
 
-        /** SSE 正文流预览（阶段条下方两行打字机）的更新节流间隔。 */
+        /** SSE 流预览（阶段条下方三行打字机）的更新节流间隔。 */
         const val STREAM_PREVIEW_INTERVAL_MS = 400L
 
         /**
@@ -1720,14 +1766,7 @@ class GameAgent(
                                             scenarioFailCounts[label] = (scenarioFailCounts[label] ?: 0) + 1
                                         }
                                     }
-                                    val repeated = scenarioFailCounts.filter { it.value >= 3 }
-                                        .map { (label, count) -> "「$label」已连续 $count 轮未通过" }
-                                    val alignmentHint = if (repeated.isNotEmpty()) {
-                                        "\n【断言对齐判定】${repeated.joinToString("；")}。请对照最近回传的实际快照重新判定：" +
-                                            "若游戏状态本身合理（其它断言通过、系统按验收行为运行），是断言字段名/阈值/steps 帧预算与实现不符——" +
-                                            "应修改 scenarios.json 对应条目（expect 或 steps），而不是继续改游戏逻辑；" +
-                                            "确属游戏行为缺陷才修 index.html。"
-                                    } else ""
+                                    val alignmentHint = alignmentHintFor(scenarioFailCounts, smokeErrors.joinToString(";"))
                                     val normalized = ErrorSignature.normalize("冒烟测试失败:" + smokeErrors.joinToString(";"))
                                     val known = RetryBookkeeping.record(_session.value.knownErrors, ErrorCategory.USER_RUNTIME, normalized)
                                     saveGlobalErrorSignatures(known)
@@ -2608,34 +2647,52 @@ class GameAgent(
         salvageHtmlOnCancel: Boolean = false
     ): LlmResponse {
         val sb = StringBuilder()
-        var lastProgressMark = 0
+        // 工具模式多数轮次正文为空：思考流与工具参数字节是预览/活性信号的主要来源
+        val thinkingSb = StringBuilder()
+        var toolArgChars = 0L
+        var lastProgressMark = 0L
         var lastPreviewAt = 0L
+        // "已接收 N 字符"只计文本流（正文+思考，均为 SSE 回传文字）；
+        // 工具参数（writefile 等）不计入——参数是 JSON+代码，突发到达会造成读数瞬跳
+        fun textReceived(): Long = sb.length.toLong() + thinkingSb.length
+        // 阶段条下方的三行流预览（打字机）：时间节流，由正文/思考/参数三类增量统一驱动；
+        // 兼容回环（salvageHtmlOnCancel=true 的整 HTML 流）不回显——正文即源代码。
+        fun pumpPreview() {
+            if (salvageHtmlOnCancel) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastPreviewAt < STREAM_PREVIEW_INTERVAL_MS) return
+            lastPreviewAt = now
+            val preview = pickStreamPreview(sb.toString(), thinkingSb.toString(), toolArgChars)
+            _session.update { it.copy(streamPreview = preview) }
+        }
         try {
             return llm.streamChat(
                 messages = messages,
                 onDelta = { delta ->
                     sb.append(delta)
-                    if (stageLabel != null && sb.length - lastProgressMark >= 200) {
-                        lastProgressMark = sb.length
+                    if (stageLabel != null && textReceived() - lastProgressMark >= 200) {
+                        lastProgressMark = textReceived()
                         // onDelta 运行在 OkHttp IO 线程，与 agent 协程/停止键并发写会话，
                         // 必须走原子 update（快照覆盖会丢其它线程刚写入的字段）。
-                        _session.update { it.copy(agentStage = "$stageLabel 已接收 ${sb.length} 字符") }
+                        _session.update { it.copy(agentStage = "$stageLabel 已接收 ${textReceived()} 字符") }
                     }
-                    // 阶段条下方的两行正文流预览（打字机）：时间节流，只在流式期间存在——
-                    // 调用结束（正常/异常/取消）由 finally 清空，形成"临时动态"语义。
-                    // 兼容回环（salvageHtmlOnCancel=true 的整 HTML 流）不回显：正文即源代码。
-                    if (!salvageHtmlOnCancel) {
-                        val now = android.os.SystemClock.elapsedRealtime()
-                        if (now - lastPreviewAt >= STREAM_PREVIEW_INTERVAL_MS) {
-                            lastPreviewAt = now
-                            val preview = formatStreamPreview(sb.toString())
-                            _session.update { it.copy(streamPreview = preview) }
-                        }
-                    }
+                    pumpPreview()
                 },
-                onThinking = { /* 思考过程属于内部信号，不回显到前端 */ },
+                onThinking = { thinking ->
+                    thinkingSb.append(thinking)
+                    if (stageLabel != null && textReceived() - lastProgressMark >= 200) {
+                        lastProgressMark = textReceived()
+                        _session.update { it.copy(agentStage = "$stageLabel 已接收 ${textReceived()} 字符") }
+                    }
+                    pumpPreview()
+                },
                 onDone = {},
-                tools = tools
+                tools = tools,
+                onToolCallDelta = { chars ->
+                    // 参数字节只作预览后备信号（纯工具轮的活性），不进"已接收字符"计数
+                    toolArgChars += chars
+                    pumpPreview()
+                }
             )
         } catch (e: CancellationException) {
             if (salvageHtmlOnCancel) {

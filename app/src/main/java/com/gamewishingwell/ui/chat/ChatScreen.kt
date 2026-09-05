@@ -360,14 +360,14 @@ private fun TypingBubble(stage: String, streamPreview: String? = null) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            // 阶段条下方的两行正文流预览（临时动态"打字机"）：只在 SSE 接收期间
+            // 阶段条下方的三行流预览（临时动态"打字机"）：只在 SSE 接收期间
             // 非空（Agent 侧节流写入、流结束即清空）；兼容回环的整 HTML 流不回显。
             if (!streamPreview.isNullOrBlank()) {
                 Text(
                     streamPreview,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                    maxLines = 2,
+                    maxLines = 3,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(top = 2.dp)
                 )
