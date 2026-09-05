@@ -55,11 +55,8 @@ class OpenAiClientTest {
     }
 
     @Test
-    fun `max_tokens 被服务端拒绝时去掉该字段重试`() = runBlocking {
+    fun `请求不携带 max_tokens 不限制输出长度`() = runBlocking {
         val server = MockWebServer()
-        server.enqueue(
-            MockResponse().setResponseCode(400).setBody("{\"error\":\"max_tokens must be <= 4096\"}")
-        )
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "text/event-stream")
@@ -75,10 +72,10 @@ class OpenAiClientTest {
         )
         assertEquals("OK", sb.toString())
 
-        val first = server.takeRequest()
-        assertTrue(first.body.readUtf8().contains("\"max_tokens\""))
-        val second = server.takeRequest()
-        assertFalse(second.body.readUtf8().contains("\"max_tokens\""))
+        // 输出长度不设限：请求体不携带 max_tokens，由网关按模型上限裁定
+        val recorded = server.takeRequest()
+        assertFalse(recorded.body.readUtf8().contains("\"max_tokens\""))
+        assertEquals(1, server.requestCount)
 
         server.shutdown()
     }

@@ -304,7 +304,7 @@ fun ChatScreen(
                     vm.undoToSaved { ok ->
                         Toast.makeText(
                             context,
-                            if (ok) "已撤销到上次保存的版本" else "当前没有可撤销的保存点",
+                            if (ok) "已撤销到上次保存的版本" else "当前没有可撤销的修改",
                             Toast.LENGTH_SHORT
                         ).show()
                     }

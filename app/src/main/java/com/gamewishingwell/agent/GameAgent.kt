@@ -29,7 +29,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -202,10 +201,6 @@ class GameAgent(
          * + 常规修复轮次后仍有余量。
          */
         const val LEGACY_MAX_ROUNDS = 30
-
-        /** 确认后策划 LLM 的独立超时：超时回退静态种子继续生成（策划只是辅助，
-         *  有回退；不该让玩家在网络断时盯着"策划中"等满 5 分钟读超时）。 */
-        const val PLANNING_TIMEOUT_MS = 90_000L
     }
 
     /**
@@ -220,10 +215,14 @@ class GameAgent(
 
     private val okHttp by lazy {
         OkHttpClient.Builder()
-            // 整体时长不设限（callTimeout=0）：用户可无限等待，停止键是唯一主动中断。
-            // 但连接与读必须有界：蜂窝网络下运营商城域 NAT 通常几分钟就回收空闲 TCP，
-            // 零超时会让协程在死连接上永远挂起且用户无感知。SSE 持续有 delta 时
-            // 读超时不会触发；5 分钟无任何字节才判定连接死亡并抛错，由上层提示用户。
+            // 网络层超时是"死连接探测器"，不是对 LLM 的时长限制——三者都不约束模型生成：
+            // 1) connect/write 只管建连与请求体上传（模型尚未开始输出），超时=网络不可达；
+            // 2) read 是字节间静默超时（单次阻塞读的等待上限，非整流时长）——只要流上有任何
+            //    字节到达（content / reasoning_content / SSE 心跳）就永不触发；推理与长输出
+            //    阶段字节持续在流。唯一触发场景：连接已死、一个字节都到不了（蜂窝 NAT 几分钟
+            //    就回收空闲 TCP），此时的"无限等待"没有任何价值；
+            // 3) 触发后不判死：callLlm 对网络类异常自动重试最多 2 次（重连新连接），
+            //    模型输出不会被截断；callTimeout=0 保证整体时长不设限，停止键是用户侧唯一主动中断。
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(5, TimeUnit.MINUTES)
             .writeTimeout(60, TimeUnit.SECONDS)
@@ -434,25 +433,19 @@ class GameAgent(
         // 耗时；若放在策划后重置，停止键计时会在策划完成瞬间跳回 0 秒。
         markTurnStart()
 
-        // 策划延迟到此刻执行：LLM 异常时 draftWithLlm 内部回退静态种子，不阻塞生成。
+        // 策划延迟到此刻执行：LLM 异常时 draftWithLlm 内部回退静态种子（不抛出、
+        // 不阻塞生成）；不对策划调用设任何超时——停止键是用户侧唯一中断手段。
         val llm = createClient()
         if (llm == null) {
             failTurn("请先在「设置」中配置 API Key、地址和模型")
             return
         }
-        val draftPlan = withTimeoutOrNull(PLANNING_TIMEOUT_MS) {
-            PlanningEngine.draftWithLlm(
-                schema = schema,
-                llm = llm,
-                existingTitle = _session.value.designPlan?.title,
-                currentUserRequest = pending.userRequest
-            )
-        } ?: run {
-            // 策划只是辅助步骤（有静态种子回退）：网络断/网关挂时读超时长达 5 分钟，
-            // 不该让玩家盯着"策划中"干等——超时即回退静态方案继续生成。
-            alog("planning LLM timed out after ${PLANNING_TIMEOUT_MS / 1000}s, fallback to static seeds")
-            null
-        }
+        val draftPlan = PlanningEngine.draftWithLlm(
+            schema = schema,
+            llm = llm,
+            existingTitle = _session.value.designPlan?.title,
+            currentUserRequest = pending.userRequest
+        )
         currentCoroutineContext().ensureActive()
         val finalPlan = PlanningEngine.finalize(
             schema = schema,
@@ -540,7 +533,8 @@ class GameAgent(
         saveGlobalErrorSignatures(known)
 
         // 运行错误不做次数预算或自动降级：每次都以完整玩法为上下文继续修复，用户可无限等待。
-        val instruction = "游戏运行时报错，请修复并输出完整新版代码（保持原有玩法与 P0 特性）：\n$jsError"
+        val instruction = "游戏运行时报错，请精准修复该错误（修改范围契约：只改与报错直接相关的代码，" +
+            "其余一切游戏特性保持原样，不得顺带优化或重构）：\n$jsError"
         val messages = s.messages + ChatMessage("user", instruction)
         // schema 推导与其它回合同源：gameSchema → 旧版会话兼容推导 → 兜底空 Schema。
         val schema = legacyAnchoredSchema(s) ?: GameSchema(confidence = 1.0)
@@ -614,35 +608,66 @@ class GameAgent(
      * 撤销（保存的逆操作）：把保存区（games/<id>）的游戏文件覆盖回编辑区（工作区），
      * 会话上下文回滚到保存点（保存时冻结的快照）——未保存的修改与其后的对话记录被丢弃。
      * 仅对已保存游戏的编辑会话有意义（草稿没有保存点）。
+     * 旧版本保存的游戏没有保存点：保存时的上下文不可恢复，撤销时清空对话
+     * （只保留一条说明气泡），避免"文件已回滚、气泡还在描述未保存修改"的误导。
+     * 返回 false 表示当前已在保存的版本上（无可撤销的修改）。
      */
     suspend fun undoToSaved(): Boolean {
         val editingId = editingGameId ?: return false
-        if (_session.value.isGenerating) return false
+        val before = _session.value
+        if (before.isGenerating) return false
+        var changed = false
         val ok = withContext(Dispatchers.IO) {
             val savedHtml = repository.loadGameHtml(editingId) ?: return@withContext false
             restoreWorkspaceFromSaved(editingId)
-            // 上下文回滚到保存点；旧版本保存的游戏没有 .savepoint 时回退到保存区实时副本（尽力而为）。
-            val spMessages = repository.loadSavepointSession(editingId) ?: repository.loadGameSession(editingId)
-            val spState = repository.loadSavepointAgentState(editingId) ?: repository.loadGameAgentState(editingId)
-            val decoded = decodeSession(spState)
-            _session.value = decoded.copy(
-                messages = spMessages.ifEmpty { decoded.messages },
+            val hasSavepoint = repository.loadSavepointAgentState(editingId) != null
+            var restored: GameSession
+            if (hasSavepoint) {
+                val spMessages = repository.loadSavepointSession(editingId).orEmpty()
+                restored = decodeSession(repository.loadSavepointAgentState(editingId))
+                if (spMessages.isNotEmpty()) restored = restored.copy(messages = spMessages)
+            } else {
+                // 旧版本保存的游戏：保存点缺失，保存时的对话不可回放——清空对话与
+                // 过期摘要（摘要描述的是未保存版本），保留 Schema/策划稿供继续编辑。
+                // 对话既已清空，待确认门（若残留）一并作废，避免 ActionBar 被隐藏。
+                restored = decodeSession(repository.loadGameAgentState(editingId)).copy(
+                    messages = emptyList(),
+                    rollingSummary = "",
+                    knownIssues = emptyList(),
+                    lastError = null,
+                    lastErrorSignature = null,
+                    pendingConfirmation = null
+                )
+            }
+            changed = restored.messages != before.messages || before.currentHtml != savedHtml
+            if (changed) {
+                val note = if (hasSavepoint) {
+                    ChatMessage("assistant", "已撤销未保存的修改，回到上次保存的版本。")
+                } else {
+                    ChatMessage(
+                        "assistant",
+                        "已回到上次保存的版本。该游戏由旧版本应用保存（无保存点），此前的对话记录已随撤销清空；" +
+                            "游戏文件已恢复为保存区版本，可继续描述需求修改。"
+                    )
+                }
+                restored = restored.copy(messages = restored.messages + note)
+            }
+            _session.value = restored.copy(
                 currentHtml = savedHtml,
                 isGenerating = false,
                 streamingText = null,
                 error = null,
                 agentStage = AgentStage.IDLE,
-                pendingConfirmation = null,
-                lastWarning = "已撤销未保存的修改，回到上次保存的版本。"
+                lastWarning = if (changed) "已撤销未保存的修改，回到上次保存的版本。" else null
             )
             true
         }
         if (ok) {
-            alog("undo: workspace + context restored to savepoint (game-$editingId)")
+            alog("undo: workspace + context restored (game-$editingId, savepoint=$changed)")
             // 撤销结果同步进保存区实时会话副本：应用若在撤销后立即重启，重进编辑对话看到的也是回滚后的上下文。
             persistSessionMessages(_session.value)
         }
-        return ok
+        return ok && changed
     }
 
     /**
@@ -1041,7 +1066,7 @@ class GameAgent(
             s.copy(
                 messages = s.messages + ChatMessage(
                     "assistant",
-                    text.take(1000) + "（耗时 ${formatAgentDuration(turnElapsedMs())}）"
+                    text + "（耗时 ${formatAgentDuration(turnElapsedMs())}）"
                 ),
                 isGenerating = false,
                 agentStage = AgentStage.DONE,
@@ -1136,18 +1161,12 @@ class GameAgent(
             plan.gameSystems,
             QualityTier.normalize(_session.value.qualityTier)
         )
-        // 修改范围契约的执行层：修改/修复回合禁止整量重写入口文件（未点名的游戏逻辑
-        // 必须保持原样）；首次生成拦一次放行；用户明确要求重做（allowEntryRewrite）直接放行。
+        // 修改范围契约只在提示词层约束（scopeFence 注入 SCOPE_FENCE_RULE）：
+        // 执行层不做检查或撤回——LLM 若仍主动发挥，由用户以停止键/撤销兜底。
         val scopeFence = existingHtml != null && !allowEntryRewrite
-        val rewritePolicy = when {
-            allowEntryRewrite -> EntryRewritePolicy.ALLOW
-            existingHtml == null -> EntryRewritePolicy.NUDGE_ONCE
-            else -> EntryRewritePolicy.FORBID
-        }
         val executor = GameToolExecutor(
             workspace,
-            validate = { GameValidator.validate(it, allowedEngines) },
-            entryRewritePolicy = rewritePolicy
+            validate = { GameValidator.validate(it, allowedEngines) }
         )
 
         var outcome = runToolLoop(
@@ -1184,19 +1203,22 @@ class GameAgent(
 
         currentCoroutineContext().ensureActive()
         val elapsedMs = turnElapsedMs()
-        val assistantText = HtmlExtractor.nonCodeText(accepted.finalText).trim().ifBlank {
+        // 结算后缀（轮次/耗时）直接拼接，不做任何长度裁切——对模型输出与用户可见
+        // 信息都不截断（停止键是用户侧唯一干预手段）。
+        val summaryBody = HtmlExtractor.nonCodeText(accepted.finalText).trim().ifBlank {
             if (existingHtml.isNullOrBlank()) {
                 "游戏已制作完成，并通过沙箱运行验证。点击「立即游玩」试玩吧——如遇问题可让 AI 修复，也可以直接在这里继续提改进需求。"
             } else {
                 "游戏已按你的要求更新，并通过沙箱运行验证。点击「立即游玩」确认效果；如遇问题或想继续调整，随时告诉我。"
             }
-        } + "（本次 Agent Loop 共 ${accepted.rounds} 轮，耗时 ${formatAgentDuration(elapsedMs)}）"
+        }
+        val assistantText = summaryBody + "（本次 Agent Loop 共 ${accepted.rounds} 轮，耗时 ${formatAgentDuration(elapsedMs)}）"
         val summary = buildRollingSummary(plan, accepted.report, accepted.html)
         currentCoroutineContext().ensureActive()
         alog("turn reply: rounds=${accepted.rounds} elapsedMs=$elapsedMs")
         val next = updateSession { s ->
             s.copy(
-                messages = s.messages + ChatMessage("assistant", assistantText.take(1000)),
+                messages = s.messages + ChatMessage("assistant", assistantText),
                 currentHtml = accepted.html,
                 gameGenerated = true,
                 streamingText = null,
@@ -1247,7 +1269,7 @@ class GameAgent(
         allowedEngines: Set<String> = GameEngines.BUNDLED.keys,
         /** 修复轮（运行报错回传/修复快车道）：自检降为一轮回归检查，且不参与预算复核。 */
         fixTurn: Boolean = false,
-        /** 修改范围契约：修改回合且未获重做授权时注入提示词（与执行层 EntryRewritePolicy 双保险）。 */
+        /** 修改范围契约：修改回合且未获重做授权时注入提示词（仅提示词层约束，执行层不检查）。 */
         scopeFence: Boolean = false
     ): GenOutcome {
         val customSystem = settingsRepository.settings.value.systemPrompt.trim()
@@ -1346,18 +1368,9 @@ class GameAgent(
                 }
 
                 // 中途退化：模型在正文直接给出整份代码 → 按隐式写入处理（等价 overwrite 写入）。
-                // 修改范围契约：正文整份代码＝变相整量重写，与 writefile 整量重写同罪——
-                // 拒绝写入并引导 editfile（完全不会用工具的模型由上面的 LegacyFallback 分流）。
+                // 修改范围契约只在提示词层约束，正文写入不做检查或撤回。
                 var content = current
                 if (directHtml != null && directHtml != current) {
-                    if (scopeFence && current != null) {
-                        messages += ChatMessage(
-                            "user",
-                            "修改范围契约：禁止以正文输出整份 HTML 的方式整量重写已有游戏（与 writefile 整量重写同罪，" +
-                                "未点名的游戏逻辑必须保持原样）。请改用 editfile 精确替换实现用户诉求：$instruction"
-                        )
-                        continue
-                    }
                     val saved = if (current == null) {
                         workspace.writeInitial(GameFileWorkspaceEntryPoint.DEFAULT, directHtml)
                     } else {
@@ -1593,7 +1606,7 @@ class GameAgent(
 
                 messages += ChatMessage(
                     ChatMessage.ROLE_TOOL,
-                    outcome.observation.take(8000),
+                    outcome.observation,
                     toolCallId = outcome.callId
                 )
                 if (outcome.ok && outcome.name == GameTools.READ_FILE) {
@@ -1845,7 +1858,7 @@ class GameAgent(
         instruction: String,
         plan: DesignPlan,
         firstGeneration: Boolean,
-        /** 修改范围契约：修改回合且用户未明确要求重做时注入（提示词与执行层 EntryRewritePolicy 双保险）。 */
+        /** 修改范围契约：修改回合且用户未明确要求重做时注入（仅提示词层约束，执行层不检查）。 */
         scopeFence: Boolean = false
     ): String = buildString {
         if (firstGeneration) {
@@ -2045,11 +2058,11 @@ class GameAgent(
             )
             signatureRepeat == 6 -> messages += ChatMessage(
                 "user",
-                "$kind 错误$detail 已连续出现 6 轮，局部修补已失效。请停止打补丁：换一种完全不同的实现方式重写包含该问题的整个模块段落（修改回合用 editfile 整段替换，old_string 取该模块完整原文），而不是重复同样的修改。"
+                "$kind 错误$detail 已连续出现 6 轮，局部修补已失效。请停止打补丁：换一种完全不同的实现方式重写包含该问题的整个模块段落（editfile 整段替换或 writefile 均可，与该问题无关的部分保持原样），而不是重复同样的修改。"
             )
             signatureRepeat > 6 && signatureRepeat % 3 == 0 -> messages += ChatMessage(
                 "user",
-                "$kind 错误$detail 仍未解决（已连续 $signatureRepeat 轮）。请再次更换实现策略；反复失败时对问题模块做整体重写（修改回合用 editfile 整段替换），未涉及的部分仍保持原样。"
+                "$kind 错误$detail 仍未解决（已连续 $signatureRepeat 轮）。请再次更换实现策略；反复失败时对问题模块做整体重写，未涉及的部分仍保持原样。"
             )
         }
     }
@@ -2165,12 +2178,12 @@ class GameAgent(
                 thinkingEnabled = s.thinkingEnabled
             )
         } else {
+            // OpenAI 兼容协议不携带 max_tokens：输出长度由网关按模型上限裁定（不设限）
             OpenAiCompatibleClient(
                 okHttp = okHttp,
                 apiKey = s.apiKey,
                 baseUrl = s.baseUrl,
                 model = s.model,
-                maxTokens = preset.maxTokens,
                 disableThinking = preset.disableThinking || !s.thinkingEnabled
             )
         }

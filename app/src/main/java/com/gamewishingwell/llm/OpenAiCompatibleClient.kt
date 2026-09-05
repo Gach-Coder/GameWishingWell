@@ -30,13 +30,15 @@ import java.util.concurrent.atomic.AtomicReference
  * 分片到达（id/name 可能只出现一次、arguments 逐段追加），此处聚合成完整调用后
  * 随 [LlmResponse] 返回。网关不支持 tools 字段时（4xx 且错误信息提及），
  * 去掉该字段重试一次，模型将以纯文本回答——调用方可据此降级。
+ *
+ * 输出长度不设上限：请求不携带 max_tokens（由网关按模型上限自行裁定），
+ * 截断输出只会制造非法 JSON 的工具参数与残缺代码。
  */
 class OpenAiCompatibleClient(
     private val okHttp: OkHttpClient,
     private val apiKey: String,
     private val baseUrl: String,
     private val model: String,
-    private val maxTokens: Int = 8192,
     /** 是否发送 thinking={"type":"disabled"} 关闭推理模型的思考过程（由设置页思考开关驱动，默认关闭）。 */
     private val disableThinking: Boolean = false
 ) : LlmClient {
@@ -59,29 +61,23 @@ class OpenAiCompatibleClient(
         return runInterruptible(Dispatchers.IO) {
             try {
                 executeStream(
-                    buildRequest(messages, includeMaxTokens = true, includeThinking = true, tools = tools),
+                    buildRequest(messages, includeThinking = true, tools = tools),
                     onDelta, onThinking, onDone, activeCall
                 )
             } catch (e: LlmError) {
                 if (Thread.currentThread().isInterrupted) throw e
                 val msg = e.message ?: ""
                 when {
-                    // 个别老模型不支持 max_tokens 字段，收到相关 4xx 时去掉该字段重试
-                    msg.contains("max_tokens", ignoreCase = true) ->
-                        executeStream(
-                            buildRequest(messages, includeMaxTokens = false, includeThinking = true, tools = tools),
-                            onDelta, onThinking, onDone, activeCall
-                        )
                     // 个别网关不支持 thinking 字段，去掉后重试
                     msg.contains("thinking", ignoreCase = true) ->
                         executeStream(
-                            buildRequest(messages, includeMaxTokens = true, includeThinking = false, tools = tools),
+                            buildRequest(messages, includeThinking = false, tools = tools),
                             onDelta, onThinking, onDone, activeCall
                         )
                     // 网关不支持 function calling：去掉 tools 重试，由调用方按纯文本回复降级处理
                     tools.isNotEmpty() && msg.contains(Regex("tool|function", RegexOption.IGNORE_CASE)) ->
                         executeStream(
-                            buildRequest(messages, includeMaxTokens = true, includeThinking = true, tools = emptyList()),
+                            buildRequest(messages, includeThinking = true, tools = emptyList()),
                             onDelta, onThinking, onDone, activeCall
                         )
                     else -> throw e
@@ -92,7 +88,6 @@ class OpenAiCompatibleClient(
 
     private fun buildRequest(
         messages: List<ChatMessage>,
-        includeMaxTokens: Boolean,
         includeThinking: Boolean,
         tools: List<ToolSpec>
     ): Request {
@@ -100,7 +95,6 @@ class OpenAiCompatibleClient(
             OpenAiChatRequest(
                 model = model,
                 stream = true,
-                max_tokens = if (includeMaxTokens) maxTokens else null,
                 thinking = if (includeThinking && disableThinking) ThinkingConfig("disabled") else null,
                 messages = mergeConsecutive(messages).map { it.toWire() },
                 tools = tools.takeIf { it.isNotEmpty() }?.map { it.toWire() }
@@ -206,7 +200,6 @@ class OpenAiCompatibleClient(
     private data class OpenAiChatRequest(
         val model: String,
         val stream: Boolean,
-        val max_tokens: Int? = null,
         val thinking: ThinkingConfig? = null,
         val messages: List<OpenAiMessage>,
         val tools: List<OpenAiToolDef>? = null

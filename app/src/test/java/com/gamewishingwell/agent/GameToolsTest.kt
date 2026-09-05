@@ -60,76 +60,21 @@ class GameToolsTest {
     }
 
     @Test
-    fun `修改回合 writefile 整量重写被硬拒绝且重发仍拒绝`() = runBlocking {
+    fun `writefile 可覆盖已存在文件且版本递增`() = runBlocking {
         val (ws, dir) = newWorkspace()
-        // 默认策略 FORBID（修改/修复回合）：首次新建照常通过
         val executor = GameToolExecutor(ws)
         executor.execute(call(GameTools.WRITE_FILE, """{"content":"v1"}"""))
-        // 整量重写：拒绝，文件保持不变
-        val blocked = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
-        assertFalse(blocked.ok)
-        assertFalse(blocked.mutated)
-        assertFalse(blocked.workspaceTouched)
-        assertTrue(blocked.observation.contains("已拒绝"))
-        assertTrue(blocked.observation.contains("修改范围契约"))
-        assertTrue(blocked.observation.contains("editfile"))
-        assertEquals("v1", ws.read("index.html"))
-        // 重发同样被拒（硬门禁：没有"再发一次放行"的旁路）
-        val again = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
-        assertFalse(again.ok)
-        assertEquals("v1", ws.read("index.html"))
-        dir.deleteRecursively()
-        Unit
-    }
-
-    @Test
-    fun `首次生成回合整量重写拦一次后放行`() = runBlocking {
-        val (ws, dir) = newWorkspace()
-        val executor = GameToolExecutor(ws, entryRewritePolicy = EntryRewritePolicy.NUDGE_ONCE)
-        executor.execute(call(GameTools.WRITE_FILE, """{"content":"v1"}"""))
-        val blocked = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
-        assertFalse(blocked.ok)
-        assertTrue(blocked.observation.contains("已拦截"))
-        val pass = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
-        assertTrue(pass.ok)
-        assertTrue(pass.mutated)
+        val out = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
+        // 一般 Agent 惯例：Write 支持新建与整量覆盖，不做策略门禁（修改范围契约只在提示词层约束）
+        assertTrue(out.ok)
+        assertTrue(out.mutated)
         assertEquals("v2", ws.read("index.html"))
+        assertTrue(out.observation.contains("v2"))
         // 内容一致时不产生变更
         val same = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
         assertTrue(same.ok)
         assertFalse(same.mutated)
         assertTrue(same.observation.contains("完全一致"))
-        dir.deleteRecursively()
-        Unit
-    }
-
-    @Test
-    fun `用户明确要求重做的回合直接放行`() = runBlocking {
-        val (ws, dir) = newWorkspace()
-        val executor = GameToolExecutor(ws, entryRewritePolicy = EntryRewritePolicy.ALLOW)
-        executor.execute(call(GameTools.WRITE_FILE, """{"content":"v1"}"""))
-        val out = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
-        assertTrue(out.ok)
-        assertTrue(out.mutated)
-        assertEquals("v2", ws.read("index.html"))
-        assertTrue(out.observation.contains("v2"))
-        dir.deleteRecursively()
-        Unit
-    }
-
-    @Test
-    fun `门禁只管入口文件 scenarios 重写不受影响`() = runBlocking {
-        val (ws, dir) = newWorkspace()
-        // 修改回合（FORBID）下 scenarios.json 的维护性整写不受门禁影响
-        ws.writeInitial(GameScenarios.FILE, """{"scenarios":[]}""")
-        val executor = GameToolExecutor(ws)
-        val scenJson = """{"scenarios":[{"id":"score-up","system":"战斗","name":"击杀得分","steps":[{"frames":24}],"expect":"s.score > 0"}]}"""
-        val scen = executor.execute(
-            call(GameTools.WRITE_FILE, """{"path":"${GameScenarios.FILE}","content":${Json.encodeToString(scenJson)}}""")
-        )
-        assertTrue(scen.ok)
-        assertTrue(scen.workspaceTouched)
-        assertFalse(scen.observation.contains("已拒绝"))
         dir.deleteRecursively()
         Unit
     }
@@ -211,6 +156,42 @@ class GameToolsTest {
         val missing = executor.execute(call(GameTools.READ_FILE, """{"path":"nope.html"}"""))
         assertFalse(missing.ok)
         assertTrue(missing.observation.contains("不存在"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `readfile 整读去重且写入后失效`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        ws.writeInitial("index.html", "l1\nl2\nl3")
+        val first = executor.execute(call(GameTools.READ_FILE, "{}"))
+        assertTrue(first.ok)
+        assertTrue(first.observation.contains("l1"))
+        // 同回合重复整读（含切片请求被整读覆盖）：只回指针，不再整发全文
+        val dup = executor.execute(call(GameTools.READ_FILE, "{}"))
+        assertTrue(dup.ok)
+        assertTrue(dup.observation.contains("未发生变更"))
+        assertFalse(dup.observation.contains("l1"))
+        val dupSlice = executor.execute(call(GameTools.READ_FILE, """{"start_line":2,"end_line":3}"""))
+        assertTrue(dupSlice.observation.contains("未发生变更"))
+        // 写入后标记失效：重读返回最新全文
+        executor.execute(call(GameTools.EDIT_FILE, """{"old_string":"l2","new_string":"L2"}"""))
+        val fresh = executor.execute(call(GameTools.READ_FILE, "{}"))
+        assertTrue(fresh.observation.contains("L2"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `writefile 参数中途截断时引导改用 editfile`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 未闭合的 JSON 字符串 → Unexpected EOF（模拟输出在参数中途被截断）
+        val out = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"""))
+        assertFalse(out.ok)
+        assertTrue(out.observation.contains("截断"))
+        assertTrue(out.observation.contains("editfile"))
         dir.deleteRecursively()
         Unit
     }

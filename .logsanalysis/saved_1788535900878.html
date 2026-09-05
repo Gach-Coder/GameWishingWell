@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="ww-engine" content="three">
+<title>方块矿工 · 守护金矿</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b1526;
+    touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;}
+  #g{position:fixed;left:0;top:0;width:100%;height:100%;display:block;}
+  .ui{position:fixed;pointer-events:none;color:#fff;font-family:system-ui,sans-serif;text-shadow:0 1px 3px rgba(0,0,0,.7);}
+  #topb{position:fixed;top:118px;left:0;right:0;text-align:center;pointer-events:none;z-index:4;}
+  #lvlEl{background:rgba(0,0,0,.42);border-radius:13px;padding:3px 16px;font:800 16px/1.6 system-ui,sans-serif;display:inline-block;color:#ffe8a0;}
+  #scoreWrap{position:fixed;top:158px;left:0;right:0;text-align:center;z-index:3;}
+  #hs0{font:900 33px/1 system-ui,sans-serif;display:inline-block;background:rgba(0,0,0,.45);border-radius:16px;
+    padding:7px 22px;color:#ffdc63;box-shadow:0 4px 14px rgba(0,0,0,.35);}
+  #hpbar{position:fixed;top:210px;left:50%;transform:translateX(-46%);width:min(52vw,210px);height:13px;
+    background:rgba(0,0,0,.55);border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,.32);z-index:3;}
+  #hfill{height:100%;width:100%;background:linear-gradient(90deg,#e048,#ff8a5a);transition:width .12s;}
+  #noti{position:fixed;top:240px;left:0;right:0;text-align:center;color:#ffe9a0;font-weight:800;font-size:16px;
+    text-shadow:0 2px 8px #000;pointer-events:none;z-index:3;transition:opacity .25s;}
+  #pulse{position:fixed;left:0;right:0;top:0;bottom:0;pointer-events:none;z-index:4;opacity:0;transition:opacity .3s;
+    background:radial-gradient(ellipse at center,transparent 45%,rgba(220,40,20,.5));}
+  #joy{position:fixed;left:22px;bottom:34px;width:118px;height:118px;border-radius:50%;pointer-events:auto;z-index:8;
+    background:rgba(255,255,255,.14);border:2px solid rgba(255,255,255,.36);box-shadow:inset 0 0 18px rgba(255,255,255,.12);}
+  #joysmall{position:absolute;left:0;right:0;top:56%;text-align:center;font-size:10px;color:#dde8ff;opacity:.6;
+    font-family:system-ui,sans-serif;font-weight:700;letter-spacing:1px;pointer-events:none;}
+  #knob{position:absolute;width:52px;height:52px;border-radius:50%;background:rgba(255,255,255,.76);left:31px;top:31px;
+    box-shadow:0 2px 8px rgba(0,0,0,.45);pointer-events:none;transition:left .02s,top .02s;}
+  #atkN{position:fixed;right:22px;bottom:42px;width:96px;height:96px;border-radius:50%;pointer-events:auto;z-index:8;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;color:#5a2208;text-align:center;
+    background:radial-gradient(circle at 40% 34%,rgba(255,210,150,.9),rgba(195,78,36,.72));
+    border:3px solid rgba(255,214,165,.95);box-shadow:0 6px 16px rgba(120,30,10,.45);}
+  #dashN{position:fixed;right:132px;bottom:58px;width:78px;height:78px;border-radius:50%;pointer-events:auto;z-index:8;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;color:#113a62;text-align:center;
+    background:radial-gradient(circle at 40% 34%,rgba(190,230,255,.92),rgba(42,112,168,.75));
+    border:3px solid rgba(205,240,255,.92);box-shadow:0 5px 14px rgba(10,40,70,.45);}
+  #atkN i,#dashN i{font-style:normal;font-size:32px;line-height:1;text-shadow:0 1px 2px rgba(255,255,255,.6);}
+  #atkN em,#dashN em{font-style:normal;font-size:11px;font-weight:900;margin-top:2px;}
+  #pauseBtn{position:fixed;top:130px;right:16px;width:46px;height:46px;border-radius:14px;pointer-events:auto;z-index:9;
+    background:rgba(0,0,0,.35);border:2px solid rgba(255,255,255,.32);color:#fff;font-size:20px;line-height:1;
+    display:flex;align-items:center;justify-content:center;padding:0;}
+  .btn{pointer-events:auto;background:linear-gradient(180deg,#6ab57a,#3f8a50);color:#fff;border:none;border-radius:30px;
+    padding:15px 46px;font-size:18px;font-weight:900;box-shadow:0 6px 14px rgba(0,0,0,.5);cursor:pointer;font-family:system-ui,sans-serif;}
+  .card{max-width:86vw;background:rgba(14,23,48,.98);border:2px solid rgba(255,217,120,.65);border-radius:22px;
+    padding:22px 20px 20px;text-align:center;color:#fff;font-family:system-ui,sans-serif;box-shadow:0 14px 40px rgba(0,0,0,.66);}
+  #menu{position:fixed;left:0;right:0;top:0;bottom:0;display:flex;align-items:center;justify-content:center;z-index:10;
+    background:rgba(8,16,34,.58);}
+  #menu h1{margin:0 0 10px;font-size:32px;color:#ffd95e;letter-spacing:2px;text-shadow:0 3px 9px rgba(0,0,0,.8);}
+  .sub2{font-size:14px;line-height:1.9;color:#dce6ff;margin:0 0 4px;}
+  .subdot{font-size:12px;line-height:1.55;color:#9fb3e8;margin:6px 8px 0;}
+  #menu .btn{margin-top:15px;}
+  #ovend{position:fixed;left:0;right:0;top:0;bottom:0;z-index:10;display:none;align-items:center;justify-content:center;
+    background:rgba(8,14,32,.58);}
+  #ovend h2{margin:0 0 14px;font-size:26px;line-height:1.2;}
+  .row{font-size:14px;color:#d3dfff;margin:7px 0;}
+  #ovend .btn{margin-top:15px;}
+</style>
+</head>
+<body>
+<canvas id="g"></canvas>
+<div class="ui" id="topb"><span id="lvlEl">第1关 · 守护金矿</span></div>
+<div id="scoreWrap"><span id="hs0">0</span></div>
+<div id="hpbar"><div id="hfill"></div></div>
+<div id="noti"></div>
+<div id="pulse"></div>
+<button id="pauseBtn" aria-label="暂停">❚❚</button>
+<div id="joy"><div id="knob"></div><div id="joysmall">移动</div></div>
+<div id="dashN"><i>≫</i><em>冲刺</em></div>
+<div id="atkN"><i>⚔</i><em>击退</em></div>
+<div id="menu"><div class="card">
+  <h1>⛏ 方块矿工</h1>
+  <p class="sub2">拖动左侧摇杆移动矿工<br>靠近金矿自动采集 · 点 ⚔ 挥镐击退亡灵</p>
+  <div class="row">金矿 +50　亡灵 +18~36</div>
+  <div class="subdot">达到 120 分守住矿区获胜，<br>每 60 分自动强化一次铁镐！</div>
+  <button class="btn" id="sbtn">⚒ 开始挖矿</button>
+</div></div>
+<div id="ovend"><div class="card">
+  <h2 id="ot">游戏结束</h2>
+  <div class="row">本次得分：<b id="osc">0</b>　（目标120）</div>
+  <div class="row">⛏采金 <b id="oIng">0</b>　|　⚔斩敌 <b id="oKill">0</b></div>
+  <div class="row">历史最高：<b id="obest">0</b></div>
+  <button class="btn" id="rbtn">✊ 再来一局</button>
+</div></div>
+<script>
+'use strict';
+/* ============ 方块矿工 3D 竖版（自改加强版） ============ */
+var PI=Math.PI,TWO=PI*2,W=0,H=0;
+var renderer=null,camera=null,scene=null;
+var R=null,materials=null;
+var state='menu',score=0,best=0,hp=5,MAXHP=5,level=1,kills=0,ingots=0;
+var runTicks=0,spawnTimer=0,shake=0,lastNow=0,running=false,globalNow=0;
+var WIN=120,ARENA=10,MAXMOB=5,spawnRate=3.1;
+var player={x:0,z:0,speed:4.8,power:1,pickR:1.6,atkCd:0,invT:1.4};
+var upgrades=0,nextTier=60,dashCd=0,dashT=0;
+var enemies=[],goldn=[],parts=[];
+var joy={a:false,dx:0,dy:0,idx:-1,ox:0,oy:0};
+var knobEl=null,atkEl=null,joyEl=null,dashEl=null,pauseEl=null,inited=false;
+var levelMobs=0;
+function $(id){return document.getElementById(id);}
+function clamp(v,a,b){return v<a?a:(v>b?b:v);}
+function rand(mn,mx){return mn+Math.random()*(mx-mn);}
+function r1(v){return Math.round(v*10)/10;}
+/* ---------- 音频 ---------- */
+var actx=null;
+function audio(){try{if(!actx)actx=new(window.AudioContext||window.webkitAudioContext)();}catch(e){}return actx;}
+function tone(f,d,ty,v){
+  try{var c=audio();if(!c)return;var o=c.createOscillator(),g=c.createGain(),t=c.currentTime;
+    o.type=ty||'square';o.frequency.value=f;o.connect(g);g.connect(c.destination);
+    g.gain.setValueAtTime(v==null?0.09:v,t);g.gain.exponentialRampToValueAtTime(0.001,t+d);
+    o.start(t);o.stop(t+d+0.03);}catch(e){}
+}
+function snd(k){
+  if(k==='st'){tone(523,.1,'square',.1);setTimeout(function(){tone(784,.16,'square',.1);},120);}
+  else if(k==='coin'){tone(880,.09,'triangle',.11);setTimeout(function(){tone(1318,.12,'triangle',.08);},60);}
+  else if(k==='hit'){tone(205,.12,'square',.1);setTimeout(function(){tone(90,.14,'square',.07);},45);}
+  else if(k==='hurt'){tone(135,.3,'sawtooth',.12);}
+  else if(k==='kfu'){tone(740,.1,'sine',.1);setTimeout(function(){tone(1174,.12,'sine',.08);},70);}
+  else if(k==='win'){tone(523,.12,'square',.1);setTimeout(function(){tone(659,.12,'square',.1);},120);setTimeout(function(){tone(784,.24,'square',.1);},240);}
+  else if(k==='lose'){tone(420,.2,'sawtooth',.1);setTimeout(function(){tone(200,.6,'sawtooth',.1);},170);}
+  else if(k==='dash'){tone(700,.09,'sine',.06);}
+  else if(k==='level'){tone(392,.12,'triangle',.1);setTimeout(function(){tone(588,.16,'triangle',.1);},110);}
+}
+function unlock(){try{var c=audio();if(c&&c.resume)c.resume();}catch(e){}}
+/* ---------- Canvas 纹理 ---------- */
+function mkTex(paint){
+  var cv=document.createElement('canvas');cv.width=cv.height=64;
+  var c=cv.getContext('2d');paint(c);
+  var t=new THREE.CanvasTexture(cv);t.wrapS=t.wrapT=THREE.RepeatWrapping;return t;
+}
+function makeAssets(){
+  var T={};
+  T.ground=mkTex(function(c){c.fillStyle='#3f7a47';c.fillRect(0,0,64,64);
+    c.fillStyle='#558d5a';for(var i=0;i<46;i++)c.fillRect((Math.random()*64)|0,(Math.random()*64)|0,6,2);
+    c.fillStyle='rgba(0,0,0,.06)';c.fillRect(0,0,64,16);});
+  T.gold=mkTex(function(c){c.fillStyle='#a1740a';c.fillRect(0,0,64,64);
+    c.fillStyle='#eab53e';c.fillRect(10,10,44,44);c.fillStyle='#fff3bc';c.fillRect(18,14,17,12);
+    c.fillStyle='#ffec98';c.fillRect(26,34,22,12);c.fillStyle='#9c7112';c.fillRect(38,14,10,9);});
+  T.enemy=mkTex(function(c){c.fillStyle='#53234a';c.fillRect(0,0,64,64);
+    c.fillStyle='#b555d6';c.fillRect(10,5,18,15);c.fillRect(37,5,18,15);c.fillStyle='#2c0a26';c.fillRect(10,42,44,13);});
+  T.enemy2=mkTex(function(c){c.fillStyle='#4a1220';c.fillRect(0,0,64,64);
+    c.fillStyle='#c4293f';c.fillRect(9,4,19,15);c.fillRect(36,31,19,13);c.fillStyle='#18030a';c.fillRect(10,41,44,15);});
+  T.enemy3=mkTex(function(c){c.fillStyle='#195c2c';c.fillRect(0,0,64,64);
+    c.fillStyle='#45e065';c.fillRect(9,9,18,15);c.fillRect(36,35,18,14);c.fillStyle='#073c12';c.fillRect(0,28,64,7);});
+  T.player=mkTex(function(c){c.fillStyle='#3f85cf';c.fillRect(0,0,64,64);
+    c.fillStyle='#6cb3ec';c.fillRect(4,28,56,12);c.fillStyle='#eef8ff';c.fillRect(7,12,26,10);c.fillStyle='#28507a';c.fillRect(0,52,64,12);});
+  T.tree=mkTex(function(c){c.fillStyle='#2a6b33';c.fillRect(2,20,60,44);c.fillStyle='rgba(255,255,255,.08)';c.fillRect(22,3,10,44);});
+  materials={
+    ground:new THREE.MeshLambertMaterial({map:T.ground}),
+    gold:new THREE.MeshLambertMaterial({map:T.gold}),
+    enemy:new THREE.MeshLambertMaterial({map:T.enemy}),
+    enemy2:new THREE.MeshLambertMaterial({map:T.enemy2}),
+    enemy3:new THREE.MeshLambertMaterial({map:T.enemy3}),
+    player:new THREE.MeshLambertMaterial({map:T.player}),
+    tree:new THREE.MeshLambertMaterial({map:T.tree}),
+    trunk:new THREE.MeshLambertMaterial({color:0x6b4a2a}),
+    rock:new THREE.MeshLambertMaterial({color:0x9aa0a6})
+  };
+}
+/* ---------- 场景搭建 ---------- */
+function buildScene(){
+  R={ground:null,player:null};
+  scene=new THREE.Scene();
+  scene.background=new THREE.Color(0x87c9eb);
+  scene.fog=new THREE.Fog(0x87c9eb,26,60);
+  var hemi=new THREE.HemisphereLight(0xffffff,0x9db884,1.15);scene.add(hemi);
+  var sun=new THREE.DirectionalLight(0xfff2cf,0.95);sun.position.set(8,18,6);scene.add(sun);
+  R.ground=new THREE.Mesh(new THREE.BoxGeometry(ARENA+4,0.75,ARENA+4),materials.ground);
+  R.ground.position.y=-0.38;scene.add(R.ground);
+  var stoneGeo=new THREE.BoxGeometry(0.7,0.9,ARENA+4);
+  var i;
+  for(i=0;i<4;i++){
+    var m=new THREE.Mesh(stoneGeo,materials.rock);
+    if(i<2){m.position.set(0,0.45,i===0?-(ARENA/2+2.2):(ARENA/2+2.2));}
+    else{m.position.set((i===2?-(ARENA/2+2.2):(ARENA/2+2.2)),0.45,0);}
+    scene.add(m);
+  }
+  for(i=0;i<7;i++){
+    var tx=rand(-ARENA/2.6,ARENA/2.6),tz=rand(-ARENA/2.6,ARENA/2.6);
+    if(Math.abs(tx)<1.6&&Math.abs(tz)<1.6)continue;
+    var grp=new THREE.Group();
+    var tr=new THREE.Mesh(new THREE.BoxGeometry(0.3,0.9,0.3),materials.trunk);tr.position.y=0.45;grp.add(tr);
+    var cr=new THREE.Mesh(new THREE.BoxGeometry(1.0,1.2,1.0),materials.tree);cr.position.y=1.25;grp.add(cr);
+    grp.position.set(tx,0,tz);scene.add(grp);
+  }
+  var pb=new THREE.Mesh(new THREE.BoxGeometry(0.9,0.95,0.9),materials.player);
+  pb.position.y=0.48;R.player=pb;scene.add(pb);
+}
+function makeCubic(mat){return new THREE.Mesh(new THREE.BoxGeometry(0.8,0.8,0.8),mat);}
+function spawnGoldMesh(gd){
+  var g=new THREE.Group();
+  var base=makeCubic(materials.gold);base.position.y=0.42;g.add(base);
+  if(rand(0,1)<0.5){
+    var py=new THREE.Mesh(new THREE.ConeGeometry(0.55,0.8,4),materials.gold);
+    py.position.y=1.05;py.rotation.y=PI/4;g.add(py);
+  }
+  g.position.set(gd.x,0,gd.z);scene.add(g);
+  gd.mesh=g;
+}
+function addGoldAt(x,z){
+  var gd={x:x,z:z,hp:1,mesh:null};
+  spawnGoldMesh(gd);
+  goldn.push(gd);
+  return gd;
+}
+function clearDynamic(){
+  var i;
+  for(i=0;i<goldn.length;i++)if(goldn[i]&&goldn[i].mesh)scene.remove(goldn[i].mesh);
+  for(i=0;i<enemies.length;i++)if(enemies[i]&&enemies[i].mesh)scene.remove(enemies[i].mesh);
+  for(i=0;i<parts.length;i++)if(parts[i]&&parts[i].mesh)scene.remove(parts[i].mesh);
+  goldn=[];enemies=[];parts=[];
+  spawnTimer=0;levelMobs=0;
+}
+function harvestAt(nx,nz){
+  var i=goldn.length-1;
+  while(i>=0){
+    var gd=goldn[i];
+    if(gd){
+      var dx=nx-gd.x,dz=nz-gd.z;
+      if(dx*dx+dz*dz<1.06*1.06){
+        if(gd.mesh)scene.remove(gd.mesh);
+        goldn.splice(i,1);
+        score+=50;ingots++;snd('coin');
+        partsPush(gd.x,gd.z,'#ffd95e');
+        shake=Math.max(shake,0.3);
+        checkGrowth();
+      }
+    }
+    i--;
+  }
+  refreshHUD();
+}
+function resetState(){
+  score=0;hp=MAXHP;level=1;kills=0;ingots=0;
+  upgrades=0;nextTier=60;dashCd=0;dashT=0;
+  runTicks=0;shake=0;spawnTimer=1.6;spawnRate=3.1;
+  player.x=0;player.z=0;player.invT=1.5;player.atkCd=0;
+  player.power=1;player.speed=4.8;player.pickR=1.6;
+  try{clearDynamic();}catch(e){}
+  addGoldAt(0,0);
+  harvestAt(0,0);
+  noti('开局拾获金矿 +50');
+  var spots=0;
+  while(spots<7){
+    var tx=rand(-ARENA/2+1.2,ARENA/2-1.2);
+    var tz=rand(-ARENA/2+1.2,ARENA/2-1.2);
+    if(Math.abs(tx)<2.0&&Math.abs(tz)<2.0)continue;
+    var can=true;
+    for(var k=0;k<goldn.length;k++){
+      var g=goldn[k];
+      if(g&&Math.abs(g.x-tx)<1.2&&Math.abs(g.z-tz)<1.2){can=false;break;}
+    }
+    if(can){addGoldAt(tx,tz);spots++;}
+  }
+  spawnEnemy(false,false);
+  refreshHUD();
+}
+function spawnEnemy(hard,fast){
+  if(enemies.length>=MAXMOB)return;
+  var h=1,sp=2.05,val=18;
+  if(hard){h=2.4;sp=3.0;val=36;}
+  if(fast){h=1;sp=4.1;val=24;}
+  var ang=rand(0,TWO),d=ARENA/2+rand(0.8,4.5);
+  var e={x:Math.cos(ang)*(d+3),z:Math.sin(ang)*(d+3),hp:h,hd:h,
+    speed:sp,val:val,atkCd:rand(0,0.6),mesh:null,hard:!!hard,fast:!!fast};
+  var g=makeCubic(fast?materials.enemy3:(hard?materials.enemy2:materials.enemy));
+  g.position.y=0.42;e.mesh=g;
+  if(fast)g.scale.set(0.72,0.72,0.72);
+  if(hard)g.scale.set(1.12,1.12,1.12);
+  g.position.set(e.x,0.42,e.z);
+  scene.add(g);
+  enemies.push(e);
+}
+function noti(txt){
+  var el=$('noti');if(!el)return;
+  el.textContent=txt;el.style.opacity='1';
+  window.clearTimeout(noti.timer);
+  noti.timer=window.setTimeout(function(){el.style.opacity='0';},1100);
+}
+function refreshHUD(){
+  var s=$('hs0');if(s)s.textContent=String(score);
+  var lv=$('lvlEl');if(lv)lv.textContent='第'+level+'关 · 目标'+WIN;
+  var f=$('hfill');if(f)f.style.width=clamp(hp/MAXHP*100,0,100)+'%';
+}
+/* ---------- 流程控制 ---------- */
+function checkGrowth(){
+  if(upgrades>=3||score<nextTier)return;
+  upgrades++;
+  player.power=1+0.45*upgrades;
+  player.speed=4.8+0.35*upgrades;
+  nextTier+=60;
+  noti('✨ 铁镐强化 Lv.'+(upgrades+1)+'！伤害+');
+  snd('level');
+  partsPush(player.x,player.z,'#8ef5ff');
+  shake=Math.max(shake,.3);
+  if(upgrades>=2)MAXHP=6;
+}
+function togglePause(){
+  if(state!=='playing'&&state!=='pause')return;
+  if(state==='pause'){
+    state='playing';running=true;lastNow=performance.now();
+  }else{
+    state='pause';running=false;
+  }
+  if(pauseEl)pauseEl.textContent=state==='pause'?'▶':'❚❚';
+}
+function startGame(){
+  unlock();
+  if(!inited)return;
+  resetState();
+  state='playing';running=true;lastNow=performance.now();
+  var menuEl=$('menu');if(menuEl)menuEl.style.display='none';
+  var oeEl=$('ovend');if(oeEl)oeEl.style.display='none';
+  if(pauseEl)pauseEl.textContent='❚❚';
+  snd('st');
+  refreshHUD();
+}
+function restart(){startGame();}
+function endGame(win){
+  if(state!=='playing'&&state!=='pause')return;
+  state=win?'win':'over';running=false;
+  if(score>best)best=score;
+  var ot=$('ot'),osc=$('osc'),oIng=$('oIng'),oKill=$('oKill'),ob=$('obest');
+  if(ot){ot.textContent=win?'🎉 矿区保住了！':'💀 矿脉失守';ot.style.color=win?'#ffe27a':'#ff9a8a';}
+  if(osc)osc.textContent=String(score);
+  if(oIng)oIng.textContent=String(ingots);
+  if(oKill)oKill.textContent=String(kills);
+  if(ob)ob.textContent=String(best);
+  var v=$('ovend');if(v)v.style.display='flex';
+  snd(win?'win':'lose');
+  refreshHUD();
+}
+/* ---------- 战斗与更新 ---------- */
+function hitPlayer(){
+  if(state!=='playing'||player.invT>0||dashT>0)return;
+  player.invT=1.0;hp--;snd('hurt');shake=1;
+  var pl=$('pulse');if(pl){pl.style.opacity='0.55';window.setTimeout(function(){pl.style.opacity='0';},180);}
+  noti('遭亡灵攻击 -1 ♥');
+  if(hp<=0){hp=0;endGame(false);}
+  refreshHUD();
+}
+function partsPush(x,z,color){
+  if(parts.length>60)return;
+  var i;
+  for(i=0;i<5;i++){
+    var g=new THREE.Mesh(new THREE.BoxGeometry(0.18,0.18,0.18),
+      new THREE.MeshLambertMaterial({color:color||0xffffff}));
+    parts.push({x:x,y:0.6,z:z,vy:rand(1.2,4.8),vz:rand(-1.2,1.2),life:rand(0.3,0.66),mesh:g});
+    scene.add(g);
+  }
+}
+function playerAttack(){
+  if(state!=='playing'||player.atkCd>0)return;
+  player.atkCd=0.42;
+  var i=0,hitAny=false;
+  while(i<enemies.length){
+    var e=enemies[i];
+    if(!e){i++;continue;}
+    var dx=player.x-e.x,dz=player.z-e.z;
+    if(dx*dx+dz*dz<2.75*2.75){
+      e.hp-=player.power;
+      hitAny=true;snd('hit');partsPush(e.x,e.z,'#ffb0c0');
+      if(e.hp<=0){
+        if(e.mesh)scene.remove(e.mesh);
+        enemies.splice(i,1);kills++;score+=e.val;snd('kfu');
+        noti('击退亡灵 +'+e.val);
+        checkGrowth();
+        if(score>=WIN)endGame(true);
+        continue;
+      }
+    }
+    i++;
+  }
+  if(hitAny)shake=Math.max(shake,0.22);
+  refreshHUD();
+}
+function playerDash(){
+  if(state!=='playing'||dashCd>0||dashT>0)return;
+  dashT=0.2;dashCd=1.1;
+  snd('dash');
+  partsPush(player.x,player.z,'#aef2ff');
+  refreshHUD();
+}
+function updateGame(dt){
+  runTicks++;
+  if(player.invT>0)player.invT-=dt;
+  if(player.atkCd>0)player.atkCd-=dt;
+  if(dashCd>0)dashCd-=dt;
+  if(dashT>0)dashT-=dt;
+  var spd=player.speed*(dashT>0?3.1:1);
+  if(joy.a&&(joy.dx!==0||joy.dy!==0)){
+    var mx=joy.dx*spd*dt;
+    var mz=-joy.dy*spd*dt;
+    player.x=clamp(player.x+mx,-ARENA/2+0.65,ARENA/2-0.65);
+    player.z=clamp(player.z+mz,-ARENA/2+0.65,ARENA/2-0.65);
+  }
+  if(R&&R.player)R.player.position.set(player.x,0.46,player.z);
+  harvestAt(player.x,player.z);
+  if(score>=WIN){endGame(true);return;}
+  var i;
+  for(i=enemies.length-1;i>=0;i--){
+    var e=enemies[i];
+    if(!e)continue;
+    var ex=player.x-e.x,ez=player.z-e.z;
+    var d=Math.sqrt(ex*ex+ez*ez);
+    if(d>0.01){
+      var st=e.speed*dt;
+      e.x+=ex/d*st;e.z+=ez/d*st;
+    }
+    if(e.mesh)e.mesh.position.set(e.x,0.42+(e.hard?0.08:0)+(e.fast?0.12:0)+Math.sin(runTicks*0.13)*0.04,e.z);
+    e.atkCd-=dt;
+    if(d<1.4&&e.atkCd<=0){e.atkCd=1.0;hitPlayer();if(state!=='playing')return;}
+  }
+  spawnTimer-=dt;
+  if(spawnTimer<=0&&enemies.length<MAXMOB){
+    var roll=Math.random();
+    var hardNow=(level>=2)&&roll<0.3;
+    var fastNow=(level>=3)&&roll>=0.3&&roll<0.52;
+    spawnEnemy(hardNow,fastNow);
+    levelMobs++;
+    spawnTimer=spawnRate-level*0.15;
+    if(levelMobs>=2+level){
+      levelMobs=0;level++;
+      spawnRate=Math.max(1.55,spawnRate-0.22);
+      noti('⚠ 第'+level+'波亡灵来袭');
+      if(level%2===0&&MAXMOB<7)MAXMOB++;
+      snd('level');
+    }
+    refreshHUD();
+  }
+  for(i=parts.length-1;i>=0;i--){
+    var p=parts[i];
+    if(!p)continue;
+    p.life-=dt;p.y+=p.vy*dt;p.vy-=3.8*dt;
+    if(p.mesh)p.mesh.position.set(p.x,p.y,p.z);
+    if(p.life<=0){if(p.mesh)scene.remove(p.mesh);parts.splice(i,1);}
+  }
+  if(goldn.length<3&&Math.random()<dt*0.5){
+    var nx=rand(-ARENA/2+1.1,ARENA/2-1.1);
+    var nz=rand(-ARENA/2+1.1,ARENA/2-1.1);
+    var ok=true;
+    for(i=0;i<goldn.length;i++){var g0=goldn[i];if(g0&&Math.abs(g0.x-nx)<1.2&&Math.abs(g0.z-nz)<1.2){ok=false;break;}}
+    if(ok)addGoldAt(nx,nz);
+  }
+  if(dashEl){
+    if(dashCd>0)dashEl.style.opacity='0.45';
+    else dashEl.style.opacity='1';
+    if(dashT>0)dashEl.style.background='radial-gradient(circle at 40% 34%,rgba(200,250,255,.95),rgba(90,190,255,.9))';
+  }
+}
+/* ---------- 渲染循环 ---------- */
+function loop(now){
+  requestAnimationFrame(loop);
+  globalNow=now;
+  try{
+    var dt=(now-lastNow)/1000;
+    lastNow=now;
+    if(dt>0.05)dt=0.05;
+    if(state==='playing'&&running)updateGame(dt);
+    if(!joy.a&&knobEl){knobEl.style.left='31px';knobEl.style.top='31px';}
+    if(R&&R.player&&R.player.material){
+      if(state==='playing'&&(player.invT>0||dashT>0)&&Math.floor(player.invT*8)%2===0&&dashT<=0){
+        R.player.material.emissive=new THREE.Color(0.85,0.15,0.15);
+      }else if(state==='playing'&&dashT>0){
+        R.player.material.emissive=new THREE.Color(0.2,0.7,1);
+      }else{
+        R.player.material.emissive=new THREE.Color(0,0,0);
+      }
+    }
+    if(camera){
+      var tx=player.x*0.38,tz=player.z*0.38+3.4;
+      camera.position.x+=(tx-camera.position.x)*0.08;
+      camera.position.y+=(12.6-camera.position.y)*0.08;
+      camera.position.z+=(tz-camera.position.z)*0.08;
+      camera.lookAt(tx,0.4,tz);
+    }
+    if(renderer&&scene&&camera)renderer.render(scene,camera);
+  }catch(err){}
+}
+function resize(){
+  W=window.innerWidth;H=window.innerHeight;
+  if(renderer)renderer.setSize(W,H);
+  if(camera){
+    camera.aspect=W/H;
+    camera.fov=H<W?62:(W/H<0.65?52:46);
+    camera.updateProjectionMatrix();
+  }
+}
+/* ---------- 输入 ---------- */
+function joyDown(px,py,id){
+  joy.a=true;joy.idx=id;joy.ox=px;joy.oy=py;
+  joy.dx=0;joy.dy=0;
+  if(knobEl){knobEl.style.left='31px';knobEl.style.top='31px';}
+}
+function joyDrag(px,py){
+  if(!joy.a)return;
+  var dx=px-joy.ox,dy=py-joy.oy;
+  var d=Math.sqrt(dx*dx+dy*dy),maxR=40;
+  if(d>maxR){dx=dx/d*maxR;dy=dy/d*maxR;}
+  if(dx>40)dx=40;if(dx<-40)dx=-40;
+  if(dy>40)dy=40;if(dy<-40)dy=-40;
+  joy.dx=dx/maxR;joy.dy=dy/maxR;
+  if(knobEl){knobEl.style.left=(31+dx)+'px';knobEl.style.top=(31+dy)+'px';}
+}
+function joyUp(){
+  joy.a=false;joy.dx=0;joy.dy=0;joy.idx=-1;
+  if(knobEl){knobEl.style.left='31px';knobEl.style.top='31px';}
+}
+function init(){
+  if(inited)return;
+  var c=$('g');if(!c)return;
+  try{
+    renderer=new THREE.WebGLRenderer({antialias:true,preserveDrawingBuffer:true,canvas:c});
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+  }catch(e){return;}
+  camera=new THREE.PerspectiveCamera(48,W/H,0.1,100);
+  camera.position.set(0,12.6,3.4);
+  camera.lookAt(0,0.4,0);
+  makeAssets();
+  buildScene();
+  knobEl=$('knob');joyEl=$('joy');atkEl=$('atkN');dashEl=$('dashN');pauseEl=$('pauseBtn');
+  var sbtn=$('sbtn'),rbtn=$('rbtn');
+  if(sbtn)sbtn.addEventListener('click',function(e){e.preventDefault();startGame();});
+  if(rbtn)rbtn.addEventListener('click',function(e){e.preventDefault();startGame();});
+  if(pauseEl)pauseEl.addEventListener('click',function(e){e.preventDefault();togglePause();});
+  if(joyEl){
+    joyEl.addEventListener('touchstart',function(e){
+      try{e.preventDefault();var t=e.touches[0];joyDown(t.clientX,t.clientY,t.identifier);}catch(err){}
+    },{passive:false});
+    joyEl.addEventListener('touchmove',function(e){
+      try{e.preventDefault();var t=e.changedTouches[0];if(joy.a&&t.identifier===joy.idx)joyDrag(t.clientX,t.clientY);}catch(err){}
+    },{passive:false});
+    joyEl.addEventListener('touchend',function(e){try{var i;for(i=0;i<e.changedTouches.length;i++){if(e.changedTouches[i].identifier===joy.idx)joyUp();}}catch(err){}},{passive:false});
+    joyEl.addEventListener('touchcancel',function(){joyUp();});
+  }
+  if(atkEl){
+    atkEl.addEventListener('touchstart',function(e){try{e.preventDefault();playerAttack();}catch(err){}},{passive:false});
+  }
+  if(dashEl){
+    dashEl.addEventListener('touchstart',function(e){try{e.preventDefault();playerDash();}catch(err){}},{passive:false});
+  }
+  document.addEventListener('touchmove',function(e){
+    try{
+      var i;
+      for(i=0;i<e.changedTouches.length;i++){
+        var t=e.changedTouches[i];
+        if(joy.a&&t.identifier===joy.idx){e.preventDefault();joyDrag(t.clientX,t.clientY);}
+      }
+    }catch(err){}
+  },{passive:false});
+  document.addEventListener('touchend',function(e){
+    try{var i;for(i=0;i<e.changedTouches.length;i++){if(joy.a&&e.changedTouches[i].identifier===joy.idx)joyUp();}}catch(err){}
+  },{passive:false});
+  window.addEventListener('resize',resize);
+  resize();
+  refreshHUD();
+  inited=true;
+  requestAnimationFrame(function(now){lastNow=now;requestAnimationFrame(loop);});
+}
+document.addEventListener('click',function(){unlock();});
+window.addEventListener('load',function(){init();});
+/* ---------- 状态快照 ---------- */
+window.__wwDebugState=function(){
+  var ents=[],i;
+  for(i=0;i<enemies.length;i++){
+    var e=enemies[i];if(!e)continue;
+    ents.push({type:'enemy',hp:r1(clamp(e.hp,0,99)),x:r1(e.x),z:r1(e.z),y:0.42});
+  }
+  for(i=0;i<goldn.length;i++){
+    var g=goldn[i];if(!g)continue;
+    ents.push({type:'gold',hp:1,x:r1(g.x),z:r1(g.z),y:0});
+  }
+  for(i=0;i<parts.length;i++){
+    var p=parts[i];if(!p)continue;
+    ents.push({type:'particle',hp:1,x:r1(p.x),z:r1(p.z),y:r1(p.y)});
+  }
+  return {state:state,score:score,hp:hp,level:level,kills:kills,ingots:ingots,
+    mobs:enemies.length,golds:goldn.length,runTicks:runTicks,best:best,
+    upgrades:upgrades,nextTier:nextTier,dashCd:r1(dashCd),dashT:r1(dashT),
+    player:{hp:hp,x:r1(player.x),z:r1(player.z)},entities:ents};
+};
+</script>
+</body>
+</html>

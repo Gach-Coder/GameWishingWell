@@ -36,7 +36,7 @@ object GameTools {
         ),
         ToolSpec(
             name = WRITE_FILE,
-            description = "整量写入文件（内容为完整文件）：新建文件时使用（首次生成 index.html、编写 scenarios.json）。修改已有文件一律优先 editfile（改动最小、不回归未要求部分）或 appendfile（追加新代码段）。注意：修改/修复回合对已有 index.html 的整量重写会被直接拒绝（修改范围契约——除非用户明确要求重做，禁止改变未点名的游戏逻辑）；大范围改动请用 editfile 整段替换（old_string 取该段完整原文）。写入后系统自动检查产品契约/断言格式并在结果中回传。",
+            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用，可写 index.html（游戏本体）或 scenarios.json（功能断言）。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段——修改回合请遵守【修改范围契约】（只改用户点名的特征，未点名内容保持原样）。写入后系统自动检查产品契约/断言格式并在结果中回传。",
             parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"完整文件内容"}},"required":["content"]}"""
         ),
         ToolSpec(
@@ -71,35 +71,39 @@ data class ToolOutcome(
 )
 
 /**
- * 入口文件（index.html）整量重写策略（修改范围契约的执行层）：
- * - [FORBID] 修改/修复回合（默认）：一律拒绝——整量重写会重新生成全部代码，
- *   未要求的游戏逻辑（放置/数值/布局等）随之漂移，用户不可接受；
- * - [NUDGE_ONCE] 首次生成回合：中途结构性修复拦一次、重发放行（保留自愈能力）；
- * - [ALLOW] 用户明确要求重做的回合（再试一次/重新制作）：直接放行。
- */
-enum class EntryRewritePolicy { FORBID, NUDGE_ONCE, ALLOW }
-
-/**
  * 工具沙箱执行器：所有路径经 [GameFileWorkspace.resolve] 校验，严格限制在游戏文件夹内。
  * 写入类工具执行后自动运行 [GameValidator]，把结构化校验结果作为观察附在返回里——
  * 校验是“观察”而非“门”：模型看到报告自行决定下一步修复方式。
+ * 修改范围契约只在提示词层约束（SCOPE_FENCE_RULE），执行层不做检查或撤回。
  */
 class GameToolExecutor(
     private val workspace: GameFileWorkspace,
-    private val validate: (String) -> ValidationReport = { GameValidator.validate(it) },
-    private val entryRewritePolicy: EntryRewritePolicy = EntryRewritePolicy.FORBID
+    private val validate: (String) -> ValidationReport = { GameValidator.validate(it) }
 ) {
 
-    /** NUDGE_ONCE 策略的拦截计次（同回合每文件只拦一次）。 */
-    private val rewriteNudgedPaths = mutableSetOf<String>()
+    /**
+     * 整读去重（同回合）：path → 上次完整返回时的内容哈希。文件未变更时重复整读
+     * 只回简短指针（内容在上下文里，重发一份 30KB 副本纯属膨胀——实测修改轮开局
+     * 连续 5 轮整读同一文件，后续每轮都背着 5 份全文）。任何成功写入后清除对应
+     * 条目：改动后重读是合法的（历史里的旧读取结果已被折叠为过期提示）。
+     * 不检查、不限制行为——只是不重复发送模型上下文里已有的同一份内容。
+     */
+    private val fullReadMarks = mutableMapOf<String, String>()
 
     suspend fun execute(call: ToolCallData): ToolOutcome {
         val args = try {
             Json.parseToJsonElement(call.arguments.ifBlank { "{}" }).jsonObject
         } catch (e: Exception) {
+            val truncated = e.message?.contains("EOF") == true
             return outcome(
                 call, ok = false,
-                observation = "参数不是合法 JSON 对象：${e.message}"
+                observation = "参数不是合法 JSON 对象：${e.message}" +
+                    if (truncated) {
+                        "（输出在工具参数中途被截断——内容过长）。请改用 editfile 做小范围/整段替换，" +
+                            "或用 appendfile 分段追加，不要原样重发整份内容。"
+                    } else {
+                        ""
+                    }
             )
         }
         return try {
@@ -138,18 +142,32 @@ class GameToolExecutor(
         // 切片自适应：小文件（千行级）的切片请求直接整读——实测修复轮 60~70% 的
         // 轮次耗在切片重读上（每片一次 LLM 往返），整读一次拿到全貌反而更省；
         // 真正的大文件（精品档长文）保留切片能力。
-        if (lines.size <= GameTools.WHOLE_READ_MAX_LINES && (startLine > 1 || endLine < lines.size)) {
-            return outcome(
-                call, ok = true,
-                observation = "文件 $path 共 ${lines.size} 行（不大，已直接返回全文；后续修改请基于此内容，无需再切片读取）：\n$content"
-            )
+        val sliceNarrowed = startLine > 1 || endLine < lines.size
+        val smallFileOverride = sliceNarrowed && lines.size <= GameTools.WHOLE_READ_MAX_LINES
+        if (!sliceNarrowed || smallFileOverride) {
+            // 整读去重：文件自本回合上次整读后未变更时只回指针——重复整发全文
+            // 会让上下文堆多份 30KB 副本（后续每轮变慢变贵，模型也更容易跑偏）。
+            val hash = GameFileWorkspace.sha256(content)
+            if (fullReadMarks[path] == hash) {
+                return outcome(
+                    call, ok = true,
+                    observation = "文件 $path（${lines.size} 行）自本回合上次完整读取后未发生变更，" +
+                        "完整内容就在上文最近一次 readfile 结果里——请直接基于它用 editfile 修改，不要重复整读；" +
+                        "确需局部核对可用 start_line/end_line 切片。"
+                )
+            }
+            fullReadMarks[path] = hash
+            return if (smallFileOverride) {
+                outcome(
+                    call, ok = true,
+                    observation = "文件 $path 共 ${lines.size} 行（不大，已直接返回全文；后续修改请基于此内容，无需再切片读取）：\n$content"
+                )
+            } else {
+                outcome(call, ok = true, observation = "文件 $path 内容如下（共 ${lines.size} 行）：\n$content")
+            }
         }
-        return if (startLine == 1 && endLine == lines.size) {
-            outcome(call, ok = true, observation = "文件 $path 内容如下（共 ${lines.size} 行）：\n$content")
-        } else {
-            val slice = lines.subList(startLine - 1, endLine).joinToString("\n")
-            outcome(call, ok = true, observation = "文件 $path 第 $startLine-$endLine 行（共 ${lines.size} 行）：\n$slice")
-        }
+        val slice = lines.subList(startLine - 1, endLine).joinToString("\n")
+        return outcome(call, ok = true, observation = "文件 $path 第 $startLine-$endLine 行（共 ${lines.size} 行）：\n$slice")
     }
 
     private suspend fun writeFile(call: ToolCallData, args: JsonObject): ToolOutcome {
@@ -160,38 +178,15 @@ class GameToolExecutor(
         if (existing != null && existing == content) {
             return outcome(call, ok = true, observation = "写入内容与当前版本完全一致，未产生变更。")
         }
-        // 修改范围契约的执行层（见 EntryRewritePolicy）：仅管入口文件——
-        // scenarios.json 等辅助文件的维护性整写不受影响。
-        if (existing != null && path == GameFileWorkspaceEntryPoint.DEFAULT) {
-            when (entryRewritePolicy) {
-                EntryRewritePolicy.FORBID -> return outcome(
-                    call, ok = false,
-                    observation = "已拒绝：修改回合禁止对已有入口文件 $path 做整量重写（修改范围契约：除非用户明确要求重做，" +
-                        "只允许改动用户点名的部分，既有游戏逻辑必须保持原样）。请把改动拆成 editfile 精确替换——" +
-                        "需要改动一大段时，old_string 直接取该段完整原文（如整个函数块），new_string 给出替换后的整段；" +
-                        "新增代码用 appendfile。若确需彻底重做，请在交付总结中向用户说明并等待确认。"
-                )
-                EntryRewritePolicy.NUDGE_ONCE -> if (path !in rewriteNudgedPaths) {
-                    rewriteNudgedPaths += path
-                    return outcome(
-                        call, ok = false,
-                        observation = "已拦截：writefile 试图整量重写已存在的入口文件 $path。整量重写会重新生成全部代码，" +
-                            "未要求修改的部分容易被一并改掉而产生回归。常规修改请改用 editfile 做精确替换" +
-                            "（old_string 取唯一的原文片段；多处互不依赖的修改可在同一轮并行发起多个 editfile），" +
-                            "新增代码段用 appendfile。确属结构性重构需要整量重写时，再次发起同样的 writefile 即直接放行" +
-                            "（本回合对 $path 仅拦截这一次）。"
-                    )
-                }
-                EntryRewritePolicy.ALLOW -> Unit
-            }
-        }
         // 一般 Agent 惯例：Write 新建或整量覆盖均可（版本化写入保底可回滚），
-        // 用 Write 还是 Edit 由模型按任务自行权衡，执行层不做硬门禁。
+        // 用 Write 还是 Edit 由模型按任务自行权衡，执行层不做策略门禁——
+        // 修改范围契约只在提示词层约束（SCOPE_FENCE_RULE）。
         val saved = if (existing == null) {
             workspace.writeInitial(path, content)
         } else {
             workspace.writeUpdated(path, content)
         } ?: return outcome(call, ok = false, observation = "写入失败：$path（沙箱路径非法或哈希校验未通过）")
+        fullReadMarks.remove(path)
         return mutatedOutcome(call, path, content, saved.version)
     }
 
@@ -208,6 +203,7 @@ class GameToolExecutor(
         val updated = if (existing.endsWith("\n") || existing.isEmpty()) existing + content else existing + "\n" + content
         val saved = workspace.writeUpdated(path, updated)
             ?: return outcome(call, ok = false, observation = "写入失败：$path（沙箱路径非法或哈希校验未通过）")
+        fullReadMarks.remove(path)
         return mutatedOutcome(call, path, updated, saved.version, appended = content.lines().size)
     }
 
@@ -244,6 +240,7 @@ class GameToolExecutor(
         }
         val saved = workspace.writeUpdated(path, updated)
             ?: return outcome(call, ok = false, observation = "写入失败：$path（沙箱路径非法或哈希校验未通过）")
+        fullReadMarks.remove(path)
         return mutatedOutcome(call, path, updated, saved.version, replaced = occurrences, newString = newString)
     }
 

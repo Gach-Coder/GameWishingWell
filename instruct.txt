@@ -31,6 +31,8 @@
 		  同时把会话上下文冻结为保存点（games/<id>/.savepoint，撤销锚点）；
 		  “撤销”按钮（仅编辑已保存游戏的会话）为保存的逆操作：保存区文件覆盖编辑区、
 		  上下文回滚到保存点——未保存的修改与其后的对话记录被丢弃（二次确认，不可恢复）；
+		  旧版本保存的游戏无保存点：撤销时清空对话只留说明气泡（保存点缺失时上下文不可回放），
+		  可用 scripts/migrate-savepoint.py（adb run-as 直写 .savepoint）为旧游戏补建保存点恢复精确撤销；
 		  编辑对话的”立即游玩”预览编辑区最新版本（不入运行区）；重新进入编辑对话从编辑区续作（未保存修改不丢）。
 		- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
@@ -135,18 +137,22 @@ Agent处理message流程如下：
 		按 template_class（画面维度×画面方向×主类型）选取特征矩阵（系统×默认参数），只做"选系统+覆盖参数"，不自由发明
 	→ Prompt：根据用户最后确认的完整信息组成游戏内容提示文本加入system 提示词（工具模式：文件内容一律经工具写入，回复正文不出现代码）+ 上下文最小化：
 		首次生成放参考模板；迭代放 rolling summary（"最新内容请通过 readfile 获取"），其余靠工具按需取
-	→ Agent Loop：（bug 修复轮数不设上限，多轮属正常；仅无进展与运行验证环境异常两类非修复性退出；网络层连接30s/读5min/写60s超时防蜂窝NAT死连接）
+	→ Agent Loop：（bug 修复轮数不设上限，多轮属正常；仅无进展与运行验证环境异常两类非修复性退出；
+	  输出零截断：不携带 max_tokens、工具观察与消息全量透传；网络层超时（连接30s/读静默5min/写60s）是死连接探测器
+	  而非 LLM 时长限制——只要流上有字节就永不触发，触发后走自动重试不截断输出；整体时长不设限，停止键是用户侧唯一主动中断）
 	主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/appendfile/editfile，沙箱严格限游戏工作区目录）
 	readfile 整读自适应：千行级以内文件的切片请求直接整读返回（实测修复轮 60~70% 轮次耗在切片重读上，每片一次 LLM 往返），
 	  真正的大文件（>1200 行）保留切片语义；工具描述与纪律提示同步要求"多区段一轮并行 readfile、修改一轮并行 editfile"
 		写入策略与修改范围契约：
-			writefile=整量写入（新建文件：首次生成 index.html、编写 scenarios.json）；editfile=精确替换（修改首选：改动最小、最快、不回归未要求部分，可整段替换）；
-			appendfile=末尾追加（新增代码段，无行数限制）；
-			修改范围契约（硬性，提示词 SCOPE_FENCE_RULE + 执行层 EntryRewritePolicy 双保险）：
-			除非用户主动要求（"再试一次"整回合重做 → ALLOW），修改/修复回合禁止改变游戏内容逻辑——
-			对已有 index.html 的整量重写一律拒绝（FORBID，正文输出整份代码的隐式写入同罪），
-			只允许最小侵入地改动用户点名的部分；首次生成回合中途的结构性修复拦一次后放行（NUDGE_ONCE）。
-		无截断机制：不捕获/不处理 finish_reason 截断信号，不注入截断相关引导——模型输出由 max_tokens 预设与策划清单体量控制自然约束（首次生成体量大时允许 writefile 骨架 + appendfile 分段拼装，避免单次输出过长）
+			writefile=整量写入（新建文件或彻底重写）；editfile=精确替换（修改首选：改动最小、最快、不回归未要求部分，可整段替换）；
+			appendfile=末尾追加（新增代码段，无行数限制）；用哪个由模型按任务自行权衡，执行层不做策略门禁。
+			修改范围契约（仅提示词层约束，无执行层检查/撤回——LLM 仍主动发挥时不拦截，用户以停止键/撤销兜底）：
+			修复/改进轮（非首次创建轮）注入 SCOPE_FENCE_RULE——"根据用户指令精准优化改进游戏"：
+			只改用户点名的游戏特征，未点名特性（数值/规则/布局/显示/文案/音效/命名）保持原样，即使改动"更好"也不做；
+			首次创建轮与用户明确要求重做的回合不注入。
+		无截断机制（彻底贯彻）：不捕获/不处理 finish_reason 截断信号；请求不携带 max_tokens（Anthropic 协议因 API 强制要求发送模型上限值），
+		  工具观察（tool_result）与消息不做任何长度裁切——截断输出/裁切上下文只会制造非法工具参数与残缺代码；
+		  模型输出体量由任务自然约束（首次生成体量大时允许 writefile 骨架 + appendfile 分段拼装）
 			→ 模型发起 tool call → 宿主经 GameFileWorkspace 执行（版本化文件+指针切换+同会话加锁+hash防并发覆盖；
 			  修改用 old_string 逐字符精确替换且要求唯一（或 replace_all），全量重写仅限首次生成或 overwrite=true 结构性重构）
 			→ 每次写入后宿主自动检查产品契约（外部资源/eval 禁令，无解析器代差），报告作为"观察"附在 tool_result 回传
@@ -299,15 +305,18 @@ Agent处理message流程如下：
 	
 协议枚举与厂商默认预设：
 
-  厂商           baseUrl							默认模型								协议					最大token  关闭思考
+  厂商           baseUrl							默认模型								协议					max_tokens  关闭思考
   -----------------------------------------------------------------------------------------------------------------------
-  DeepSeek		https://api.deepseek.com/v1		deepseek-v4-flash					OPENAI_COMPATIBLE	16384      否
-  Kimi			https://api.moonshot.cn/v1		moonshot-v1-8k     					OPENAI_COMPATIBLE   16384      否
-  OpenAI		https://api.openai.com/v1		gpt-4o-mini        					OPENAI_COMPATIBLE	16384      否
-  Claude		https://api.anthropic.com		claude-sonnet-4-6					ANTHROPIC           16384      否
-  智谱 GLM		https://open.bigmodel.cn/api/paas/v4	glm-5.3-flash					OPENAI_COMPATIBLE	16384      否
-  小米 MiMo		https://api.xiaomimimo.com/v1	mimo-v2.5							OPENAI_COMPATIBLE	16384      否
-  自定义         （留空自填）                    （留空自填）       						OPENAI_COMPATIBLE   8192       否
+  DeepSeek		https://api.deepseek.com/v1		deepseek-v4-flash					OPENAI_COMPATIBLE	不发送     否
+  Kimi			https://api.moonshot.cn/v1		moonshot-v1-8k     					OPENAI_COMPATIBLE   不发送     否
+  OpenAI		https://api.openai.com/v1		gpt-4o-mini        					OPENAI_COMPATIBLE	不发送     否
+  Claude		https://api.anthropic.com		claude-sonnet-4-6					ANTHROPIC           64000*     否
+  智谱 GLM		https://open.bigmodel.cn/api/paas/v4	glm-5.3-flash					OPENAI_COMPATIBLE	不发送     否
+  小米 MiMo		https://api.xiaomimimo.com/v1	mimo-v2.5							OPENAI_COMPATIBLE	不发送     否
+  自定义         （留空自填）                    （留空自填）       						OPENAI_COMPATIBLE   不发送     否
+
+（*Anthropic API 强制要求 max_tokens 字段，发送模型输出上限使其不构成实际限制；
+  OpenAI 兼容协议一律不发送 max_tokens——输出长度由网关按模型上限裁定，不人为设限。）
 
 （表中“关闭思考”为厂商预设级是否强制禁用；设置页另有“模型思考能力”开关，默认关闭：
 OpenAI 兼容协议关闭时发送 thinking={"type":"disabled"}，Anthropic 开启时发送 extended thinking。）
@@ -531,7 +540,7 @@ Android Studio 运行方式：
 - 构建同步报 SDK/JDK 错误：检查 local.properties 与 JDK 17。
 - 提示“请先在设置中配置 API Key、地址和模型”：isConfigured() 要求三项均非空。
 - 模型输出为空或抽不到 HTML：检查模型/网关是否支持流式 chat/completions；
-  DeepSeek 默认模型为 deepseek-v4-flash（deepseek-chat 已弃用），max_tokens 16384；
+  DeepSeek 默认模型为 deepseek-v4-flash（deepseek-chat 已弃用），请求不携带 max_tokens（输出长度不设限）；
   思考能力由设置页开关控制（默认关闭）。
 - 游戏白屏：确认生成 HTML 中 canvas 使用 vh/100% 也可渲染；HtmlEnhancer 已做视口修复，
   但模型仍应遵守“自包含、无外部资源”的提示词约束。

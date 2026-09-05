@@ -8,7 +8,11 @@ data class ProviderPreset(
     val baseUrl: String,
     val defaultModel: String,
     val protocol: Protocol,
-    /** 单次回复最大 token 数。完整 HTML 游戏通常远超模型默认的 4096，必须显式调高，否则输出被截断导致反复"提取不到 HTML"。 */
+    /**
+     * 仅 Anthropic 协议使用（其 API 强制要求 max_tokens 字段，无法省略）：
+     * 取模型输出上限使其不构成实际限制。OpenAI 兼容协议不发送 max_tokens——
+     * 输出长度由网关按模型上限裁定，人为截断只会制造残缺代码与非法工具参数。
+     */
     val maxTokens: Int = 8192,
     /**
      * 预设级兜底：为 true 时强制通过 thinking={"type":"disabled"} 关闭思考，
@@ -25,7 +29,7 @@ object ProviderPresets {
         ProviderPreset("deepseek", "DeepSeek", "https://api.deepseek.com/v1", "deepseek-v4-flash", Protocol.OPENAI_COMPATIBLE, 16384, disableThinking = false),
         ProviderPreset("kimi", "Kimi (Moonshot)", "https://api.moonshot.cn/v1", "moonshot-v1-8k", Protocol.OPENAI_COMPATIBLE, 16384),
         ProviderPreset("openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini", Protocol.OPENAI_COMPATIBLE, 16384),
-        ProviderPreset("anthropic", "Anthropic Claude", "https://api.anthropic.com", "claude-sonnet-4-6", Protocol.ANTHROPIC, 16384),
+        ProviderPreset("anthropic", "Anthropic Claude", "https://api.anthropic.com", "claude-sonnet-4-6", Protocol.ANTHROPIC, 64000),
         // 智谱开放平台 OpenAI 兼容端点（Bearer 鉴权、/chat/completions、SSE、function calling 均兼容）；
         // 默认 glm-5.3-flash，模型名可在设置页直接改为其他 GLM 系列（如 glm-5.3 / glm-4.6 / glm-4-flash）。
         ProviderPreset("zhipu", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-5.3-flash", Protocol.OPENAI_COMPATIBLE, 16384),
