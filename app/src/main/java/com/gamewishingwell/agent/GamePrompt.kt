@@ -101,8 +101,12 @@ object GamePrompt {
         }
     }
 
-    fun readTemplate(context: Context): String =
+    /** 模板源码缓存：首次生成上下文每轮组装都会读一次 assets（数十 KB），缓存后只读一次。 */
+    private val templateCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    fun readTemplate(context: Context): String = templateCache.getOrPut("game_template") {
         context.assets.open("game_template.html").bufferedReader().use { it.readText() }
+    }
 
     /**
      * 策划层 LLM 的 system 提示词：只负责把每个系统解释成“这款游戏里的具体实现”。

@@ -244,9 +244,6 @@ class GameToolExecutor(
         return mutatedOutcome(call, path, updated, saved.version, replaced = occurrences, newString = newString)
     }
 
-    private fun versionOf(path: String): Int =
-        workspace.manifest().files.firstOrNull { it.path == path }?.version ?: 0
-
     /**
      * 变更类工具的成功返回：附上自动契约检查（观察）；editfile 额外附修改点上下文片段。
      * 按路径分流：入口文件（index.html）走 HTML 契约校验并作为 currentHtml 发布依据；

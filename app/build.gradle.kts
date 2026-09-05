@@ -71,7 +71,6 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.rhino)
     implementation(libs.jsoup)
     testImplementation(libs.junit)
     testImplementation(libs.mockwebserver)

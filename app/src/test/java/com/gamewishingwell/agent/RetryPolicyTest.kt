@@ -16,6 +16,19 @@ class RetryPolicyTest {
     }
 
     @Test
+    fun `错误签名库超限时按插入序淘汰最旧条目`() {
+        // 直接用互异的原始串做签名（不经 normalize——归一化会把同类文案折叠成同签名）
+        var list = emptyList<KnownError>()
+        for (i in 1..RetryBookkeeping.MAX_ENTRIES + 10) {
+            list = RetryBookkeeping.record(list, ErrorCategory.SYNTAX, "unique-signature-$i")
+        }
+        assertEquals(RetryBookkeeping.MAX_ENTRIES, list.size)
+        // 最旧的 10 条被淘汰，最新条目仍在库中
+        assertEquals("unique-signature-11", list.first().normalizedMessage)
+        assertEquals("unique-signature-${RetryBookkeeping.MAX_ENTRIES + 10}", list.last().normalizedMessage)
+    }
+
+    @Test
     fun `同一错误规范化后行号漂移不影响签名`() {
         val a = ErrorSignature.normalize("TypeError: cannot read x of undefined at index.html:120", "index.html", 120)
         val b = ErrorSignature.normalize("TypeError: cannot read y of undefined at index.html:312", "index.html", 312)

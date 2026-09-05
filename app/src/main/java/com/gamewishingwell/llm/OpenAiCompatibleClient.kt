@@ -20,6 +20,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -58,27 +59,35 @@ class OpenAiCompatibleClient(
         currentCoroutineContext()[Job]?.invokeOnCompletion {
             activeCall.get()?.cancel()
         }
+        // 降级重试的安全护栏：当前 LlmError 只会从"非 2xx 响应"抛出（尚未推送任何
+        // 增量），重发请求不会重复回调；一旦未来加入流中错误（已推增量后抛出），
+        // 重发会让调用方收到两次拼接的内容——此处直接失败，交给上层 callLlm 重试。
+        var deltasEmitted = false
+        val guardedOnDelta: (String) -> Unit = { s ->
+            deltasEmitted = true
+            onDelta(s)
+        }
         return runInterruptible(Dispatchers.IO) {
             try {
                 executeStream(
                     buildRequest(messages, includeThinking = true, tools = tools),
-                    onDelta, onThinking, onDone, activeCall
+                    guardedOnDelta, onThinking, onDone, activeCall
                 )
             } catch (e: LlmError) {
-                if (Thread.currentThread().isInterrupted) throw e
+                if (Thread.currentThread().isInterrupted || deltasEmitted) throw e
                 val msg = e.message ?: ""
                 when {
                     // 个别网关不支持 thinking 字段，去掉后重试
                     msg.contains("thinking", ignoreCase = true) ->
                         executeStream(
                             buildRequest(messages, includeThinking = false, tools = tools),
-                            onDelta, onThinking, onDone, activeCall
+                            guardedOnDelta, onThinking, onDone, activeCall
                         )
                     // 网关不支持 function calling：去掉 tools 重试，由调用方按纯文本回复降级处理
                     tools.isNotEmpty() && msg.contains(Regex("tool|function", RegexOption.IGNORE_CASE)) ->
                         executeStream(
                             buildRequest(messages, includeThinking = true, tools = emptyList()),
-                            onDelta, onThinking, onDone, activeCall
+                            guardedOnDelta, onThinking, onDone, activeCall
                         )
                     else -> throw e
                 }
@@ -167,6 +176,13 @@ class OpenAiCompatibleClient(
                 "流结束: done=$endedByDone 推理字符=$reasoningChars 内容字符=$contentChars " +
                     "工具调用=${toolCalls.size} finish_reason=$lastFinishReason 尾帧=$lastPayloadTail"
             )
+            // 连接被中途掐断（网关/代理/移动网络抖动）时 readUtf8Line 返回 null 正常退出循环——
+            // 零内容 + 零工具调用 + 未收到 [DONE] 属于"假成功"：不抛错就会绕过统一重试，
+            // 上层只能看到空回复/非法工具参数，表象是空转或莫名失败。显性化为可重试
+            // IOException（已带部分内容时保持旧行为：尽力返回已收内容，由上层处置）。
+            if (!endedByDone && contentChars == 0L && reasoningChars == 0L && toolCalls.isEmpty()) {
+                throw IOException("连接提前关闭：未收到 [DONE] 且无任何内容（网关/网络瞬断）")
+            }
             onDone()
             return LlmResponse(text = text.toString(), toolCalls = toolCalls)
             }

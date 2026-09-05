@@ -26,12 +26,15 @@ import java.security.MessageDigest
  */
 class GameRepository(private val context: Context) {
 
-    private companion object {
+    internal companion object {
         /** 游戏入口文件名（工作区与保存区一致）。 */
         const val ENTRY_HTML = "index.html"
 
         /** 保存点目录名（保存时冻结的上下文快照，撤销锚点）。 */
         const val SAVEPOINT_DIR = ".savepoint"
+
+        /** 每个文件保留的历史版本数（超出部分在写入时修剪）。 */
+        const val KEEP_VERSIONS = 20
     }
 
     private val json = Json {
@@ -213,13 +216,6 @@ class GameRepository(private val context: Context) {
         if (f.isFile) f.readText(Charsets.UTF_8) else null
     }
 
-    /** 回滚到指定版本（默认回滚到上一个通过校验的归档版本）。 */
-    suspend fun rollbackGame(gameId: Long, version: Int? = null): Boolean = withContext(Dispatchers.IO) {
-        writeMutex.withLock {
-            rollbackFile(File(File(gamesDir, gameId.toString()), "index.html"), version)
-        }
-    }
-
     suspend fun deleteGame(gameId: Long) {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
@@ -307,13 +303,6 @@ class GameRepository(private val context: Context) {
         if (f.exists()) f.readText(Charsets.UTF_8) else null
     }
 
-    /** 回滚草稿到指定版本（默认上一个归档版本）。 */
-    suspend fun rollbackDraft(version: Int? = null): Boolean = withContext(Dispatchers.IO) {
-        writeMutex.withLock {
-            rollbackFile(File(draftsDir, "latest.html"), version)
-        }
-    }
-
     suspend fun hasDraft(): Boolean = withContext(Dispatchers.IO) {
         File(draftsDir, "latest.html").exists() ||
             File(draftsDir, "session.json").exists() ||
@@ -337,6 +326,8 @@ class GameRepository(private val context: Context) {
     /**
      * 版本化写入：旧文件归档到 .versions/<v>-index.html，更新
      * .versions/index.html.version（版本号）和 current.txt（指针），最后落盘 sha256。
+     * 归档滚动保留最近 [KEEP_VERSIONS] 个——保存区版本只用于人工排查，
+     * 不修剪会在反复保存后无限膨胀。
      */
     private fun versionedWrite(file: File, content: String) {
         file.parentFile?.mkdirs()
@@ -352,19 +343,15 @@ class GameRepository(private val context: Context) {
         marker.writeText(next.toString(), Charsets.UTF_8)
         File(file.parentFile, "current.txt").writeText(file.name, Charsets.UTF_8)
         File(file.parentFile, "${file.name}.sha256").writeText(sha256(content), Charsets.UTF_8)
-    }
-
-    private fun rollbackFile(file: File, version: Int?): Boolean {
-        if (!file.isFile) return false
-        val versionsDir = File(file.parentFile, ".versions")
-        val marker = File(versionsDir, "${file.name}.version")
-        val current = marker.takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull() ?: 0
-        if (current <= 1) return false
-        val target = (version ?: (current - 1)).coerceIn(1, current - 1)
-        val archived = File(versionsDir, "$target-${file.name}")
-        if (!archived.isFile) return false
-        versionedWrite(file, archived.readText(Charsets.UTF_8))
-        return true
+        if (next > KEEP_VERSIONS) {
+            val minKeep = next - KEEP_VERSIONS
+            versionsDir.listFiles()?.forEach { archived ->
+                val v = archived.name.substringBefore('-', "").toIntOrNull()
+                if (v != null && v < minKeep && archived.name.endsWith("-${file.name}")) {
+                    archived.delete()
+                }
+            }
+        }
     }
 
     private fun sha256(content: String): String =

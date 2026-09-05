@@ -543,9 +543,27 @@ object SmokeTestProbe {
                 html.replaceFirst("</head>", "$blob</head>", ignoreCase = true)
             html.contains("<body", ignoreCase = true) ->
                 html.replaceFirst("<body", "$blob<body", ignoreCase = true)
-            else -> blob + html
+            else -> insertAfterRootTags(blob, html)
         }
     }
+
+    /**
+     * 无 head/body 的兜底插入：脚本必须落在 DOCTYPE 与 <html> 开标签之后——
+     * 前插到 DOCTYPE 之前会触发 quirks 模式，布局/视口行为与真机不一致，
+     * 沙箱结论失真。连 <html> 都没有时原样前插（页面本就无标准模式可言）。
+     */
+    private fun insertAfterRootTags(blob: String, html: String): String {
+        htmlOpenTagRegex.find(html)?.let { m ->
+            return html.replaceRange(m.range, m.value + "\n" + blob)
+        }
+        doctypeRegex.find(html)?.let { m ->
+            return html.replaceRange(m.range, m.value + "\n" + blob)
+        }
+        return blob + html
+    }
+
+    private val htmlOpenTagRegex = Regex("<html[^>]*>", RegexOption.IGNORE_CASE)
+    private val doctypeRegex = Regex("^\\s*<!DOCTYPE[^>]*>", RegexOption.IGNORE_CASE)
 }
 
 /**
@@ -589,6 +607,7 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                 lateinit var webView: WebView
                 var finished = false
                 var polls = 0
+                var pollStarted = false
                 var lastRaw: String? = null
                 // 探针活性遥测：frames 与 pumpCount 双零 = evaluateJavascript 从未真正
                 // 驱动过探针（renderer 冻结）或页面卡在 loading（readyState 永远 loading，
@@ -600,17 +619,22 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                 var livenessRunnable: Runnable? = null
                 var timeoutRunnable: Runnable? = null
 
+                /** 取消/超时共用的收尾：停轮询链、解绑回调、销毁 WebView。 */
+                fun stopAll() {
+                    finished = true
+                    timeoutRunnable?.let { main.removeCallbacks(it) }
+                    livenessRunnable?.let { main.removeCallbacks(it) }
+                    // 用完即毁（根修复）：泄漏的 WebView 实例会持续占用共享渲染器的
+                    // tile 内存与 JS 堆，累积后新页面无法绘制（tile memory limits
+                    // exceeded）→ 探针停滞 → "运行验证环境异常"。摧毁后资源归还，
+                    // 同进程内多轮沙箱不再互相拖垮。
+                    main.post { runCatching { webView.destroy() } }
+                }
+
                 val finish: (SmokeTestResult) -> Unit = { result ->
                     if (!finished) {
-                        finished = true
-                        timeoutRunnable?.let { main.removeCallbacks(it) }
-                        livenessRunnable?.let { main.removeCallbacks(it) }
+                        stopAll()
                         cont.resumeWith(Result.success(result))
-                        // 用完即毁（根修复）：泄漏的 WebView 实例会持续占用共享渲染器的
-                        // tile 内存与 JS 堆，累积后新页面无法绘制（tile memory limits
-                        // exceeded）→ 探针停滞 → "运行验证环境异常"。摧毁后资源归还，
-                        // 同进程内多轮沙箱不再互相拖垮；取消路径同理销毁。
-                        main.post { runCatching { webView.destroy() } }
                     }
                 }
 
@@ -672,6 +696,9 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                     val js = "(function(){try{if(window.__wwPump){window.__wwPump($FRAMES_PER_POLL);}}catch(pumpErr){}" +
                         "try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],fin:!!window.__wwSmokeFinalized,rs:document.readyState,m:!!window.__wwSmokeInstalled,pfn:typeof window.__wwPump,pc:window.__wwPumpCount||0,sc:(r&&r.scenarios)||[]});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true,rs:document.readyState});}})()"
                     webView.evaluateJavascript(js) { value ->
+                        // 取消与回调的竞态兜底：stopAll 置位后 WebView 已销毁/结果已无意义，
+                        // 不再续排下一轮（否则对已销毁实例无限 200ms 重轮）。
+                        if (finished) return@evaluateJavascript
                         lastRaw = value
                         if (polls <= 8) {
                             android.util.Log.d("SmokeRunner", "poll#$polls raw=${value?.take(220)}")
@@ -706,6 +733,18 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                             main.postDelayed(::poll, POLL_INTERVAL_MS)
                         }
                     }
+                }
+
+                /**
+                 * 单例轮询链入口：真实页 onPageFinished 与"个别环境 onPageFinished
+                 * 不触发"的兜底定时器都经此启动（此前两条链并行，帧推进双倍速、
+                 * 取消时要停两处）。已启动/已收尾则 no-op。必须定义在 poll 之后：
+                 * 局部函数引用（::poll）不允许前向引用。
+                 */
+                fun startPollingOnce(delayMs: Long = 0L) {
+                    if (finished || pollStarted) return
+                    pollStarted = true
+                    main.postDelayed(::poll, delayMs)
                 }
 
                 main.post {
@@ -764,8 +803,8 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                                 blankChecked = true
                                 handshake(0)
                             } else {
-                                // 不依赖单次 onPageFinished：从加载完成起开始轮询探针结果。
-                                view.postDelayed(::poll, FIRST_POLL_DELAY_MS)
+                                // 真实页面加载完成：启动（唯一一条）轮询链。
+                                startPollingOnce(FIRST_POLL_DELAY_MS)
                             }
                         }
 
@@ -777,15 +816,19 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                             return true
                         }
                     }
-                    // 兜底：若 onPageFinished 未触发（个别环境），仍按计划开始轮询。
-                    main.postDelayed(::poll, FIRST_POLL_DELAY_MS + 2500)
+                    // 兜底：若 onPageFinished 未触发（个别环境），仍按计划开始轮询；
+                    // 正常路径已启动时此处 no-op，不再出现第二条并行轮询链。
+                    main.postDelayed({ startPollingOnce() }, FIRST_POLL_DELAY_MS + 2500)
                     view.loadDataWithBaseURL(null, BLANK_HTML, "text/html", "UTF-8", null)
                 }
                 main.postDelayed(timeout, timeoutMs)
                 main.postDelayed(liveness, LIVENESS_GRACE_MS)
 
                 cont.invokeOnCancellation {
-                    main.post { runCatching { webView.destroy() } }
+                    // 取消（外层超时/调用方协程取消）必须终止轮询链并解绑全部回调：
+                    // 此前只销毁 WebView，飞行中的 poll 会继续对已销毁实例
+                    // evaluateJavascript（可能抛异常）或按 200ms 无限重排。
+                    main.post { stopAll() }
                 }
             }
         } ?: SmokeTestResult(false, errors = listOf("冒烟测试超时"), message = "smoke-timeout")

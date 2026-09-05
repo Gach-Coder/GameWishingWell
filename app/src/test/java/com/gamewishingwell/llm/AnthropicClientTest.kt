@@ -9,6 +9,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class AnthropicClientTest {
@@ -16,8 +17,10 @@ class AnthropicClientTest {
     private fun streamResponse(): MockResponse = MockResponse()
         .setHeader("Content-Type", "text/event-stream")
         .setBody(
-            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"OK\"}}\n\n" +
-                "data: [DONE]\n\n"
+            // 协议忠实事件：delta 必带 type，流以 message_stop 收尾（缺 type 的夹具
+            // 此前靠"静默空响应不报错"通过，现在会被空流守卫正确拦截）
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n" +
+                "data: {\"type\":\"message_stop\"}\n\n"
         )
 
     @Test
@@ -147,6 +150,54 @@ class AnthropicClientTest {
         // 曾经被静默吞掉、以空文本"正常"返回——上层只能看到空回复无法归因。
         assertNotNull(thrown)
         assertTrue(thrown!!.message!!.contains("overloaded_error"))
+        server.shutdown()
+    }
+    @Test
+    fun `零内容且无 message_stop 的流判为可重试网络异常`() = runBlocking {
+        val server = MockWebServer()
+        // 连接被中途掐断：200 + SSE 头 + 零事件即关流（无 message_stop）——
+        // 此前会作为"空回复"正常返回，绕过统一重试
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody("")
+        )
+        server.start()
+
+        try {
+            AnthropicClient(
+                okHttp = OkHttpClient(),
+                apiKey = "test-key",
+                baseUrl = server.url("/").toString().trimEnd('/'),
+                model = "claude-sonnet-4-6"
+            ).streamChat(listOf(ChatMessage("user", "hi")), onDelta = {}, onDone = {})
+            fail("应当抛出 IOException（可重试网络异常）")
+        } catch (e: java.io.IOException) {
+            assertTrue(e.message.orEmpty().contains("连接提前关闭"))
+        }
+
+        server.shutdown()
+    }
+
+    @Test
+    fun `带 message_stop 的空回复是合法空响应`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"type\":\"message_stop\"}\n\n")
+        )
+        server.start()
+
+        val resp = AnthropicClient(
+            okHttp = OkHttpClient(),
+            apiKey = "test-key",
+            baseUrl = server.url("/").toString().trimEnd('/'),
+            model = "claude-sonnet-4-6"
+        ).streamChat(listOf(ChatMessage("user", "hi")), onDelta = {}, onDone = {})
+        assertEquals("", resp.text)
+        assertTrue(resp.toolCalls.isEmpty())
+
         server.shutdown()
     }
 }

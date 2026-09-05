@@ -43,18 +43,24 @@ object ErrorSignature {
 
 /**
  * 错误签名记账库：只记录错误历史（同签名累计次数），不再设任何重试预算或自动降级。
+ * 库存跨会话持久化且只增不减，设保留上限——超出时按插入序淘汰最旧条目
+ * （新错误的参考价值高于陈年错误）。
  */
 object RetryBookkeeping {
+    /** 保留上限：防 error_signatures.json 无限膨胀（每个条目只用于历史参考）。 */
+    const val MAX_ENTRIES = 200
+
     /** 同签名只更新计数，不重复占库。 */
     fun record(existing: List<KnownError>, category: ErrorCategory, normalized: String): List<KnownError> {
         val old = existing.firstOrNull { it.signature == ErrorSignature.hash(normalized) }
-        return if (old == null) {
+        val updated = if (old == null) {
             existing + KnownError(category, ErrorSignature.hash(normalized), normalized)
         } else {
             existing.map {
                 if (it === old) it.copy(occurrences = it.occurrences + 1) else it
             }
         }
+        return if (updated.size > MAX_ENTRIES) updated.drop(updated.size - MAX_ENTRIES) else updated
     }
 
 }

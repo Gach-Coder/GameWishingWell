@@ -12,7 +12,6 @@ coroutines = "1.9.0"
 webkit = "1.12.1"
 junit = "4.13.2"
 mockito = "5.12.0"
-rhino = "1.7.15"
 jsoup = "1.18.3"
 
 [libraries]
@@ -35,7 +34,6 @@ androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "w
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 mockwebserver = { group = "com.squareup.okhttp3", name = "mockwebserver", version.ref = "okhttp" }
 mockito = { group = "org.mockito", name = "mockito-core", version.ref = "mockito" }
-rhino = { group = "org.mozilla", name = "rhino", version.ref = "rhino" }
 jsoup = { group = "org.jsoup", name = "jsoup", version.ref = "jsoup" }
 
 [plugins]

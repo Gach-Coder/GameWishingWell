@@ -27,25 +27,6 @@ class GamePlanningLlmTest {
         }
     }
 
-    /** 记录每次调用的 user 提示词，用于断言“只为需重策划的 module 调用 LLM”。 */
-    private class RecordingLlmClient(var reply: String = "") : LlmClient {
-        override val protocol: Protocol = Protocol.OPENAI_COMPATIBLE
-        val prompts = mutableListOf<String>()
-
-        override suspend fun streamChat(
-            messages: List<ChatMessage>,
-            onDelta: (String) -> Unit,
-            onThinking: (String) -> Unit,
-            onDone: () -> Unit,
-            tools: List<com.gamewishingwell.llm.ToolSpec>
-        ): com.gamewishingwell.llm.LlmResponse {
-            prompts += messages.filter { it.role == "user" }.joinToString("\n") { it.content }
-            if (reply.isNotEmpty()) onDelta(reply)
-            onDone()
-            return com.gamewishingwell.llm.LlmResponse(text = reply)
-        }
-    }
-
     private val goldMinerReply = """
         ```json
         {
@@ -125,110 +106,9 @@ class GamePlanningLlmTest {
         assertFalse(designs.any { it.system.contains(",") })
     }
 
-    @Test
-    fun `重组时删除module直接移除且不调用LLM`() = runBlocking {
-        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
-        val plan1 = PlanningEngine.draftWithLlm(schema1, FakeLlmClient(goldMinerReply))
-
-        val second = RecognitionEngine.recognize("不要道具", schema1)
-        val llm = RecordingLlmClient()
-        val plan2 = PlanningEngine.reorganizeWithLlm(
-            schema = second.gameSchema,
-            previousPlan = plan1,
-            touchedModules = second.appliedPatch!!.let {
-                (it.gameSystems + it.reAddSystems).distinct()
-            },
-            llm = llm
-        )
-
-        // 删除 module：直接移除，无 LLM 调用
-        assertTrue(llm.prompts.isEmpty())
-        assertTrue("道具" !in plan2.gameSystems)
-        assertTrue(plan2.implementations.none { it.system == "道具" })
-        assertTrue("道具" in plan2.excludedSystems)
-        // 未涉及的 module 沿用上一版 LLM 策划结果
-        assertEquals(
-            plan1.implementations.first { it.system == "物理" },
-            plan2.implementations.first { it.system == "物理" }
-        )
-        assertEquals(
-            plan1.implementations.first { it.system == "商店经济" },
-            plan2.implementations.first { it.system == "商店经济" }
-        )
-    }
-
-    @Test
-    fun `重组时新增或修改的module由LLM重新策划其余沿用上一版`() = runBlocking {
-        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
-        val plan1 = PlanningEngine.draftWithLlm(schema1, FakeLlmClient(goldMinerReply))
-
-        val second = RecognitionEngine.recognize("加一个技能系统，大招要炫酷", schema1)
-        val llm = RecordingLlmClient(
-            """{"systems":[{"system":"技能","implementation":"玩家可释放范围大招，冷却10秒，命中敌人有明显反馈。",
-               "methods":["大招范围伤害","冷却10秒"],"acceptanceBoundary":"技能可主动释放且有冷却","layer":1}]}"""
-        )
-        val plan2 = PlanningEngine.reorganizeWithLlm(
-            schema = second.gameSchema,
-            previousPlan = plan1,
-            touchedModules = second.appliedPatch!!.let {
-                (it.gameSystems + it.reAddSystems).distinct()
-            },
-            llm = llm,
-            currentUserRequest = "加一个技能系统，大招要炫酷"
-        )
-
-        // 只为新增/修改的 module 调一次 LLM，且提示词只把该子集列为待策划项
-        assertEquals(1, llm.prompts.size)
-        val prompt = llm.prompts.single()
-        assertTrue(prompt.contains("技能"))
-        assertTrue(Regex("<modules_to_plan>\\s*技能\\s*</modules_to_plan>").containsMatchIn(prompt))
-        assertFalse(prompt.contains("- 商店经济：种子方法"))
-        // 修改 module 的范围提示
-        assertTrue(prompt.contains("其余系统沿用已确认方案"))
-
-        // 新增 module 使用本轮 LLM 策划结果
-        val skill = plan2.implementations.first { it.system == "技能" }
-        assertTrue(skill.playerFacing.contains("大招"))
-        assertEquals("技能可主动释放且有冷却", skill.acceptanceBoundary)
-        // 未涉及 module 原样沿用上一版 LLM 策划
-        assertEquals(
-            plan1.implementations.first { it.system == "道具" },
-            plan2.implementations.first { it.system == "道具" }
-        )
-        assertEquals(plan1.gameSystems + listOf("技能"), plan2.gameSystems)
-    }
-
-    @Test
-    fun `修改已有module时只重新策划被点名的module`() = runBlocking {
-        val schema1 = RecognitionEngine.recognize("做一个黄金矿工游戏，钩子物理摆动，有道具和商店经济", null).gameSchema
-        val plan1 = PlanningEngine.draftWithLlm(schema1, FakeLlmClient(goldMinerReply))
-
-        val second = RecognitionEngine.recognize("把道具改成只有黄金和石头", schema1)
-        val llm = RecordingLlmClient(
-            """{"systems":[{"system":"道具","implementation":"矿场里只有黄金和石头：越大越值钱，石头更廉价。",
-               "methods":["黄金/石头随机分布","钩子前端触碰即拾取"],"acceptanceBoundary":"两类道具均可被抓取且分值正确","layer":0}]}"""
-        )
-        val plan2 = PlanningEngine.reorganizeWithLlm(
-            schema = second.gameSchema,
-            previousPlan = plan1,
-            touchedModules = second.appliedPatch!!.let {
-                (it.gameSystems + it.reAddSystems).distinct()
-            },
-            llm = llm,
-            currentUserRequest = "把道具改成只有黄金和石头"
-        )
-
-        assertEquals(1, llm.prompts.size)
-        assertTrue(Regex("<modules_to_plan>\\s*道具\\s*</modules_to_plan>").containsMatchIn(llm.prompts.single()))
-        val item = plan2.implementations.first { it.system == "道具" }
-        assertTrue(item.playerFacing.contains("只有黄金和石头"))
-        assertFalse(item.playerFacing.contains("炸弹"))
-        // 未点名 module 沿用上一版
-        assertEquals(
-            plan1.implementations.first { it.system == "物理" },
-            plan2.implementations.first { it.system == "物理" }
-        )
-    }
+    // 注：旧确认门"重组只重策划变动 module"的管线（reorganizeWithLlm）从未接线，
+    // 已随死代码移除——现行为是重组卡片重建后于确认时统一定稿（draftWithLlm 全量策划），
+    // 由下方 finalize/取消勾选用例覆盖。
 
     @Test
     fun `确认时取消勾选的module移出范围不视作排除且不注入prompt`() = runBlocking {

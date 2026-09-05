@@ -108,11 +108,18 @@ class AnthropicClient(
                 // 默认用户可无限等待：不做内容停滞超时，用户主动按停止键时由 runInterruptible 中断读取。
                 val text = StringBuilder()
                 val blocks = HashMap<Int, PartialToolBlock>()
+                var sawMessageStop = false
                 while (true) {
                     val line = source.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val payload = line.removePrefix("data:").trim()
-                    handleEvent(payload, text, blocks, onDelta, onThinking)
+                    if (handleEvent(payload, text, blocks, onDelta, onThinking)) sawMessageStop = true
+                }
+                // 连接被中途掐断时 readUtf8Line 返回 null 正常退出循环——零内容 + 零工具
+                // 调用 + 未收到 message_stop 属于"假成功"（会绕过统一重试），显性化为
+                // 可重试 IOException；已带部分内容时保持旧行为（尽力返回已收内容）。
+                if (!sawMessageStop && text.isEmpty() && blocks.isEmpty()) {
+                    throw java.io.IOException("连接提前关闭：未收到 message_stop 且无任何内容（网关/网络瞬断）")
                 }
                 onDone()
                 LlmResponse(
@@ -138,31 +145,36 @@ class AnthropicClient(
         val arguments: StringBuilder = StringBuilder()
     )
 
+    /**
+     * 处理一条 SSE data 事件；返回 true 表示收到了 message_stop（协议层结束标记，
+     * 用于区分"正常结束"与"连接被中途掐断"）。
+     */
     private fun handleEvent(
         payload: String,
         text: StringBuilder,
         blocks: HashMap<Int, PartialToolBlock>,
         onDelta: (String) -> Unit,
         onThinking: (String) -> Unit
-    ) {
+    ): Boolean {
         val obj = try {
             Json.parseToJsonElement(payload).jsonObject
         } catch (e: Exception) {
-            return
+            return false
         }
-        when (obj["type"]?.jsonPrimitive?.contentOrNull) {
+        val type = obj["type"]?.jsonPrimitive?.contentOrNull
+        when (type) {
             // SSE 错误事件（overloaded_error / invalid_request_error 等服务端 mid-stream 推送）：
             // 必须抛出而非静默吞掉——吞掉会让流"正常"结束并返回空文本，上层只能看到
             // 空回复，无法归因（可重试错误交由 GameAgent.callLlm 的退避重试处理）。
             "error" -> {
                 val err = obj["error"]?.jsonObject
-                val type = err?.get("type")?.jsonPrimitive?.contentOrNull ?: "error"
+                val errType = err?.get("type")?.jsonPrimitive?.contentOrNull ?: "error"
                 val message = err?.get("message")?.jsonPrimitive?.contentOrNull ?: payload.take(200)
-                throw LlmError("API 错误 ($type)：$message")
+                throw LlmError("API 错误 ($errType)：$message")
             }
             "content_block_start" -> {
-                val index = obj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: return
-                val block = obj["content_block"]?.jsonObject ?: return
+                val index = obj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: return false
+                val block = obj["content_block"]?.jsonObject ?: return false
                 if (block["type"]?.jsonPrimitive?.contentOrNull == "tool_use") {
                     blocks[index] = PartialToolBlock(
                         id = block["id"]?.jsonPrimitive?.contentOrNull.orEmpty(),
@@ -171,25 +183,26 @@ class AnthropicClient(
                 }
             }
             "content_block_delta" -> {
-                val index = obj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: return
-                val delta = obj["delta"]?.jsonObject ?: return
+                val index = obj["index"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: return false
+                val delta = obj["delta"]?.jsonObject ?: return false
                 when (delta["type"]?.jsonPrimitive?.contentOrNull) {
                     "text_delta" -> {
-                        val chunk = delta["text"]?.jsonPrimitive?.contentOrNull ?: return
+                        val chunk = delta["text"]?.jsonPrimitive?.contentOrNull ?: return false
                         text.append(chunk)
                         onDelta(chunk)
                     }
                     "input_json_delta" -> {
-                        val chunk = delta["partial_json"]?.jsonPrimitive?.contentOrNull ?: return
+                        val chunk = delta["partial_json"]?.jsonPrimitive?.contentOrNull ?: return false
                         blocks[index]?.arguments?.append(chunk)
                     }
                     "thinking_delta" -> {
-                        val chunk = delta["thinking"]?.jsonPrimitive?.contentOrNull ?: return
+                        val chunk = delta["thinking"]?.jsonPrimitive?.contentOrNull ?: return false
                         onThinking(chunk)
                     }
                 }
             }
         }
+        return type == "message_stop"
     }
 
     // ---------- 消息到 content blocks 的转换 ----------

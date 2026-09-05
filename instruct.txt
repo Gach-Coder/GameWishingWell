@@ -116,9 +116,9 @@ Agent处理message流程如下：
 		例如<我的世界>游戏的"人物实体" module，简单诠释其在游戏的核心实现方式：用户可操作移动，有对应坐标...等
 		（不用策划出或和用户探讨具体的技术细节，例如游戏引擎，算法等底层技术或逻辑。这里只探讨游戏内容和玩法系统逻辑。）
 		策划默认口径为"类型标配的完整可玩版本"：核心玩法闭环=P0；类型常见标配内容（多种单位/敌人、波次或关卡递进、升级成长、经济资源）=P1 一并纳入；仅锦上添花的打磨=P2（除非用户明确说明）。
-		若收到确认门的重组
-			追加或修改 module —> 策划子 Agent LLM 重新策划该module
-			删除 module -> 直接删除，无LLM调用
+		若收到确认门的修正文本：回到识别层在同一份 Game Schema 上补全/重组摘要，再次回显待确认；
+		策划 LLM 延迟到玩家点击确认才执行（确认后的范围才是策划输入）——确认时对全部纳入系统统一定稿，
+		取消勾选的 module 直接剔除（无 LLM 调用），不设独立的"只重策划变动项"路径
 	→ 确认门：用卡片回显上游游戏JSON的综合策划结果，
 		卡片中对于 game_module_list 的每个 module 都有一个可选框供用户勾选(默认为勾选，确认或取消勾选代表是否希望实现这个游戏系统)
 		（勾选只做加法不做减法：勾选=纳入本轮实现范围；取消勾选=仅不纳入，不进任何禁止清单，后续文本点名该系统自动恢复；
@@ -138,7 +138,7 @@ Agent处理message流程如下：
 	→ Prompt：根据用户最后确认的完整信息组成游戏内容提示文本加入system 提示词（工具模式：文件内容一律经工具写入，回复正文不出现代码）+ 上下文最小化：
 		首次生成放参考模板；迭代放 rolling summary（"最新内容请通过 readfile 获取"），其余靠工具按需取
 	→ Agent Loop：（bug 修复轮数不设上限，多轮属正常；仅无进展与运行验证环境异常两类非修复性退出；
-	  输出零截断：不携带 max_tokens、工具观察与消息全量透传；网络层超时（连接30s/读静默5min/写60s）是死连接探测器
+	  输出零截断：不携带 max_tokens、工具观察与消息全量透传；网络层超时（连接30s/读静默12min/写60s）是死连接探测器
 	  而非 LLM 时长限制——只要流上有字节就永不触发，触发后走自动重试不截断输出；整体时长不设限，停止键是用户侧唯一主动中断）
 	主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/appendfile/editfile，沙箱严格限游戏工作区目录）
 	readfile 整读自适应：千行级以内文件的切片请求直接整读返回（实测修复轮 60~70% 轮次耗在切片重读上，每片一次 LLM 往返），
@@ -171,7 +171,7 @@ Agent处理message流程如下：
 	（避免上回合取消回调与下回合启动的竞态）；Android 15+ dataSync 6 小时上限由 onTimeout 退前台兜底（不终止生成）；
 	通知权限（Android 13+）在 MainActivity 启动时请求，拒绝仅影响通知显示、不影响后台生成；
 		服务同时持有 WifiLock（高性能模式）降低后台网卡省电断流；LLM 调用带网络韧性：网络/超时/5xx/真限流 429/overloaded
-		自动重试最多 2 次（5s/15s 退避，阶段显示"网络波动，正在自动重试"）；账户额度类（GLM 429+code1113 余额不足、
+		自动重试最多 4 次（5/15/30/60s 递增退避，阶段显示"网络波动，正在自动重试"；后台瞬断恢复窗口常需 30~60s）；账户额度类（GLM 429+code1113 余额不足、
 		DeepSeek 402 Insufficient Balance）与鉴权/模型类 4xx 不重试，如实提示"LLM 服务不可用"（余额/密钥/模型指引）——
 		确定性失败不伪装成网络波动；后台瞬断不再直接判死整个回合；
 		交付约束：交给用户前必须通过基础校验（0 error）、沙箱冒烟测试（同 WebView 内核确定性 tick 跑通）与两轮可玩性自检（内容完整性、体验与平台合规），不存在"带错交付"
@@ -378,21 +378,18 @@ GameWishingWell/
       │  │  ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
 	      │  │  ├─ agent/
-	      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / 工具模式 Agent Loop（含无工具降级回环与修复快车道）
+	      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / 工具模式 Agent Loop（含无工具降级回环与修复快车道）；回合整体运行于全局 agentScope——策划+生成是同一个可取消任务
 	      │  │  │  ├─ GameTools.kt           # 工具定义(listfiles/readfile/writefile/editfile) + 沙箱执行器（写后自动校验回传）
 	      │  │  │  ├─ GameIntent.kt          # 意图层：dev/chat 二分类（正则优先+Lite LLM 复核）；修复快车道由会话状态推导
-      │  │  │  ├─ GameIntentLegacy.kt    # 旧版三意图 Schema/引擎，仅供历史会话与旧测试兼容
-      │  │  │  ├─ GameRecognition.kt     # 识别层：会话级 Game Schema JSON、白名单校验、模板库、确认门
-      │  │  │  ├─ GameTemplateSystems.kt # 对标模板的具体系统实现/验收边界（LLM 策划的种子与回退）
+      │  │  │  ├─ GameRecognition.kt     # 识别层：会话级 Game Schema JSON、白名单校验、确认门；IntentEngine 纯文本特征正则
       │  │  │  ├─ GamePlan.kt            # 策划层：LLM 逐系统阐述具体实现、P0/P1/P2、验收清单
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
 	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单）；运行校验由沙箱承担
 	      │  │  │  ├─ GameEngines.kt        # 内置引擎条件注册表（ww-engine 解析/BUNDLED/allowedFor 条件矩阵）
 	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控
 	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试 + 功能断言执行 + 画面方向断言（横板按横屏视口运行）
-      │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入 / 行级 patch
+      │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入（归档滚动保留，delete 同步清理版本簿记）
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
-      │  │  │  ├─ QualityGate.kt         # 两段式自检 verdict
       │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
 	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入（视口修复/错误捕获/内置引擎注入）
 	      │  │  │  └─ GenerationForegroundService.kt # 生成期前台服务（dataSync）：后台保活/进度通知/停止入口/wakelock
@@ -427,12 +424,16 @@ GameWishingWell/
       │     ├─ drawable/                 # launcher 背景/前景
       │     └─ mipmap-anydpi-v26/        # 自适应图标
       └─ test/java/com/gamewishingwell/  # 本地 JVM 单元测试
+         ├─ agent/GameAgentTurnTest.kt   # 回合级集成测试（脚本化 LLM+桩沙箱：异常兜底/工具降级判定/聊天历史）
          ├─ agent/GameRecognitionTest.kt
          ├─ agent/GamePlanningLlmTest.kt
          ├─ agent/HtmlEnhancerTest.kt
          ├─ agent/HtmlExtractorTest.kt
          ├─ data/JsonTest.kt
          └─ llm/OpenAiClientTest.kt
+      （另有 GameTools/GameValidator/GameScenario/GameEngines/GameFileWorkspace/RetryPolicy/
+        SmokeProbe/SmokeRetryPolicy/LlmFailureClassifier/AgentLog/GameIntent/GamePlan/
+        GameRepository/LlmSettings/ProviderPreset/AnthropicClient 等单测，覆盖各纯逻辑模块）
 
 六、模块与关键文件说明
 ------------------------------------------------------------

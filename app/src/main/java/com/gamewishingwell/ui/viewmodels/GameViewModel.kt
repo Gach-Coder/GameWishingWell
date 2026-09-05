@@ -96,15 +96,19 @@ class GameViewModel(
 
     /** 让 AI 修复运行时报错：先确保 agent 会话与当前游戏一致，再发起修复。
      *  运行区（game）游玩页的报障重载会话后修复；预览页（preview）本身就是
-     *  当前编辑会话的版本，直接在会话上修复，避免重载覆盖未保存的编辑状态。 */
-    fun fixErrorAndGo() {
-        val err = _jsError.value ?: return
+     *  当前编辑会话的版本，直接在会话上修复，避免重载覆盖未保存的编辑状态。
+     *  @return false 表示当前正在生成、报障未被受理（调用方应提示稍后再试，
+     *  错误提示保留不消失——此前静默早退会让用户误以为修复已提交）。 */
+    fun fixErrorAndGo(): Boolean {
+        val err = _jsError.value ?: return false
+        if (agent.session.value.isGenerating) return false
         _jsError.value = null
         viewModelScope.launch {
             val id = _loadedGameId.value
             if (playSource == "game" && id != null) agent.loadGameSession(id)
             agent.fixWithError(err)
         }
+        return true
     }
 
     fun saveDraft(title: String, onDone: (Boolean) -> Unit) {

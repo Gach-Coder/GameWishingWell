@@ -170,93 +170,10 @@ object PlanningEngine {
     }
 
     /**
-     * 确认门重组：策划子 Agent 只对“追加或修改的 module”重新 LLM 策划，
-     * 删除的 module 直接移除（无 LLM 调用），未涉及的 module 沿用上一版策划结果。
-     *
-     * @param touchedModules 本轮用户文本明确点名的 module（识别补丁的 gameSystems + reAddSystems），
-     *   视为“修改”，即使上一版已有其实现也要重新策划。
+     * Game Schema 版本的系统范围继承已随旧确认门管线一并移除：新流程由
+     * [RecognitionEngine.recognize] 在同一份 Game Schema 上补全，确认门重组
+     * 走"重建卡片 → 确认时统一策划定稿"，不再有独立的重组策划路径。
      */
-    suspend fun reorganizeWithLlm(
-        schema: GameSchema,
-        previousPlan: DesignPlan,
-        touchedModules: Collection<String>,
-        llm: LlmClient,
-        currentUserRequest: String? = null,
-        existingTitle: String? = null
-    ): DesignPlan {
-        val target = schema.gameSystems
-            .mapNotNull { GameSystemCatalog.admit(it) }
-            .filter { it !in schema.excludedSystems && it !in schema.uncheckedSystems }
-            .distinct()
-        val replan = modulesNeedingReplan(schema, previousPlan, touchedModules)
-
-        val previousByModule = previousPlan.implementations.associateBy { it.system }
-        val staticByModule = build(schema, existingTitle ?: previousPlan.title)
-            .implementations.associateBy { it.system }
-
-        val designs = requestLlmDesigns(llm, schema, replan, currentUserRequest)
-            .associateBy { it.system }
-
-        val implementations = target.mapNotNull { module ->
-            when {
-                module in replan -> {
-                    val design = designs[module]
-                    val fallback = previousByModule[module] ?: staticByModule[module]
-                    if (design == null) fallback else mergeLlmDesign(fallback, design)
-                }
-                // 未涉及的 module 沿用上一版策划（含 LLM 阐述），不重复调用 LLM。
-                else -> previousByModule[module] ?: staticByModule[module]
-            }
-        }
-        return assemblePlan(schema, existingTitle ?: previousPlan.title, target, implementations)
-    }
-
-    /**
-     * 重组时需要重新策划的 module：
-     * 1) 上一版没有的新增 module；2) 本轮用户文本点名的修改 module。
-     * 其余（包括被删除的）都不需要 LLM。
-     */
-    fun modulesNeedingReplan(
-        schema: GameSchema,
-        previousPlan: DesignPlan,
-        touchedModules: Collection<String>
-    ): List<String> {
-        val previous = previousPlan.gameSystems.toSet()
-        return schema.gameSystems.filter { it !in previous || it in touchedModules }
-    }
-
-    /**
-     * Game Schema 版本的系统范围继承：用于旧会话迁移或识别层尚未补全的边界场景。
-     * 新流程正常由 [RecognitionEngine.recognize] 在同一份 Game Schema 上补全。
-     */
-    fun inheritExistingDesign(
-        schema: GameSchema,
-        previous: DesignPlan?,
-        userText: String? = null
-    ): GameSchema {
-        if (previous == null) return schema
-
-        val excluded = schema.excludedSystems.toSet()
-        val merged = (previous.gameSystems + schema.gameSystems)
-            .mapNotNull { GameSystemCatalog.admit(it) }
-            .filter { it !in excluded }
-            .distinct()
-        val dimension = if (userText != null && !IntentEngine.explicitlySpecifiesDimension(userText)) {
-            previous.visualDimension
-        } else {
-            schema.visualDimension
-        }
-        val orientation = if (userText != null && !IntentEngine.explicitlySpecifiesOrientation(userText)) {
-            previous.screenOrientation
-        } else {
-            schema.screenOrientation
-        }
-        return schema.copy(
-            gameSystems = merged.ifEmpty { previous.gameSystems },
-            visualDimension = dimension,
-            screenOrientation = orientation
-        )
-    }
 
     /** 新流程核心构建：Game Schema 中已经包含最终系统集合。
      *  allowEmptySystems=true 时不做默认系统兜底（直接制作路径：系统由生成

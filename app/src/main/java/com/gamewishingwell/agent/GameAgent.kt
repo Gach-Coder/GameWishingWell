@@ -16,6 +16,7 @@ import com.gamewishingwell.llm.ProviderPresets
 import com.gamewishingwell.llm.ToolSpec
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -43,8 +44,6 @@ import java.util.concurrent.TimeUnit
 data class GameSession(
     val messages: List<ChatMessage> = emptyList(),
     val currentHtml: String? = null,
-    /** 为兼容旧 UI 保留；新流程中前端只展示 [agentStage]，不再回显源代码文本。 */
-    val streamingText: String? = null,
     val agentStage: String = AgentStage.IDLE,
     val pendingConfirmation: IntentConfirmation? = null,
     /** 会话级 Game Schema JSON：一个对话框只制作一个游戏，识别层与下游共享。 */
@@ -69,9 +68,7 @@ data class GameSession(
     val snapshots: List<String> = emptyList(),
     val schemaVersion: Int = 2,
     /** 质量档位（确认门四挡 fast/light/balanced/premium），默认均衡：驱动档位提示词、自检轮数与沙箱深度。 */
-    val qualityTier: String = QualityTier.BALANCED,
-    /** 仅用于兼容旧会话；简化流程不再运行两段式质量自检，因此新状态中保持 null。 */
-    val qualityVerdict: QualityVerdict? = null
+    val qualityTier: String = QualityTier.BALANCED
 ) {
     /** 兼容旧会话：持久化标志为 false 但已存在游戏代码时，同样视为已生成。 */
     fun effectiveGameGenerated(): Boolean = gameGenerated || !currentHtml.isNullOrBlank()
@@ -209,7 +206,14 @@ class GameAgent(
     @Volatile
     private var editingGameId: Long? = null
 
-    private val agentScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // CoroutineExceptionHandler 是最后防线：回合协程已用 runTurnSafely 兜底，
+    // 这里只拦截兜底路径自身（如 failTurn 落盘）抛出的意外异常——SupervisorJob
+    // 无 handler 时未捕获异常会走 defaultUncaughtExceptionHandler 直接崩溃进程。
+    private val agentScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e ->
+            runCatching { alog("UNCAUGHT ${e.javaClass.simpleName}: ${e.message}") }
+        }
+    )
     private val turnMutex = Mutex()
 
     /** 当前正在执行的 Agent Loop 任务；停止键取消该任务。 */
@@ -244,6 +248,17 @@ class GameAgent(
         const val USER_MSG_CHANGE_MODEL = "本轮制作未能推进。你可以重试；若反复出现，请在设置中更换模型。"
         const val USER_MSG_NETWORK = "网络或服务连接异常，进度已保留。请检查网络与模型配置后重试。"
         const val USER_MSG_SANDBOX_ENV = "运行验证环境异常，进度已保留。请重试；若反复出现，请重启应用后再试。"
+        /** 回合内未被业务 try/catch 覆盖的意外异常（文件 IO/序列化等）：如实失败收尾，绝不带崩进程。 */
+        const val USER_MSG_UNEXPECTED = "本轮出现意外错误，进度已保留。请重试；若反复出现，请重启应用后再试。"
+
+        /** 会话内版本快照的保留上限：防 agent_state.json 无限膨胀（每次成功回合只追加不清理）。 */
+        const val MAX_SNAPSHOTS = 50
+
+        /**
+         * LLM 网络重试的递增退避表（5/15/30/60s）：表长即重试次数（首次 + 4 次重试 = 5 次尝试）。
+         * 后台瞬断（射频切换/Doze 间隙/网关限流）恢复常需 30~60s，短退避跨不过窗口。
+         */
+        val LLM_RETRY_BACKOFF_MS = longArrayOf(5_000L, 15_000L, 30_000L, 60_000L)
 
         /**
          * 兼容回环（每轮全量重写）的总轮次上限：最贵路径的止损熔断。工具模式靠
@@ -268,14 +283,17 @@ class GameAgent(
         OkHttpClient.Builder()
             // 网络层超时是"死连接探测器"，不是对 LLM 的时长限制——三者都不约束模型生成：
             // 1) connect/write 只管建连与请求体上传（模型尚未开始输出），超时=网络不可达；
-            // 2) read 是字节间静默超时（单次阻塞读的等待上限，非整流时长）——只要流上有任何
-            //    字节到达（content / reasoning_content / SSE 心跳）就永不触发；推理与长输出
-            //    阶段字节持续在流。唯一触发场景：连接已死、一个字节都到不了（蜂窝 NAT 几分钟
-            //    就回收空闲 TCP），此时的"无限等待"没有任何价值；
-            // 3) 触发后不判死：callLlm 对网络类异常自动重试最多 2 次（重连新连接），
+            // 2) read 是字节间静默超时（单次阻塞读的等待上限，非整流时长）。阈值取 12 分钟：
+            //    部分网关对推理模型不回传 reasoning_content 增量（思考期间连接完全静默），
+            //    复杂任务（首对话整游戏生成/修复轮大上下文推理）思考超过 5 分钟并不罕见——
+            //    此前 5 分钟阈值会把正常思考判成 SocketTimeout，三次重试全部同样超时，
+            //    最终以"网络或服务连接异常"失败（后台长任务的高频失败来源）。
+            //    只要流上有任何字节（content/reasoning/SSE 心跳）就永不触发；真正死连接
+            //    （蜂窝 NAT 回收）12 分钟内也必然暴露，代价可接受；
+            // 3) 触发后不判死：callLlm 对网络类异常自动重试（重连新连接），
             //    模型输出不会被截断；callTimeout=0 保证整体时长不设限，停止键是用户侧唯一主动中断。
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(5, TimeUnit.MINUTES)
+            .readTimeout(12, TimeUnit.MINUTES)
             .writeTimeout(60, TimeUnit.SECONDS)
             .callTimeout(0, TimeUnit.SECONDS)
             .build()
@@ -301,6 +319,23 @@ class GameAgent(
     }
 
     /**
+     * 回合级异常兜底（agentScope.launch 的统一包裹层）：LLM 调用各有局部 try/catch，
+     * 但工作区读写、持久化序列化等仍可能抛 IOException/SerializationException——
+     * 不兜底会穿透 SupervisorJob 崩溃进程。任何意外异常都转为如实失败收尾
+     * （会话状态正确翻回空闲、决策日志留痕），进行中的中间版本保留。
+     */
+    private suspend fun runTurnSafely(block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            alog("turn crashed: ${e.javaClass.simpleName}: ${e.message}")
+            runCatching { failTurn(USER_MSG_UNEXPECTED, internalDetail = "回合意外异常：${e.javaClass.name}: ${e.message}") }
+        }
+    }
+
+    /**
      * 停止键：随时中断当前 Agent Loop。
      * 中断后保留最近一次已抽取出的 HTML 候选（如果有），玩家可立即尝试游玩；
      * 该候选可能尚未通过基础校验，运行错误属于正常现象。
@@ -310,15 +345,25 @@ class GameAgent(
         val job = activeGenerationJob
         if (!current.isGenerating) return
         alog("STOP by user")
-        if (job?.isActive == true) job.cancel()
+        if (job?.isActive == true) {
+            job.cancel()
+            // cancel 异步生效：回合协程在"最后一次 ensureActive 之后"飞行中的进度
+            // 更新可能落在 INTERRUPTED 之后，把终态盖回"第 N 轮生成中"。回合协程
+            // 完全退出后不再有任何写方，此时把终态复位（新回合已启动/已失败则不动）。
+            job.invokeOnCompletion {
+                _session.update { s ->
+                    if (!s.isGenerating && s.error == null &&
+                        s.agentStage != AgentStage.INTERRUPTED && s.agentStage != AgentStage.DONE
+                    ) s.copy(agentStage = AgentStage.INTERRUPTED) else s
+                }
+            }
+        }
         activeGenerationJob = null
         _session.update { s ->
             s.copy(
                 isGenerating = false,
-                streamingText = null,
                 agentStage = AgentStage.INTERRUPTED,
                 error = null,
-                qualityVerdict = null,
                 lastWarning = if (s.currentHtml != null) {
                     "已中断。你可以试玩当前版本，或继续描述需求。"
                 } else {
@@ -330,58 +375,90 @@ class GameAgent(
 
     // ---------- 会话管理 ----------
 
+    /**
+     * 会话加载的乐观提交（并发纪律根修复）：入口快照 [before]，读文件期间若有
+     * 其它入口（发送消息翻转 isGenerating / 停止 / 下一回合）改写了会话——引用
+     * 必然变化——则放弃本次覆盖。此前直接 `_session.value = 新值` 会把读文件
+     * 窗口内刚追加的用户消息与生成状态整体吞掉。所有会话写入都走 `_session.update`
+     * 原子读-改-写，引用比对才有意义。
+     */
+    private fun commitSessionIfUntouched(before: GameSession, build: (GameSession) -> GameSession): Boolean {
+        var committed = false
+        _session.update { cur ->
+            if (cur === before) {
+                committed = true
+                build(cur)
+            } else {
+                cur
+            }
+        }
+        return committed
+    }
+
     suspend fun loadDraftSession() {
-        if (_session.value.isGenerating) return
+        val before = _session.value
+        if (before.isGenerating) return
         withContext(Dispatchers.IO) {
             val html = repository.loadDraftHtml()
             val messages = repository.loadDraftSession()
             val persisted = repository.loadDraftAgentState()
             val decoded = decodeSession(persisted)
-            editingGameId = null
-            _session.value = decoded.copy(
-                messages = messages.ifEmpty { decoded.messages },
-                currentHtml = html ?: decoded.currentHtml
-            )
+            if (commitSessionIfUntouched(before) {
+                    decoded.copy(
+                        messages = messages.ifEmpty { decoded.messages },
+                        currentHtml = html ?: decoded.currentHtml
+                    )
+                }
+            ) {
+                editingGameId = null
+            }
         }
     }
 
     suspend fun loadGameSession(gameId: Long) {
-        if (_session.value.isGenerating) return
+        val before = _session.value
+        if (before.isGenerating) return
         withContext(Dispatchers.IO) {
             val savedHtml = repository.loadGameHtml(gameId)
             val messages = repository.loadGameSession(gameId)
             val persisted = repository.loadGameAgentState(gameId)
             val decoded = decodeSession(persisted)
-            editingGameId = gameId
             // 编辑区优先：编辑文件夹（agent/workspace/game-<id>）里可能有未保存的修改，
             // 重新进入编辑对话从编辑区续作；运行区（games/<id>）只被保存按钮覆盖。
             val editingHtml = editingWorkspaceHtml(gameId)
-            _session.value = decoded.copy(
-                messages = messages.ifEmpty { decoded.messages },
-                currentHtml = editingHtml ?: savedHtml ?: decoded.currentHtml
-            )
+            if (commitSessionIfUntouched(before) {
+                    decoded.copy(
+                        messages = messages.ifEmpty { decoded.messages },
+                        currentHtml = editingHtml ?: savedHtml ?: decoded.currentHtml
+                    )
+                }
+            ) {
+                editingGameId = gameId
+            }
         }
     }
 
     /**
      * 开始一个空会话。
-     * [clearDraft] 为 true 时同时删除草稿文件；从底部“创作”进入新对话时传 false，
-     * 这样不会破坏“我的游戏”页的“继续上次创作”入口。
+     * [clearDraft] 为 true 时同时删除草稿文件；从底部"创作"进入新对话时传 false，
+     * 这样不会破坏"我的游戏"页的"继续上次创作"入口。
      * 跨会话的错误签名库会保留，只用于错误历史记录；Agent Loop 不设重试上限。
      */
     suspend fun newSession(clearDraft: Boolean = true) {
-        if (_session.value.isGenerating) return
+        val before = _session.value
+        if (before.isGenerating) return
         if (clearDraft) repository.clearDraft()
-        editingGameId = null
         val signatures = withContext(Dispatchers.IO) { loadGlobalErrorSignatures() }
-        _session.value = GameSession(knownErrors = signatures)
+        if (commitSessionIfUntouched(before) { GameSession(knownErrors = signatures) }) {
+            editingGameId = null
+        }
     }
 
     // ---------- 用户回合入口 ----------
 
     /**
      * 独立协程中执行用户回合；调用方协程被取消（例如用户切走页面）时，
-     * agentScope 中的任务继续运行，保证“生成任务在全局 GameAgent 中继续”。
+     * agentScope 中的任务继续运行，保证"生成任务在全局 GameAgent 中继续"。
      */
     suspend fun sendUserMessage(
         text: String,
@@ -394,7 +471,7 @@ class GameAgent(
         val trimmed = text.trim()
         if (trimmed.isBlank()) return
 
-        // 确认门期间输入框发来的任何文字都是“补充/修正”，不会当作确认语句；
+        // 确认门期间输入框发来的任何文字都是"补充/修正"，不会当作确认语句；
         // 进入决策层的唯一入口是界面上的确认按钮（confirmIntent）。
         // 修正回合重建卡片时继承用户当前选择的质量档位（否则选择被重置回上一张卡的持久值）。
         val priorConfirmation = current.pendingConfirmation?.let { p ->
@@ -411,24 +488,22 @@ class GameAgent(
                 messages = messages,
                 isGenerating = true,
                 error = null,
-                streamingText = null,
                 agentStage = AgentStage.INTENT,
                 qualityTier = qualityTier?.let { q -> QualityTier.normalize(q) } ?: it.qualityTier,
-                qualityVerdict = null
             )
         }
         markTurnStart()
         val job = trackGenerationJob(agentScope.launch {
-            runUserTurn(trimmed, priorConfirmation, dimensionOverride, orientationOverride)
+            runTurnSafely { runUserTurn(trimmed, priorConfirmation, dimensionOverride, orientationOverride) }
         })
         job.join()
     }
 
     /**
-     * 确认门唯一入口：“按此方案生成”按钮；点击后执行策划 LLM（延迟到此刻——
+     * 确认门唯一入口："按此方案生成"按钮；点击后执行策划 LLM（延迟到此刻——
      * 玩家确认后的范围才是策划输入，改主意不再白跑策划）并开始生成代码。
      * [uncheckedModules] 为卡片上被取消勾选的 module：本轮不实现、直接从方案中
-     * 剔除（无 LLM 调用），但不视作玩家明确排除——不进任何“禁止实现”清单，
+     * 剔除（无 LLM 调用），但不视作玩家明确排除——不进任何"禁止实现"清单，
      * 后续文本点名该系统会自动恢复到范围。
      * [orientationOverride]/[dimensionOverride] 为卡片上的画面形态选择器：识别
      * 错了方向/维度（一票否决下游的错误）玩家在卡上直接改，优先级高于识别结果。
@@ -471,12 +546,10 @@ class GameAgent(
                 },
                 isGenerating = true,
                 error = null,
-                streamingText = null,
                 agentStage = "游戏策划中：正在定稿每个系统的实现方案",
                 pendingConfirmation = null,
                 gameSchema = schema,
                 qualityTier = safeTier,
-                qualityVerdict = null
             )
         }
         alog("confirm: unchecked=[${uncheckedModules.joinToString(",")}] systems=${schema.gameSystems.joinToString(",")} tier=$safeTier form=${schema.visualDimension}/${schema.screenOrientation}")
@@ -484,35 +557,42 @@ class GameAgent(
         // 耗时；若放在策划后重置，停止键计时会在策划完成瞬间跳回 0 秒。
         markTurnStart()
 
-        // 策划延迟到此刻执行：LLM 异常时 draftWithLlm 内部回退静态种子（不抛出、
-        // 不阻塞生成）；不对策划调用设任何超时——停止键是用户侧唯一中断手段。
-        val llm = createClient()
-        if (llm == null) {
-            failTurn("请先在「设置」中配置 API Key、地址和模型")
-            return
-        }
-        val draftPlan = PlanningEngine.draftWithLlm(
-            schema = schema,
-            llm = llm,
-            existingTitle = _session.value.designPlan?.title,
-            currentUserRequest = pending.userRequest
-        )
-        currentCoroutineContext().ensureActive()
-        val finalPlan = PlanningEngine.finalize(
-            schema = schema,
-            confirmedDraft = draftPlan,
-            existingTitle = _session.value.designPlan?.title,
-            uncheckedModules = uncheckedModules
-        )
-        _session.update { s ->
-            s.copy(
-                agentStage = AgentStage.PLANNING,
-                designPlan = finalPlan
-            )
-        }
+        // 回合所有权（根修复）：策划 LLM（2~40s）+ 代码生成作为同一个 job 运行在
+        // agentScope 内并持有 turnMutex——此前策划跑在调用方协程（viewModelScope），
+        // 用户切页清掉 ViewModel 会把策划砍断（会话已锁死在 isGenerating=true，
+        // 生成永远不启动）；策划窗口内按停止键也取消不到它，停止后回合照样跑完。
+        // 整体进 agentScope 后，停止键取消的就是完整回合，切页/息屏不再影响。
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
-                generateFromIntent(pending.userRequest, schema, _session.value.currentHtml, finalPlan)
+                runTurnSafely {
+                    // 策划 LLM 异常时 draftWithLlm 内部回退静态种子（不抛出、不阻塞生成）；
+                    // 不对策划调用设任何超时——停止键是用户侧唯一中断手段。
+                    val llm = createClient()
+                    if (llm == null) {
+                        failTurn("请先在「设置」中配置 API Key、地址和模型")
+                        return@runTurnSafely
+                    }
+                    val draftPlan = PlanningEngine.draftWithLlm(
+                        schema = schema,
+                        llm = llm,
+                        existingTitle = _session.value.designPlan?.title,
+                        currentUserRequest = pending.userRequest
+                    )
+                    currentCoroutineContext().ensureActive()
+                    val finalPlan = PlanningEngine.finalize(
+                        schema = schema,
+                        confirmedDraft = draftPlan,
+                        existingTitle = _session.value.designPlan?.title,
+                        uncheckedModules = uncheckedModules
+                    )
+                    _session.update { s ->
+                        s.copy(
+                            agentStage = AgentStage.PLANNING,
+                            designPlan = finalPlan
+                        )
+                    }
+                    generateFromIntent(pending.userRequest, schema, _session.value.currentHtml, finalPlan)
+                }
             }
         })
         job.join()
@@ -544,26 +624,26 @@ class GameAgent(
                 messages = s.messages + ChatMessage("user", "再试一次：重新制作"),
                 isGenerating = true,
                 error = null,
-                streamingText = null,
                 agentStage = "代码生成中：正在重新制作",
                 pendingConfirmation = null,
                 gameSchema = schema,
-                qualityVerdict = null
             )
         }
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
-                markTurnStart()
-                generateFromIntent(
-                    instruction = "用户点击了「再试一次」。请重新制作这款游戏：忽略现有版本，" +
-                        "用 writefile 写入全新的完整版本（允许整量替换），并确保沙箱可运行。；原始需求：$trimmed",
-                    intent = schema,
-                    existingHtml = html,
-                    forcePlan = s.designPlan ?: PlanningEngine.finalize(schema),
-                    fixTurn = false,
-                    // 用户主动要求的整体重做：修改范围契约对此放行。
-                    allowEntryRewrite = true
-                )
+                runTurnSafely {
+                    markTurnStart()
+                    generateFromIntent(
+                        instruction = "用户点击了「再试一次」。请重新制作这款游戏：忽略现有版本，" +
+                            "用 writefile 写入全新的完整版本（允许整量替换），并确保沙箱可运行。；原始需求：$trimmed",
+                        intent = schema,
+                        existingHtml = html,
+                        forcePlan = s.designPlan ?: PlanningEngine.finalize(schema),
+                        fixTurn = false,
+                        // 用户主动要求的整体重做：修改范围契约对此放行。
+                        allowEntryRewrite = true
+                    )
+                }
             }
         })
         job.join()
@@ -594,26 +674,28 @@ class GameAgent(
                 messages = messages,
                 isGenerating = true,
                 error = null,
-                streamingText = null,
                 agentStage = AgentStage.FIXING,
+                // 残留的待确认卡片随修复回合作废：否则修复完成后旧门重新可交互，
+                // 与本轮已发生的修复语义脱节（其 pendingKey 也不再匹配历史卡）。
                 pendingConfirmation = null,
                 gameSchema = schema,
                 knownErrors = known,
                 lastError = jsError.take(500),
                 lastErrorSignature = ErrorSignature.hash(normalized),
-                qualityVerdict = null
             )
         }
         markTurnStart()
         val job = trackGenerationJob(agentScope.launch {
             turnMutex.withLock {
-                generateFromIntent(
-                    instruction = instruction,
-                    intent = schema,
-                    existingHtml = html,
-                    forcePlan = s.designPlan,
-                    fixTurn = true
-                )
+                runTurnSafely {
+                    generateFromIntent(
+                        instruction = instruction,
+                        intent = schema,
+                        existingHtml = html,
+                        forcePlan = s.designPlan,
+                        fixTurn = true
+                    )
+                }
             }
         })
         job.join()
@@ -631,6 +713,10 @@ class GameAgent(
      */
     suspend fun saveCurrentGame(title: String): GameMeta? {
         val s = _session.value
+        // 生成中拒绝保存：此刻的 currentHtml 是未验收的中间版本，会话上下文也在
+        // 流转中——存进运行区等于把半成品固化为"已保存版本"（撤销锚点同样失真）。
+        // UI 侧已禁用入口，这里是最终闸门。
+        if (s.isGenerating) return null
         val html = s.currentHtml ?: return null
         val editingId = editingGameId
         val cleanTitle = title.trim().ifBlank { defaultTitle(s) }
@@ -667,58 +753,69 @@ class GameAgent(
         val editingId = editingGameId ?: return false
         val before = _session.value
         if (before.isGenerating) return false
+        // 撤销要整体覆盖编辑区工作区文件，必须与回合互斥：tryLock 而非阻塞等待——
+        // 等待意味着撞上正在启动的回合（isGenerating 翻转与回合抢锁之间的空窗），
+        // 用户会被 UI 挂住整轮生成时长；拿不到锁直接返回"无可撤销"由用户重试。
+        if (!turnMutex.tryLock()) return false
         var changed = false
-        val ok = withContext(Dispatchers.IO) {
-            val savedHtml = repository.loadGameHtml(editingId) ?: return@withContext false
-            restoreWorkspaceFromSaved(editingId)
-            val hasSavepoint = repository.loadSavepointAgentState(editingId) != null
-            var restored: GameSession
-            if (hasSavepoint) {
-                val spMessages = repository.loadSavepointSession(editingId).orEmpty()
-                restored = decodeSession(repository.loadSavepointAgentState(editingId))
-                if (spMessages.isNotEmpty()) restored = restored.copy(messages = spMessages)
-            } else {
-                // 旧版本保存的游戏：保存点缺失，保存时的对话不可回放——清空对话与
-                // 过期摘要（摘要描述的是未保存版本），保留 Schema/策划稿供继续编辑。
-                // 对话既已清空，待确认门（若残留）一并作废，避免 ActionBar 被隐藏。
-                restored = decodeSession(repository.loadGameAgentState(editingId)).copy(
-                    messages = emptyList(),
-                    rollingSummary = "",
-                    knownIssues = emptyList(),
-                    lastError = null,
-                    lastErrorSignature = null,
-                    pendingConfirmation = null
-                )
-            }
-            changed = restored.messages != before.messages || before.currentHtml != savedHtml
-            if (changed) {
-                val note = if (hasSavepoint) {
-                    ChatMessage("assistant", "已撤销未保存的修改，回到上次保存的版本。")
+        var committed = false
+        try {
+            withContext(Dispatchers.IO) {
+                val savedHtml = repository.loadGameHtml(editingId) ?: return@withContext
+                restoreWorkspaceFromSaved(editingId)
+                val hasSavepoint = repository.loadSavepointAgentState(editingId) != null
+                var restored: GameSession
+                if (hasSavepoint) {
+                    val spMessages = repository.loadSavepointSession(editingId).orEmpty()
+                    restored = decodeSession(repository.loadSavepointAgentState(editingId))
+                    if (spMessages.isNotEmpty()) restored = restored.copy(messages = spMessages)
                 } else {
-                    ChatMessage(
-                        "assistant",
-                        "已回到上次保存的版本。该游戏由旧版本应用保存（无保存点），此前的对话记录已随撤销清空；" +
-                            "游戏文件已恢复为保存区版本，可继续描述需求修改。"
+                    // 旧版本保存的游戏：保存点缺失，保存时的对话不可回放——清空对话与
+                    // 过期摘要（摘要描述的是未保存版本），保留 Schema/策划稿供继续编辑。
+                    // 对话既已清空，待确认门（若残留）一并作废，避免 ActionBar 被隐藏。
+                    restored = decodeSession(repository.loadGameAgentState(editingId)).copy(
+                        messages = emptyList(),
+                        rollingSummary = "",
+                        knownIssues = emptyList(),
+                        lastError = null,
+                        lastErrorSignature = null,
+                        pendingConfirmation = null
                     )
                 }
-                restored = restored.copy(messages = restored.messages + note)
+                changed = restored.messages != before.messages || before.currentHtml != savedHtml
+                if (changed) {
+                    val note = if (hasSavepoint) {
+                        ChatMessage("assistant", "已撤销未保存的修改，回到上次保存的版本。")
+                    } else {
+                        ChatMessage(
+                            "assistant",
+                            "已回到上次保存的版本。该游戏由旧版本应用保存（无保存点），此前的对话记录已随撤销清空；" +
+                                "游戏文件已恢复为保存区版本，可继续描述需求修改。"
+                        )
+                    }
+                    restored = restored.copy(messages = restored.messages + note)
+                }
+                val finalState = restored.copy(
+                    currentHtml = savedHtml,
+                    isGenerating = false,
+                    error = null,
+                    agentStage = AgentStage.IDLE,
+                    lastWarning = if (changed) "已撤销未保存的修改，回到上次保存的版本。" else null
+                )
+                // 乐观提交：读文件期间用户发起了新回合（引用已变化）则放弃会话回滚，
+                // 避免吞掉其消息与生成状态；工作区文件已恢复无害——回合会用
+                // currentHtml 重新对齐工作区（seedWorkspace）。
+                committed = commitSessionIfUntouched(before) { finalState }
             }
-            _session.value = restored.copy(
-                currentHtml = savedHtml,
-                isGenerating = false,
-                streamingText = null,
-                error = null,
-                agentStage = AgentStage.IDLE,
-                lastWarning = if (changed) "已撤销未保存的修改，回到上次保存的版本。" else null
-            )
-            true
+        } finally {
+            turnMutex.unlock()
         }
-        if (ok) {
+        if (committed) {
             alog("undo: workspace + context restored (game-$editingId, savepoint=$changed)")
             // 撤销结果同步进保存区实时会话副本：应用若在撤销后立即重启，重进编辑对话看到的也是回滚后的上下文。
             persistSessionMessages(_session.value)
         }
-        return ok && changed
+        return committed && changed
     }
 
     /**
@@ -812,8 +909,8 @@ class GameAgent(
                 return@withLock
             }
 
-            // 1) 意图层：dev / chat 二分类（只回答“要不要动游戏”一个问题）。
-            //    确认门待确认期间的任何文本输入一律判定为“修正”：跳过意图分类，
+            // 1) 意图层：dev / chat 二分类（只回答"要不要动游戏"一个问题）。
+            //    确认门待确认期间的任何文本输入一律判定为"修正"：跳过意图分类，
             //    不落入 chat 回退，只会回到策划层重组摘要再次回显。
             val intent = if (priorConfirmation != null) {
                 IntentDecision(
@@ -833,7 +930,7 @@ class GameAgent(
             }
 
             // 修复快车道：不经文本分类，由会话状态推导——已锚定游戏且存在
-            // 未消化的运行时错误时（成功回合会把 lastError 清空，非空即”新鲜”），
+            // 未消化的运行时错误时（成功回合会把 lastError 清空，非空即"新鲜"），
             // 跳过识别/策划/确认门直通 Agent Loop，指令以用户本轮诉求为准。
             if (hasAnchoredGame(s) && hasFreshRuntimeError(s)) {
                 alog("route: fix fast-lane (fresh runtime error)")
@@ -939,10 +1036,8 @@ class GameAgent(
                     pendingConfirmation = confirmation,
                     gameSchema = schema,
                     isGenerating = false,
-                    streamingText = null,
                     agentStage = AgentStage.CONFIRM,
                     error = null,
-                    qualityVerdict = null
                 )
             }
             persistSessionMessages(next)
@@ -975,7 +1070,7 @@ class GameAgent(
             s.designPlan != null || editingGameId != null
 
     /**
-     * 是否存在“未消化”的运行时错误：成功结束的回合会把 lastError 清空
+     * 是否存在"未消化"的运行时错误：成功结束的回合会把 lastError 清空
      * （仅同签名熔断交付时保留），因此该字段非空即代表玩家回传过报错且
      * 尚未被成功修复——用它做修复快车道的确定性判据，替代文本猜测。
      */
@@ -984,7 +1079,7 @@ class GameAgent(
 
     /**
      * 修复快车道回合：会话有未消化的运行时错误 + 已锚定游戏时，带着现有代码
-     * 直通 Agent Loop。指令不预设“功能特性不变”——玩家描述的“异常”可能
+     * 直通 Agent Loop。指令不预设"功能特性不变"——玩家描述的"异常"可能
      * 实际是想要行为调整，以用户本轮诉求为准，优先最小改动修复。
      */
     private suspend fun fixReportedIssue(s: GameSession, instruction: String) {
@@ -1001,10 +1096,11 @@ class GameAgent(
             s.copy(
                 isGenerating = true,
                 error = null,
-                streamingText = null,
                 agentStage = AgentStage.FIXING,
+                // 修复快车道可能越过待确认卡片（确认门期间报错回传的场景）：
+                // 修复回合作废残留的确认门，避免修复完成后旧门重新可交互。
+                pendingConfirmation = null,
                 gameSchema = schema,
-                qualityVerdict = null
             )
         }
         generateFromIntent(
@@ -1035,11 +1131,9 @@ class GameAgent(
             s.copy(
                 isGenerating = true,
                 error = null,
-                streamingText = null,
                 agentStage = "游戏修改中：正在准备迭代上下文",
                 pendingConfirmation = null,
                 gameSchema = schema,
-                qualityVerdict = null
             )
         }
         generateFromIntent(
@@ -1094,15 +1188,18 @@ class GameAgent(
     }
 
     private suspend fun generateChatReply(s: GameSession, instruction: String, llm: LlmClient) {
-        _session.update { it.copy(isGenerating = true, agentStage = AgentStage.CHAT, streamingText = null) }
+        _session.update { it.copy(isGenerating = true, agentStage = AgentStage.CHAT) }
         // chat 虽然不改文件，但回答要贴着当前会话：把 rolling summary 作为
-        // 只读上下文注入，避免“它能联机吗”这类问题答非所问。
+        // 只读上下文注入，避免"它能联机吗"这类问题答非所问；同时附最近几轮
+        // 对话——rolling summary 只描述游戏不描述聊天，缺它时多轮问答的第二问
+        // 会丢失第一问的上下文。
         val summary = s.rollingSummary.takeIf { it.isNotBlank() }
         val reply = try {
             collectTextReply(
                 llm,
                 listOf(
                     ChatMessage("system", GamePrompt.chatSystemPrompt(summary)),
+                    *chatHistoryMessages(s.messages),
                     ChatMessage("user", instruction)
                 )
             )
@@ -1125,6 +1222,22 @@ class GameAgent(
             )
         }
         persistSessionMessages(next)
+    }
+
+    /**
+     * chat 上下文的最近对话历史：仅取用户与 assistant 气泡（确认卡是结构化 UI 不进
+     * 模型上下文），丢弃末位（那是本轮指令，已单独作为 user 消息发送）；单条截断
+     * 防超长气泡撑爆上下文。条数取少（6 条）：chat 只需要"刚才聊了什么"的连续性。
+     */
+    private fun chatHistoryMessages(messages: List<ChatMessage>, limit: Int = 6): Array<ChatMessage> {
+        val chatOnly = messages
+            .filter { (it.isUser || it.role == "assistant") && !it.isConfirmCard }
+        if (chatOnly.isEmpty()) return emptyArray()
+        return chatOnly
+            .takeLast(limit + 1)
+            .dropLast(1)
+            .map { it.copy(content = it.content.take(800)) }
+            .toTypedArray()
     }
 
     /** Agent Loop 单轮产出的三种结局。 */
@@ -1186,7 +1299,6 @@ class GameAgent(
             s.copy(
                 isGenerating = true,
                 error = null,
-                streamingText = null,
                 agentStage = planningStage,
                 gameSchema = intent,
                 designPlan = plan,
@@ -1272,7 +1384,6 @@ class GameAgent(
                 messages = s.messages + ChatMessage("assistant", assistantText),
                 currentHtml = accepted.html,
                 gameGenerated = true,
-                streamingText = null,
                 isGenerating = false,
                 error = null,
                 agentStage = AgentStage.DONE,
@@ -1284,11 +1395,13 @@ class GameAgent(
                 },
                 rollingSummary = summary,
                 fileManifest = workspace.manifest(),
-                snapshots = s.snapshots + "index.html:${GameFileWorkspace.sha256(accepted.html)}",
                 designPlan = plan,
                 knownIssues = accepted.report.warnings.map { "${it.category}:${it.message}" },
+                // 成功回合把"未消化的运行时错误"整体清空（lastError 与签名成对置空），
+                // 修复快车道判据不再被陈旧签名污染；快照滚动保留上限条防会话无限膨胀。
                 lastError = null,
-                qualityVerdict = null,
+                lastErrorSignature = null,
+                snapshots = (s.snapshots + "index.html:${GameFileWorkspace.sha256(accepted.html)}").takeLast(MAX_SNAPSHOTS),
                 decisionLog = s.decisionLog + listOf(
                     "第 ${accepted.rounds} 轮结束：基础校验 0 error / ${accepted.report.warnings.size} warning，沙箱冒烟通过，回合耗时 ${formatAgentDuration(elapsedMs)}（elapsedMs=$elapsedMs）",
                     accepted.metricsNote ?: "",
@@ -1304,8 +1417,8 @@ class GameAgent(
      * 终止 = 模型某轮不再发起工具调用；验收 = 工作区当前 index.html 通过基础校验
      * 与沙箱冒烟测试，且修改轮（[seedHash] 非 null）相对种子版本发生了实际内容
      * 变化——防止模型不做任何 editfile 就空口宣称完成。
-     * 交付约束：不存在”带错交付”——同一错误签名 3 次注入”换思路”、6 次起强制
-     * “重写问题模块/换实现”，连续 10 次同一签名或总轮次达 40 时如实失败终止
+     * 交付约束：不存在"带错交付"——同一错误签名 3 次注入"换思路"、6 次起强制
+     * "重写问题模块/换实现"，连续 10 次同一签名或总轮次达 40 时如实失败终止
      * （保留中间版本可试玩，属主动止损而非带错交付）；用户停止键可随时中断。
      */
     private suspend fun runToolLoop(
@@ -1373,7 +1486,7 @@ class GameAgent(
             } else {
                 "第 $round 轮 - 代码生成中（工具模式）：正在生成 $file"
             }
-            _session.update { it.copy(agentStage = genStage, streamingText = null) }
+            _session.update { it.copy(agentStage = genStage) }
 
             val resp = try {
                 callLlm(llm, messages, GameTools.specs(), stageLabel = genStage)
@@ -1381,7 +1494,7 @@ class GameAgent(
                 throw e
             } catch (e: Exception) {
                 // 账户额度/鉴权/模型类失败给出如实的"LLM 服务不可用"文案，不再误报为网络异常
-                failTurn(LlmFailureClassifier.userMessage(e) ?: USER_MSG_NETWORK, internalDetail = "LLM 调用失败：${e.message}")
+                failTurn(LlmFailureClassifier.userMessage(e) ?: USER_MSG_NETWORK, internalDetail = "LLM 调用失败：${e.javaClass.simpleName}: ${e.message}")
                 return GenOutcome.Failed
             }
             currentCoroutineContext().ensureActive()
@@ -1515,7 +1628,9 @@ class GameAgent(
                                     }
                                     stubborn = StubbornErrorTracker.update(
                                         stubborn,
-                                        smokeErrors.map { StubbornErrorTracker.issueSignature("sandbox", it) }.toSet()
+                                        // 记账与反查必须用同一前缀（此前 sandbox/smoke 各一个，
+                                        // worst 签名永远反查不回原文，升级提示丢失错误详情）。
+                                        smokeErrors.map { StubbornErrorTracker.issueSignature("smoke", it) }.toSet()
                                     )
                                     val worst = StubbornErrorTracker.worst(stubborn)
                                     val maxRepeat = worst?.second ?: 0
@@ -1584,7 +1699,7 @@ class GameAgent(
                         }
                         if (nudgesLeft <= 0) {
                             failTurn(
-                                "本轮没有产生新的修改。你可以重试，或直接描述想要的效果（如“再简单一点”“加个计分板”）。",
+                                "本轮没有产生新的修改。你可以重试，或直接描述想要的效果（如「再简单一点」「加个计分板」）。",
                                 internalDetail = "模型未成功执行任何 editfile 即宣称完成（nudge 耗尽）"
                             )
                             return GenOutcome.Failed
@@ -1635,6 +1750,9 @@ class GameAgent(
             }
 
             // 工具执行分支：assistant 的调用请求 + 每个调用的观察结果回填进消息历史。
+            // 有工具调用的轮次重置无工具轮计数：判定"模型不会 function calling"必须是
+            // 连续无工具（此前只增不减，readfile 一轮夹在两次纯文本之间就会被误判降级）。
+            toollessRounds = 0
             messages += ChatMessage("assistant", resp.text, toolCalls = resp.toolCalls)
             var mutatedThisRound = false
             for (call in resp.toolCalls) {
@@ -1652,7 +1770,7 @@ class GameAgent(
                 if (outcome.mutated) {
                     lastReport = outcome.report
                     // 中间版本即刻发布：中断后玩家可立即试玩该版本。
-                    _session.update { it.copy(currentHtml = outcome.html, streamingText = null) }
+                    _session.update { it.copy(currentHtml = outcome.html) }
                 }
                 alog("tool ${call.name}: ok=${outcome.ok} mutated=${outcome.mutated} obs=${outcome.observation.take(200)}")
 
@@ -1703,7 +1821,7 @@ class GameAgent(
 
     /**
      * 兼容降级回环：网关/模型不支持 function calling（首轮即在正文输出整份 HTML）时，
-     * 退回“全量重写 → 抽取 → 校验 → 文本反馈”循环；每轮重建 prompt，不累积历史。
+     * 退回"全量重写 → 抽取 → 校验 → 文本反馈"循环；每轮重建 prompt，不累积历史。
      *
      * 兼容模式每轮都是整文件再生成（最贵路径），必须有硬上限：总轮次达
      * [LEGACY_MAX_ROUNDS] 即如实失败并保留最新候选版本，不做带错交付。
@@ -1773,7 +1891,6 @@ class GameAgent(
                 it.copy(
                     currentHtml = html,
                     agentStage = "校验中：正在对 ${GameFileWorkspaceEntryPoint.DEFAULT} 做语法与基本逻辑校验",
-                    streamingText = null
                 )
             }
             lastReport = GameValidator.validate(html, allowedEngines)
@@ -1851,7 +1968,7 @@ class GameAgent(
             } else {
                 "第 $round 轮 - 代码修改中（兼容模式）：正在修改 $file"
             }
-            _session.update { it.copy(agentStage = genStage, streamingText = null) }
+            _session.update { it.copy(agentStage = genStage) }
 
             val reply = try {
                 callLlm(
@@ -1870,7 +1987,7 @@ class GameAgent(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                failTurn(LlmFailureClassifier.userMessage(e) ?: USER_MSG_NETWORK, internalDetail = "兼容模式 LLM 调用失败：${e.message}")
+                failTurn(LlmFailureClassifier.userMessage(e) ?: USER_MSG_NETWORK, internalDetail = "兼容模式 LLM 调用失败：${e.javaClass.simpleName}: ${e.message}")
                 return GenOutcome.Failed
             }
 
@@ -1991,7 +2108,7 @@ class GameAgent(
     /**
      * 工作区与当前代码版本对齐：内容哈希一致则跳过，否则重置后写入 v1 种子。
      * 无种子（首次创建）时清掉跨会话残留的旧文件——工作区目录按会话复用，
-     * 旧 index.html 若不清，会被新会话误当成“已有游戏”。
+     * 旧 index.html 若不清，会被新会话误当成"已有游戏"。
      */
     private suspend fun seedWorkspace(workspace: GameFileWorkspace, html: String?) {
         if (html.isNullOrBlank()) {
@@ -2151,7 +2268,6 @@ class GameAgent(
         val failed = updateSession { s ->
             s.copy(
                 isGenerating = false,
-                streamingText = null,
                 error = message + "（本轮耗时 ${formatAgentDuration(turnElapsedMs())}）",
                 agentStage = AgentStage.FAILED,
                 decisionLog = if (internalDetail.isNullOrBlank()) {
@@ -2309,9 +2425,12 @@ class GameAgent(
      * 兼容模式（全量重写回环）中断时抢救未收完的 HTML；工具模式正文不含代码，无需抢救。
      */
     /**
-     * 统一 LLM 调用（带网络韧性）：对可重试异常（网络/超时/5xx/429）自动重试最多 2 次
-     *（5s/15s 退避）——后台运行（前台服务）下蜂窝 NAT 回收、Doze 维护窗口间隙等瞬断
-     * 不再直接判死整个回合；鉴权/请求格式类 4xx 重试无意义，立即失败。
+     * 统一 LLM 调用（带网络韧性）：对可重试异常（网络/超时/5xx/429）自动重试——
+     * 后台运行（前台服务）下的瞬断恢复窗口明显长于前台：射频切换（Wi-Fi↔蜂窝）、
+     * Doze 维护窗口间隙常需 30~60 秒才能恢复，真限流 429 的窗口也往往超过半分钟。
+     * 因此预算为 5 次尝试、递增退避 5/15/30/60s（累计最多 110s），而不是此前的
+     * 3 次 5s/15s（总 20s——后台瞬断经常跨不过这个窗口，直接以"网络连接异常"失败）。
+     * 鉴权/请求格式类 4xx 重试无意义，立即失败。
      */
     private suspend fun callLlm(
         llm: LlmClient,
@@ -2331,12 +2450,12 @@ class GameAgent(
                 // 停止键/调整取消 OkHttp 调用会表现为 IO 异常：协程已取消时
                 // 不再进入退避重试（实测 ADJUST 后白等 5s 并留下误导性重试日志）。
                 currentCoroutineContext().ensureActive()
-                if (attempt >= 3 || !LlmFailureClassifier.isRetryable(e)) throw e
-                val waitMs = if (attempt == 1) 5_000L else 15_000L
-                alog("LLM 调用失败（第 $attempt 次），${waitMs / 1000}s 后自动重试：" +
+                val backoffMs = LLM_RETRY_BACKOFF_MS.getOrNull(attempt - 1)
+                if (backoffMs == null || !LlmFailureClassifier.isRetryable(e)) throw e
+                alog("LLM 调用失败（第 $attempt 次），${backoffMs / 1000}s 后自动重试：" +
                     "${e.javaClass.simpleName}: ${e.message?.take(140)}")
-                _session.update { it.copy(agentStage = "网络波动，正在自动重试（第 $attempt/2 次）…") }
-                delay(waitMs)
+                _session.update { it.copy(agentStage = "网络波动，正在自动重试（第 $attempt/${LLM_RETRY_BACKOFF_MS.size} 次）…") }
+                delay(backoffMs)
             }
         }
     }
@@ -2369,7 +2488,7 @@ class GameAgent(
         } catch (e: CancellationException) {
             if (salvageHtmlOnCancel) {
                 // 兼容模式的代码生成流被停止键中断时，抢救未收完的 HTML，
-                // 让玩家仍可“立即游玩”中间版本。
+                // 让玩家仍可"立即游玩"中间版本。
                 HtmlExtractor.extractPartial(sb.toString())?.let { partial ->
                     _session.update { s ->
                         s.copy(

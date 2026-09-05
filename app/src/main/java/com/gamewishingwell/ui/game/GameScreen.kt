@@ -84,6 +84,9 @@ fun GameScreen(
     val jsError by vm.jsError.collectAsState()
     val loadedGameId by vm.loadedGameId.collectAsState()
     val context = LocalContext.current
+    // 保存护栏的 UI 侧：生成中 currentHtml 是未验收的中间版本，此刻入库会把半成品
+    // 固化为"已保存版本"（agent 侧 saveCurrentGame 为最终闸门，此处先禁用入口）。
+    val agentGenerating by container.gameAgent.session.collectAsState()
 
     var webView by remember { mutableStateOf<WebView?>(null) }
     var loadedHtml by remember { mutableStateOf<String?>(null) }
@@ -98,6 +101,8 @@ fun GameScreen(
         webView?.evaluateJavascript("window.__wwSetPaused && window.__wwSetPaused(false)", null)
     }
     val restartGame: () -> Unit = {
+        // 重开成功与否都不再保留旧的报错覆盖层（restart 契约即"完整重置"）。
+        vm.dismissError()
         webView?.evaluateJavascript(
             "(function(){try{if(typeof window.restart==='function'){window.restart();}else{console.error('[游戏错误] 重新游戏失败: 未找到 restart()');}}catch(err){console.error('[游戏错误] 重新游戏失败: ' + err.message);}})()",
             null
@@ -253,8 +258,11 @@ fun GameScreen(
                             Text("关闭", color = Color.White)
                         }
                         Button(onClick = {
-                            vm.fixErrorAndGo()
-                            onEdit(loadedGameId)
+                            if (!vm.fixErrorAndGo()) {
+                                Toast.makeText(context, "正在生成中，请等本轮完成后再修复", Toast.LENGTH_SHORT).show()
+                            } else {
+                                onEdit(loadedGameId)
+                            }
                         }) {
                             Text("让 AI 修复")
                         }
@@ -297,10 +305,17 @@ fun GameScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     // 运行区（game，首页游玩入口）不提供保存；预览/草稿页可把编辑区版本保存入库。
                     if (source != "game") {
-                        OutlinedButton(onClick = {
-                            closeSettings()
-                            showSaveDialog = true
-                        }) { Text("保存游戏") }
+                        OutlinedButton(
+                            enabled = !agentGenerating.isGenerating,
+                            onClick = {
+                                if (agentGenerating.isGenerating) {
+                                    Toast.makeText(context, "正在生成中，请等本轮完成后再保存", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    closeSettings()
+                                    showSaveDialog = true
+                                }
+                            }
+                        ) { Text("保存游戏") }
                     }
                     Button(onClick = {
                         restartGame()

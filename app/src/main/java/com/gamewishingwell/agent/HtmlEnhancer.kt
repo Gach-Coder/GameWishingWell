@@ -250,6 +250,7 @@ object HtmlEnhancer {
 
     private val headTagRegex = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
     private val htmlTagRegex = Regex("<html[^>]*>", RegexOption.IGNORE_CASE)
+    private val doctypeRegex = Regex("^\\s*<!DOCTYPE[^>]*>", RegexOption.IGNORE_CASE)
     private const val ENGINE_INJECTED_MARK = "__wwEngineInjected"
 
     fun inject(html: String): String {
@@ -274,6 +275,11 @@ object HtmlEnhancer {
         htmlTagRegex.find(html)?.let { m ->
             val at = m.range.last + 1
             return html.substring(0, at) + "\n" + preludes + html.substring(at)
+        }
+        // 无 head/html 的兜底：保持 DOCTYPE（若有）在最前——脚本前插到 DOCTYPE
+        // 之前会触发 quirks 模式，视口修复与布局行为失真。
+        doctypeRegex.find(html)?.let { m ->
+            return html.replaceRange(m.range, m.value + "\n" + preludes)
         }
         return preludes + html
     }

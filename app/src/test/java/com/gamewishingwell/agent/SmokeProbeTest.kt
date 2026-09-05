@@ -26,4 +26,15 @@ class SmokeProbeTest {
         // 已注入（含探针标记）的 HTML 原样返回，不重复注入
         assertTrue(once == SmokeTestProbe.inject(once, landscape = true))
     }
+
+    @Test
+    fun `无 head 与 body 的兜底注入不破坏 DOCTYPE 标准模式`() {
+        val html = "<!DOCTYPE html>\n<html lang=\"zh\">\n<div>游戏</div>\n</html>"
+        val out = SmokeTestProbe.inject(html)
+        // DOCTYPE 必须仍是文件首个标签：脚本前插到 DOCTYPE 之前会触发 quirks 模式，
+        // 视口/布局行为与真机失真，沙箱结论不可信。
+        assertTrue(out.trimStart().startsWith("<!DOCTYPE"))
+        assertTrue(out.indexOf("__wwSmokeInstalled") > out.indexOf("<html"))
+        assertTrue(out.contains("</html>"))
+    }
 }

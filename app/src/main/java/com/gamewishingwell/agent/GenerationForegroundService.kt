@@ -23,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /** 生成期前台服务的启动入口（Agent 侧唯一接触点，幂等）。 */
@@ -64,6 +65,7 @@ class GenerationForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             runCatching { container().gameAgent.stopGeneration() }
+            // stopGeneration 已同步翻转 isGenerating=false，最终复查会放行收尾
             stopForegroundAndSelf()
             return START_NOT_STICKY
         }
@@ -72,9 +74,9 @@ class GenerationForegroundService : Service() {
         return START_NOT_STICKY
     }
 
-    /** Android 15+：dataSync 前台服务超时（6h/24h 窗口）——退前台，不终止生成。 */
+    /** Android 15+：dataSync 前台服务超时（6h/24h 窗口）——系统强制要求退前台，不复查。 */
     override fun onTimeout(startId: Int) {
-        stopForegroundAndSelf()
+        stopForegroundAndSelf(force = true)
     }
 
     private fun startInForeground(stage: String) {
@@ -96,6 +98,18 @@ class GenerationForegroundService : Service() {
         // 服务无法收尾）。以协程存活状态判重即可。
         if (observerJob?.isActive == true) return
         observerJob = scope.launch {
+            // wakelock 周期续约兜底：PARTIAL_WAKE_LOCK 带 1h 超时，常规续约依赖会话
+            // 事件（每轮 stage 更新）；但单轮 LLM 调用最长可达数十分钟静默思考——
+            // 期间零事件、超时到期后 CPU 休眠会让后台 SSE 流停摆（读超时→整回合被判
+            // 网络异常）。ticker 不依赖事件流，保证生成期间锁始终在手。
+            launch {
+                while (true) {
+                    delay(WAKELOCK_RENEW_INTERVAL_MS)
+                    if (wakeLock?.isHeld != true && container().gameAgent.session.value.isGenerating) {
+                        acquireWakeLock()
+                    }
+                }
+            }
             var lastStage: String? = null
             var lastUpdateAt = 0L
             container().gameAgent.session.collect { s ->
@@ -116,8 +130,7 @@ class GenerationForegroundService : Service() {
                         notificationManager().notify(NOTIFICATION_ID, buildNotification(s.agentStage))
                     }
                 }
-                // wakelock 续约：PARTIAL_WAKE_LOCK 带 1h 超时，精品档长修复轮可能超过；
-                // 到期后 CPU 休眠会让后台 SSE 流停摆（读超时后整回合被判网络异常）。
+                // wakelock 续约：事件路径（每次 stage 更新顺手检查）。
                 if (wakeLock?.isHeld != true) acquireWakeLock()
             }
         }
@@ -168,7 +181,17 @@ class GenerationForegroundService : Service() {
             .apply { runCatching { acquire() } }
     }
 
-    private fun stopForegroundAndSelf() {
+    /**
+     * 收尾前最终复查（除非 [force]）：从"观察到 isGenerating=false"到本方法执行之间，
+     * 新回合可能已经启动——此刻停掉前台服务会释放 wakelock/WifiLock，后台生成立即
+     * 失去网络保活（表现为"网络连接异常"）。复查到生成中就放弃本次收尾，新一轮的
+     * onStartCommand 会重新挂上观察。
+     */
+    private fun stopForegroundAndSelf(force: Boolean = false) {
+        if (!force) {
+            val generating = runCatching { container().gameAgent.session.value.isGenerating }.getOrDefault(false)
+            if (generating) return
+        }
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
         runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
@@ -197,5 +220,8 @@ class GenerationForegroundService : Service() {
         private const val ACTION_STOP = "com.gamewishingwell.agent.STOP_GENERATION"
         private const val MIN_STAGE_INTERVAL_MS = 900L
         private const val WAKELOCK_TIMEOUT_MS = 60 * 60 * 1000L
+
+        /** wakelock 周期续约间隔：远小于 1h 超时，静默思考期（零会话事件）也能续上。 */
+        private const val WAKELOCK_RENEW_INTERVAL_MS = 20 * 60 * 1000L
     }
 }

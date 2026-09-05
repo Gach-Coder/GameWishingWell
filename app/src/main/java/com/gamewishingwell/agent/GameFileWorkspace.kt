@@ -75,41 +75,20 @@ class GameFileWorkspace(private val rootDir: File) {
             writeLocked(relativePath, content, expectedHash)
         }
 
-    /**
-     * 已有文件的更新：默认行级 patch（[fromLine, toLine] 替换）。
-     * 全量重写仅允许首次生成；如果调用方确需全量替换已有文件，必须先 delete 文件。
-     */
-    suspend fun patchLines(
-        relativePath: String,
-        startLine: Int,
-        endLine: Int,
-        replacement: String,
-        expectedHash: String? = null
-    ): WorkspaceFile? = mutex.withLock {
-        val file = resolve(relativePath) ?: return@withLock null
-        if (!file.isFile) return@withLock null
-        expectedHash?.let { expected ->
-            if (sha256(file.readBytes()) != expected) return@withLock null
-        }
-        val lines = file.readText(Charsets.UTF_8).lines().toMutableList()
-        val from = startLine.coerceIn(1, lines.size + 1) - 1
-        val to = endLine.coerceIn(startLine, lines.size + 1)
-        val newLines = replacement.lines()
-        val targetSize = from + newLines.size + (lines.size - to)
-        // 小文件用 MutableList，兼容 JVM 与 Android。
-        while (lines.size < from) lines.add("")
-        val tail = lines.drop(to)
-        val rebuilt = ArrayList<String>(targetSize.coerceAtLeast(from + newLines.size + tail.size))
-        rebuilt.addAll(lines.take(from))
-        rebuilt.addAll(newLines)
-        rebuilt.addAll(tail)
-        val updated = rebuilt.joinToString("\n")
-        writeLocked(relativePath, updated, expectedHash)
-    }
-
     suspend fun delete(relativePath: String): Boolean = mutex.withLock {
         val file = resolve(relativePath) ?: return@withLock false
-        file.delete()
+        val deleted = file.delete()
+        if (deleted) {
+            // 版本簿记随文件一并清理：残留的旧 marker 会让"删除→重建"从旧版本号
+            // 续数，新归档按 v1 覆盖上一款游戏的历史归档（跨游戏版本串台）；
+            // 归档文件同步移除，避免孤儿堆积。
+            val versionsDir = File(file.parentFile, ".versions")
+            File(versionsDir, "${file.name}.version").delete()
+            versionsDir.listFiles()?.forEach { archived ->
+                if (archived.name.endsWith("-${file.name}")) archived.delete()
+            }
+        }
+        deleted
     }
 
     fun manifest(): FileManifest {
@@ -145,16 +124,31 @@ class GameFileWorkspace(private val rootDir: File) {
         if (file.isFile) {
             // 指针切换：旧文件先入版本库，再写新文件；任何一步失败都不破坏旧指针内容。
             File(versionsDir, "$currentVersion-${file.name}").writeBytes(file.readBytes())
-            File(versionsDir, "${file.name}.version").writeText(nextVersion.toString(), Charsets.UTF_8)
         }
         file.writeText(content, Charsets.UTF_8)
         File(versionsDir, "${file.name}.version").writeText(nextVersion.toString(), Charsets.UTF_8)
+        pruneVersions(versionsDir, file.name, nextVersion)
         // 入口指针只随入口文件切换：写 scenarios.json 等辅助文件不得把"当前入口"
         // 指偏（listfiles 观察与回滚语义都以入口为准）。
         if (relativePath == GameFileWorkspaceEntryPoint.DEFAULT) {
             writePointer(relativePath)
         }
         return WorkspaceFile(relativePath, nextVersion, sha256(bytes), bytes.size)
+    }
+
+    /**
+     * 归档修剪：每个文件只保留最近 [KEEP_VERSIONS] 个历史版本（即 [v-KEEP, v-1]，
+     * 当前文件本身不计入归档）。长修复轮上百次写入 × 每次归档旧全文（几十至几百
+     * KB），不修剪会让 .versions 无限膨胀。
+     */
+    private fun pruneVersions(versionsDir: File, fileName: String, currentVersion: Int) {
+        if (currentVersion <= KEEP_VERSIONS) return
+        val minKeep = currentVersion - KEEP_VERSIONS
+        versionsDir.listFiles()?.forEach { archived ->
+            val prefix = archived.name.substringBefore('-', "")
+            val v = prefix.toIntOrNull() ?: return@forEach
+            if (v < minKeep && archived.name.endsWith("-$fileName")) archived.delete()
+        }
     }
 
     private fun currentPointer(): String = File(rootDir, POINTER_FILE).takeIf { it.isFile }?.readText()?.trim() ?: "index.html"
@@ -175,6 +169,9 @@ class GameFileWorkspace(private val rootDir: File) {
 
     companion object {
         const val POINTER_FILE = "current.txt"
+
+        /** 每个文件保留的历史版本数（超出部分在写入时修剪）。 */
+        const val KEEP_VERSIONS = 20
 
         fun sha256(text: String): String =
             MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))

@@ -23,7 +23,7 @@ class GameFileWorkspaceTest {
             val dir = File(System.getProperty("java.io.tmpdir"), "ws-version-${System.nanoTime()}")
             val ws = GameFileWorkspace(dir)
             val first = ws.writeInitial("index.html", "v1")
-            val second = ws.patchLines("index.html", 1, 1, "v2")
+            val second = ws.writeUpdated("index.html", "v2")
             assertEquals(1, first?.version)
             assertEquals(2, second?.version)
             assertEquals("v2", ws.read("index.html"))
@@ -42,22 +42,9 @@ class GameFileWorkspaceTest {
             ws.writeInitial("index.html", "v1")
             val rejected = ws.writeInitial("index.html", "v2")
             assertNull(rejected)
-            val badHash = ws.patchLines("index.html", 1, 1, "v2", expectedHash = "bad")
+            val badHash = ws.writeUpdated("index.html", "v2", expectedHash = "bad")
             assertNull(badHash)
             assertEquals("v1", ws.read("index.html"))
-            dir.deleteRecursively()
-        }
-    }
-
-    @Test
-    fun `行级 patch`() {
-        runBlocking {
-            val dir = File(System.getProperty("java.io.tmpdir"), "ws-patch-${System.nanoTime()}")
-            val ws = GameFileWorkspace(dir)
-            ws.writeInitial("index.html", "a\nb\nc")
-            val patched = ws.patchLines("index.html", 2, 3, "B\nC")
-            assertEquals("a\nB\nC", ws.read("index.html"))
-            assertEquals(2, patched?.version)
             dir.deleteRecursively()
         }
     }
@@ -74,6 +61,52 @@ class GameFileWorkspaceTest {
             assertTrue(File(dir, ".versions/1-index.html").exists())
             // 不存在的文件不允许走 writeUpdated（首次必须 writeInitial）
             assertNull(ws.writeUpdated("other.html", "x"))
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `delete 清理版本簿记避免跨会话版本串台`() {
+        runBlocking {
+            val dir = File(System.getProperty("java.io.tmpdir"), "ws-del-${System.nanoTime()}")
+            val ws = GameFileWorkspace(dir)
+            ws.writeInitial("index.html", "gameA-v1")
+            ws.writeUpdated("index.html", "gameA-v2")
+            ws.writeUpdated("index.html", "gameA-v3")
+            assertTrue(ws.delete("index.html"))
+
+            // 版本 marker 与归档随文件一并清理：删除→重建从 v1 重新计数，
+            // 上一款游戏的历史归档不得被新游戏的 v1 覆盖（版本串台）。
+            assertFalse(File(dir, ".versions/index.html.version").exists())
+            assertTrue(File(dir, ".versions").list().orEmpty().isEmpty())
+            assertNull(ws.read("index.html"))
+
+            val reborn = ws.writeInitial("index.html", "gameB-v1")
+            assertEquals(1, reborn?.version)
+            ws.writeUpdated("index.html", "gameB-v2")
+            assertEquals("gameB-v2", File(dir, "index.html").readText())
+            assertEquals("gameB-v1", File(dir, ".versions/1-index.html").readText())
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `归档滚动修剪只保留最近 KEEP_VERSIONS 个版本`() {
+        runBlocking {
+            val dir = File(System.getProperty("java.io.tmpdir"), "ws-prune-${System.nanoTime()}")
+            val ws = GameFileWorkspace(dir)
+            val total = GameFileWorkspace.KEEP_VERSIONS + 6
+            ws.writeInitial("index.html", "v1")
+            for (v in 2..total) ws.writeUpdated("index.html", "v$v")
+
+            val versionsDir = File(dir, ".versions")
+            val archives = versionsDir.listFiles().orEmpty()
+                .filter { it.name.endsWith("-index.html") }
+                .mapNotNull { it.name.substringBefore('-').toIntOrNull() }
+            assertTrue(archives.isNotEmpty())
+            assertEquals(GameFileWorkspace.KEEP_VERSIONS, archives.size)
+            assertEquals(total - GameFileWorkspace.KEEP_VERSIONS, archives.min())
+            assertEquals(total - 1, archives.max())
             dir.deleteRecursively()
         }
     }

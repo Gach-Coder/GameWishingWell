@@ -177,6 +177,45 @@ class OpenAiClientTest {
     }
 
     @Test
+    fun `零内容且无 DONE 的流判为可重试网络异常`() = runBlocking {
+        val server = MockWebServer()
+        // 连接被中途掐断：200 + SSE 头 + 零事件即关流（无 [DONE]）——
+        // 此前会作为"空回复"正常返回，绕过统一重试，表象是空转或非法工具参数
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody("")
+        )
+        server.start()
+
+        try {
+            client(server).streamChat(listOf(ChatMessage("user", "hi")), onDelta = {}, onDone = {})
+            fail("应当抛出 IOException（可重试网络异常）")
+        } catch (e: java.io.IOException) {
+            assertTrue(e.message.orEmpty().contains("连接提前关闭"))
+        }
+
+        server.shutdown()
+    }
+
+    @Test
+    fun `带 DONE 的空回复是合法空响应不报错`() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody("data: [DONE]\n\n")
+        )
+        server.start()
+
+        val resp = client(server).streamChat(listOf(ChatMessage("user", "hi")), onDelta = {}, onDone = {})
+        assertEquals("", resp.text)
+        assertTrue(resp.toolCalls.isEmpty())
+
+        server.shutdown()
+    }
+
+    @Test
     fun `流式 tool_calls 分片聚合`() = runBlocking {
         val server = MockWebServer()
         server.enqueue(

@@ -63,13 +63,6 @@ class GamePlanTest {
         assertTrue(GamePrompt.KNOWN_GAME_FIDELITY_RULE.contains("禁止替换成另一种玩法的通用小游戏"))
     }
 
-    @Test
-    fun `重组时需要重新策划的模块为新增或本轮点名`() {
-        val first = PlanningEngine.build(schemaOf("做一个塔防游戏，敌人按波次进攻"))
-        val second = schemaOf("再加个商店经济")
-        val touched = setOf("商店经济")
-        val replan = PlanningEngine.modulesNeedingReplan(second, first, touched)
-        assertTrue(replan.contains("商店经济"))
-        assertFalse(replan.contains("塔防"))
-    }
+    // 旧确认门"重组只重策划变动项"的 modulesNeedingReplan 已随未接线管线移除：
+    // 现行为是确认时对全部纳入系统统一定稿（draftWithLlm + finalize）。
 }

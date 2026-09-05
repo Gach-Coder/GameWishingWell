@@ -36,6 +36,15 @@ class HtmlEnhancerTest {
     }
 
     @Test
+    fun `无 head 无 html 只有 DOCTYPE 时注入在 DOCTYPE 之后`() {
+        // 脚本前插到 DOCTYPE 之前会触发 quirks 模式（视口/布局失真），必须让 DOCTYPE 保持最前
+        val html = "<!DOCTYPE html>\n<div>游戏</div>"
+        val out = HtmlEnhancer.inject(html)
+        assertTrue(out.trimStart().startsWith("<!DOCTYPE"))
+        assertTrue(out.indexOf("unhandledrejection") > out.indexOf("<!DOCTYPE"))
+    }
+
+    @Test
     fun `已有捕获器时不重复注入`() {
         val already = "<html><head><script>window.addEventListener('unhandledrejection', function(){});</script></head><body></body></html>"
         val out = HtmlEnhancer.inject(already)

@@ -40,9 +40,33 @@ class GameRepositoryTest {
 
             assertTrue(repo.renameGame(meta.id, "新名字"))
             assertEquals("新名字", repo.listGames().first { it.id == meta.id }.title)
+        }
+        dir.deleteRecursively()
+    }
 
-            assertTrue(repo.rollbackGame(meta.id))
-            assertEquals("<html>v1</html>", repo.loadGameHtml(meta.id))
+    @Test
+    fun `保存区归档滚动修剪只保留最近版本`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-prune-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            val meta = repo.saveGame(
+                "打地鼠", "描述",
+                mapOf("index.html" to "<html>v0</html>"),
+                listOf(ChatMessage("user", "做一个游戏"))
+            )
+            val total = GameRepository.KEEP_VERSIONS + 5
+            for (v in 1 until total) {
+                repo.overwriteGameFiles(
+                    meta.id,
+                    mapOf("index.html" to "<html>v$v</html>"),
+                    listOf(ChatMessage("user", "做一个游戏"))
+                )
+            }
+            val archives = File(File(dir, "games/${meta.id}"), ".versions").listFiles().orEmpty()
+                .filter { it.name.endsWith("-index.html") }
+                .mapNotNull { it.name.substringBefore('-').toIntOrNull() }
+            assertEquals(GameRepository.KEEP_VERSIONS, archives.size)
+            assertEquals(total - 1, archives.max())
         }
         dir.deleteRecursively()
     }
