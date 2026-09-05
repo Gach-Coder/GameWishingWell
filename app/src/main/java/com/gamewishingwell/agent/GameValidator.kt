@@ -36,21 +36,34 @@ data class ValidationReport(
  * 异常/console 采集）——静态解析器（Rhino/jsoup error tracking）与 Chromium 存在
  * 语法代差，class/可选链/spread/for-of 等合法写法会被误判，模型照假报错去修
  * 只会烧轮次。这里只保留没有代差问题的产品硬约束：
- * - 自包含：禁止外部/本地资源引用（离线可玩是产品承诺）；
- * - 安全契约：禁止 eval / new Function / 动态 require / import()。
+ * - 自包含：禁止外部网络资源（离线可玩是产品承诺）；本地文本资产（JS/CSS）允许
+ *   多文件相对引用，但引用的文件必须存在（运行前由 GameBundle 内联合并）；
+ *   二进制（图片/音频）本地引用仍然禁止（无法文本内联）；
+ * - 安全契约：禁止 eval / new Function / 动态 require / import()，并禁止
+ *   ES module 的静态 import/export（内联管道不做模块依赖图解析，多文件请用
+ *   普通 script 顺序加载）。
  */
 object GameValidator {
 
     const val FILE_INDEX_HTML = "index.html"
 
     private val forbiddenJsRegex = Regex("""\beval\s*\(|new\s+Function\s*\(|\brequire\s*\(|\bimport\s*\(""")
+    private val moduleSyntaxRegex = Regex(
+        """\bimport\s*(\{|\*)|\bimport\s+['"]|\bimport\s+[\w$]+\s+from\b|\bexport\s+(default\s+)?(function\b|class\b|const\b|let\b|var\b|\{)"""
+    )
     private val cssUrlRegex = Regex("""url\(\s*['"]?([^)'"\s]+)['"]?\s*\)""", RegexOption.IGNORE_CASE)
     private val externalUrlRegex = Regex("""(?:https?://|//[a-z][a-z0-9.-]*[/'"])""", RegexOption.IGNORE_CASE)
 
     fun validate(
         html: String,
         /** 本轮条件允许的引擎集合（条件引入机制）；缺省=全部内置引擎。 */
-        allowedEngines: Set<String> = GameEngines.BUNDLED.keys
+        allowedEngines: Set<String> = GameEngines.BUNDLED.keys,
+        /**
+         * 工作区文件存在性回调（多文件契约的裁决点）：非 null 时，本地 script/link
+         * 引用改为存在性校验（存在=合法多文件组织，缺失=error 引导模型先创建）；
+         * null（兼容回环等无工作区场景）维持单文件禁令——本地引用一律 error。
+         */
+        localFileExists: ((String) -> Boolean)? = null
     ): ValidationReport {
         if (html.isBlank()) {
             return ValidationReport(
@@ -69,19 +82,39 @@ object GameValidator {
             checks += ValidationIssue("resources", FILE_INDEX_HTML, 1, "禁止外部$what 资源：$src", "error")
         }
 
+        /** 本地引用分流：多文件模式查存在性，单文件模式一律禁止。 */
+        fun localRefIssue(src: String, what: String, hint: String): ValidationIssue? = when {
+            localFileExists == null ->
+                ValidationIssue(
+                    "resources", FILE_INDEX_HTML, 1,
+                    "本地$what 资源缺失（本模式要求自包含单文件，代码请直接写在 <script>/<style> 内联）：$src", "error"
+                )
+            !localFileExists(src) ->
+                ValidationIssue(
+                    "resources", FILE_INDEX_HTML, 1,
+                    "引用的本地$what 文件不存在：$src（$hint）", "error"
+                )
+            else -> null
+        }
+
         doc.getElementsByTag("script").forEach { el ->
             if (el.hasAttr("src")) {
                 val src = el.attr("src")
                 if (src.startsWith("http://") || src.startsWith("https://") || src.startsWith("//")) {
                     externalError("script", src, "JS")
                 } else {
-                    // 与本地图片/音频同判 error：单文件交付里本地 JS 同样无法解析（必然 404），
-                    // warning 不阻断交付会把必坏的文件放行给玩家。
-                    checks += ValidationIssue(
-                        "resources", FILE_INDEX_HTML, 1,
-                        "本地 JS 资源缺失（自包含游戏禁止引用本地文件，代码请直接写在 <script> 内联）：$src", "error"
-                    )
+                    localRefIssue(src, "JS", "请先 writefile 创建该文件并核对相对路径；入口 index.html 与其同目录")?.let { checks += it }
                 }
+            }
+        }
+        doc.select("link[rel=stylesheet][href]").forEach { el ->
+            val href = el.attr("href").trim()
+            when {
+                href.startsWith("http://") || href.startsWith("https://") || href.startsWith("//") ->
+                    externalError("css", href, "CSS")
+                GameBundle.isLocalRef(href) ->
+                    localRefIssue(href, "CSS", "请先 writefile 创建该样式文件并核对相对路径")?.let { checks += it }
+                else -> Unit
             }
         }
         doc.getElementsByTag("img").forEach { el ->
@@ -91,7 +124,7 @@ object GameValidator {
                     src.startsWith("http://") || src.startsWith("https://") || src.startsWith("//") ->
                         externalError("img", src, "图片")
                     src.isNotBlank() && !src.startsWith("data:") ->
-                        checks += ValidationIssue("resources", FILE_INDEX_HTML, 1, "本地图片资源缺失（自包含游戏禁止引用本地文件）：$src", "error")
+                        checks += ValidationIssue("resources", FILE_INDEX_HTML, 1, "本地图片资源缺失（二进制无法内联，图形请用 Canvas/矢量绘制）：$src", "error")
                 }
             }
         }
@@ -102,7 +135,7 @@ object GameValidator {
                     src.startsWith("http://") || src.startsWith("https://") || src.startsWith("//") ->
                         externalError("audio", src, "音频")
                     src.isNotBlank() && !src.startsWith("data:") ->
-                        checks += ValidationIssue("resources", FILE_INDEX_HTML, 1, "本地音频资源缺失（自包含游戏禁止引用本地文件）：$src", "error")
+                        checks += ValidationIssue("resources", FILE_INDEX_HTML, 1, "本地音频资源缺失（音频请用 WebAudio 振荡器程序化生成）：$src", "error")
                 }
             }
         }
@@ -124,6 +157,13 @@ object GameValidator {
             checks += ValidationIssue(
                 "static-runtime", FILE_INDEX_HTML, 1,
                 "安全契约禁止 eval / new Function / 动态 require / import()：${m.value}", "error"
+            )
+        }
+        moduleSyntaxRegex.findAll(html).forEach { m ->
+            checks += ValidationIssue(
+                "static-runtime", FILE_INDEX_HTML, 1,
+                "多文件游戏禁用 ES module 的 import/export（平台按普通 script 顺序内联合并，" +
+                    "跨文件请用全局变量/命名空间协作，不建依赖图）：${m.value.take(60)}", "error"
             )
         }
 

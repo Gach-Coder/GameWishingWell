@@ -470,8 +470,7 @@ object PlanningEngine {
         result += "外部模型/贴图资产（3D 几何与纹理一律程序化生成）"
         result += "联机对战、账号系统与服务端存档"
         result += "外部图片、音频、字体、CDN 与第三方 JS 库"
-        result += "eval / new Function / 动态 require / import()"
-        result += "多文件工程化构建（本轮只交付单个 index.html）"
+        result += "eval / new Function / 动态 require / import() 与 ES module 的 import/export"
         result += "照搬未授权商业游戏的美术素材与源码"
         return result.toList()
     }

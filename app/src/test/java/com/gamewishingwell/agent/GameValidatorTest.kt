@@ -50,11 +50,48 @@ class GameValidatorTest {
 
     @Test
     fun `本地 script src 与本地图片同为 error`() {
-        // 单文件交付里本地 JS 同样必然 404：曾只报 warning 不阻断，坏件会漏到玩家手里。
+        // 无工作区（兼容回环等单文件场景）：本地引用一律 error——单文件直跑必然 404。
         val html = "<html><body><script src=\"game.js\"></script><img src=\"sprite.png\"></body></html>"
         val report = GameValidator.validate(html)
         assertTrue(report.errors.any { it.category == "resources" && it.message.contains("game.js") })
         assertTrue(report.errors.any { it.category == "resources" && it.message.contains("sprite.png") })
+    }
+
+    @Test
+    fun `多文件模式-存在的本地 js 与 css 引用合法`() {
+        val html = "<html><head>" +
+            "<link rel=\"stylesheet\" href=\"css/style.css\">" +
+            "<script src=\"js/main.js\"></script>" +
+            "</head><body><script>window.__wwDebugState=function(){return{state:'p'}};</script></body></html>"
+        val report = GameValidator.validate(html, localFileExists = { it == "css/style.css" || it == "js/main.js" })
+        assertFalse(report.errors.any { it.category == "resources" })
+    }
+
+    @Test
+    fun `多文件模式-缺失的本地引用报错并引导创建`() {
+        val html = "<html><head><script src=\"js/missing.js\"></script></head><body></body></html>"
+        val report = GameValidator.validate(html, localFileExists = { false })
+        val err = report.errors.firstOrNull { it.message.contains("js/missing.js") }
+        assertTrue(err != null)
+        assertTrue(err!!.message.contains("writefile"))
+    }
+
+    @Test
+    fun `ES module 语法在多文件模式下被禁止`() {
+        // 内联管道不做模块依赖图解析：跨文件必须普通 script 顺序加载
+        val htmlImport = "<html><body><script>import { Enemy } from './enemy.js';</script></body></html>"
+        assertTrue(
+            GameValidator.validate(htmlImport).errors.any { it.message.contains("ES module") }
+        )
+        val htmlExport = "<html><body><script>export default function start(){};</script></body></html>"
+        assertTrue(
+            GameValidator.validate(htmlExport).errors.any { it.message.contains("ES module") }
+        )
+        // 普通 JS 不受影响
+        val plain = "<html><body><script>var important = 1; var exported = 2;</script></body></html>"
+        assertFalse(
+            GameValidator.validate(plain).errors.any { it.message.contains("ES module") }
+        )
     }
 
     @Test

@@ -18,7 +18,9 @@ object GameTools {
     const val EDIT_FILE = "editfile"
     const val APPEND_FILE = "appendfile"
 
-    private const val PATH_DESC = "工作区内的相对路径：index.html（游戏本体）或 scenarios.json（功能断言，均衡/精品档）"
+    private const val PATH_DESC =
+        "工作区内的相对路径：index.html（唯一入口）、js/*.js 或 css/*.css（多文件组织，" +
+            "由 index.html 相对路径引用，平台运行前自动合并）或 scenarios.json（功能断言，均衡/精品档）"
 
     /** 切片自适应阈值：不超过该行数的文件，切片请求一律整读返回。 */
     const val WHOLE_READ_MAX_LINES = 1200

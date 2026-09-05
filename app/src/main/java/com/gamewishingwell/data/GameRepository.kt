@@ -33,11 +33,15 @@ class GameRepository(private val context: Context) {
         /** 保存点目录名（保存时冻结的上下文快照，撤销锚点）。 */
         const val SAVEPOINT_DIR = ".savepoint"
 
+        /** 版本化归档目录名（与 GameFileWorkspace 的 .versions 约定一致）。 */
+        const val VERSIONS_DIR = ".versions"
+
+        /** 入口指针文件名（与 GameFileWorkspace 的 current.txt 约定一致）。 */
+        const val POINTER_FILE = "current.txt"
+
         /** 每个文件保留的历史版本数（超出部分在写入时修剪）。 */
         const val KEEP_VERSIONS = 20
-    }
-
-    private val json = Json {
+    }    private val json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true
     }
@@ -167,6 +171,26 @@ class GameRepository(private val context: Context) {
     suspend fun loadGameFile(gameId: Long, name: String): String? = withContext(Dispatchers.IO) {
         val f = File(File(gamesDir, gameId.toString()), name)
         if (f.isFile) f.readText(Charsets.UTF_8) else null
+    }
+
+    /**
+     * 读取保存区的全部游戏文本文件（多文件运行副本的合并素材）：排除平台簿记
+     * （.versions 归档、current.txt 指针、.sha256 校验）与会话上下文
+     * （session.json / agent_state.json / .savepoint）。键为文件相对路径，
+     * 仅用于按名取内容——不存在的引用取不到值（安全：不做路径拼接）。
+     */
+    suspend fun loadGameTextFiles(gameId: Long): Map<String, String> = withContext(Dispatchers.IO) {
+        val dir = File(gamesDir, gameId.toString())
+        if (!dir.isDirectory) return@withContext emptyMap()
+        dir.walkTopDown()
+            .filter { it.isFile }
+            .map { it.relativeTo(dir).invariantSeparatorsPath }
+            .filter { rel ->
+                rel != "session.json" && rel != "agent_state.json" &&
+                    rel != POINTER_FILE && !rel.endsWith(".sha256") &&
+                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$VERSIONS_DIR/")
+            }
+            .associateWith { rel -> File(dir, rel).readText(Charsets.UTF_8) }
     }
 
     suspend fun loadGameSession(gameId: Long): List<ChatMessage> = withContext(Dispatchers.IO) {

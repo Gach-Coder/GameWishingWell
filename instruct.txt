@@ -43,7 +43,9 @@
    不能靠"应用信息"的安装时间判断版本新旧）。
    （注：Deepseek模型为deepseek-v4-flash和deepseek-v4-pro,已弃用deepseek-chat）
 
-核心思路：游戏不是编译出来的，而是 AI 生成的文本 = 可运行产物（HTML 文件），
+核心思路：游戏不是编译出来的，而是 AI 生成的文本 = 可运行产物（HTML+JS+CSS 文件组：
+  index.html 唯一入口 + 相对路径引用的 js/css 辅助文件；平台加载前经 GameBundle 内联合并为
+  自包含单页面，真机与沙箱共用同一合并管道），
 运行期由 Android WebView（Chromium 内核）解释执行。无编译环节，生成即玩；
 鸿蒙 ArkWeb 同为 Chromium 内核，双端可复用。
 
@@ -62,7 +64,7 @@
   cannon=3D+物理可选（真刚体需求；体素 AABB 手写更简）；tween=精品档可选（表现层补间）。
   提示词只"教"满足条件的引擎（GamePrompt.engineContract 按条件组装范式段：必选/可选措辞），
   GameValidator.validate(html, allowedEngines) 打回条件不符的声明（如贪吃蛇声明 matter）；
-- 游戏文件保持文本自包含（不含资源引用），离线可玩承诺与外部资源禁令不变；
+- 游戏文件保持文本自包含（js/css 多文件相对引用，运行前平台内联合并；二进制资源仍禁止），离线可玩承诺与外部资源禁令不变；
 - 引擎准入条件：单文件无依赖（UMD）、版本锁定、真机与沙箱注入一致、提示词有使用范式；
   新增引擎 = GameEngines 注册表加一行 + assets 放文件 + 范式文案 + 单测。
 
@@ -261,7 +263,8 @@ Agent处理message流程如下：
 			静态解析校验（Rhino 语法/no-undef/jsoup HTML 配对）已全部移除——解析器与 Chromium 存在语法代差，
 			class/可选链/空值合并/spread/for-of/箭头默认参数等合法写法会被误判（实测 15 样本误判 7 个），
 			模型照假报错去修只会烧轮次；语法错误的捕获交给沙箱（Chromium 自身即最好的解析器，SyntaxError 会出现在 console error）
-			仅保留轻量产品契约检查（GameValidator ~60行，纯正则/标签枚举，无代差）：自包含（禁外部 CDN/本地资源引用，离线可玩承诺）
+			仅保留轻量产品契约检查（GameValidator，纯正则/标签枚举，无代差）：自包含（禁外部 CDN；本地 js/css 引用按工作区存在性裁决——
+			  存在=合法多文件组织，缺失=error 引导先 writefile 创建；本地二进制图片/音频仍禁；并禁 ES module import/export），离线可玩承诺
 			与安全禁令（eval/new Function/动态 require/import()）
 		校验与交付五条保证：
 			① 沙箱模拟用户环境：与真实游戏页（GameScreen）一致的 WebView 配置（JS/domStorage/wideViewport/overview）
@@ -392,6 +395,7 @@ GameWishingWell/
       │  │  │  ├─ GameRecognition.kt     # 识别层：会话级 Game Schema JSON、白名单校验、确认门；IntentEngine 纯文本特征正则
       │  │  │  ├─ GamePlan.kt            # 策划层：LLM 逐系统阐述具体实现、P0/P1/P2、验收清单
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
+	      │  │  │  ├─ GameBundle.kt          # 多文件运行前合并：入口 index.html + 工作区 js/css 相对引用 → 内联为自包含页面（真机/沙箱同管道）
 	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单）；运行校验由沙箱承担
 	      │  │  │  ├─ GameEngines.kt        # 内置引擎条件注册表（ww-engine 解析/BUNDLED/allowedFor 条件矩阵）
 	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控
@@ -553,4 +557,4 @@ Android Studio 运行方式：
   DeepSeek 默认模型为 deepseek-v4-flash（deepseek-chat 已弃用），请求不携带 max_tokens（输出长度不设限）；
   思考能力由设置页开关控制（默认关闭）。
 - 游戏白屏：确认生成 HTML 中 canvas 使用 vh/100% 也可渲染；HtmlEnhancer 已做视口修复，
-  但模型仍应遵守“自包含、无外部资源”的提示词约束。
+  但模型仍应遵守“自包含（多文件仅限 js/css 文本）、无外部资源、引用文件真实存在”的提示词约束。

@@ -1329,7 +1329,9 @@ class GameAgent(
         val scopeFence = existingHtml != null && !allowEntryRewrite
         val executor = GameToolExecutor(
             workspace,
-            validate = { GameValidator.validate(it, allowedEngines) }
+            // 多文件契约：本地 script/link 引用按工作区存在性裁决（存在=合法组织，
+            // 缺失=error 引导模型先 writefile 创建），外部资源与二进制禁令不变。
+            validate = { GameValidator.validate(it, allowedEngines, localFileExists = { rel -> workspaceFileExists(rel) }) }
         )
 
         var outcome = runToolLoop(
@@ -1554,7 +1556,7 @@ class GameAgent(
                 // 模型声称完成：以工作区内容为准重新校验，通过且（修改轮）确实
                 // 发生了内容变化才接受；防止模型不做任何修改就宣称完成。
                 if (content != null) {
-                    val report = GameValidator.validate(content, allowedEngines)
+                    val report = GameValidator.validate(content, allowedEngines, localFileExists = { rel -> workspaceFileExists(rel) })
                     lastReport = report
                     if (!report.hasErrors) {
                         val changed = seedHash == null || GameFileWorkspace.sha256(content) != seedHash
@@ -1569,7 +1571,8 @@ class GameAgent(
                             // 横板游戏以横屏视口运行（与真实游戏页一致）并断言主画布方向。
                             val expectLandscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
                             val scenariosJson = smokeScenariosJson(workspace, tier)
-                            val smoke = if (tier == QualityTier.FAST) null else runSmokeTest(content, scenariosJson, expectLandscape)
+                            val smoke = if (tier == QualityTier.FAST) null else
+                                runSmokeTest(content, scenariosJson, expectLandscape, files = { rel -> workspaceRead(rel) })
                             sandboxAttempts += smoke?.attempts ?: 0
                             if (smoke != null && smoke.message?.startsWith("sandbox-infra") == true) {
                                 failTurn(
@@ -2093,6 +2096,23 @@ class GameAgent(
             GameFileWorkspace(editingWorkspaceDir(gameId)).read(GameFileWorkspaceEntryPoint.DEFAULT)
         }.getOrNull()
 
+    // ---------- 多文件运行副本（编辑区） ----------
+
+    /** 当前会话工作区的辅助文件读取器（路径守卫在 GameFileWorkspace.resolve 内）。 */
+    fun workspaceRead(rel: String): String? =
+        runCatching { GameFileWorkspace(gameWorkspaceDir()).read(rel) }.getOrNull()
+
+    /** 当前会话工作区是否存在某文件（多文件契约的存在性裁决）。 */
+    private fun workspaceFileExists(rel: String): Boolean =
+        runCatching { GameFileWorkspace(gameWorkspaceDir()).resolve(rel)?.isFile == true }.getOrDefault(false)
+
+    /**
+     * 编辑区运行副本（预览入口）：入口 html（会话当前发布版本）+ 工作区辅助文件
+     * 经 GameBundle 内联为自包含页面——多文件与单文件游戏对 GameScreen 完全同构。
+     */
+    fun runnablePreviewHtml(): String? =
+        _session.value.currentHtml?.let { GameBundle.inline(it) { rel -> workspaceRead(rel) } }
+
     /** 把发布版本写回编辑区工作区（内容一致则跳过）。 */
     private suspend fun syncWorkspaceToPublished(html: String) {
         val workspace = GameFileWorkspace(gameWorkspaceDir())
@@ -2107,15 +2127,15 @@ class GameAgent(
 
     /**
      * 工作区与当前代码版本对齐：内容哈希一致则跳过，否则重置后写入 v1 种子。
-     * 无种子（首次创建）时清掉跨会话残留的旧文件——工作区目录按会话复用，
-     * 旧 index.html 若不清，会被新会话误当成"已有游戏"。
+     * 无种子（首次创建）时清空整个工作区——目录按会话复用，旧 index.html 与
+     * 多文件形态下的旧辅助文件（js/css/scenarios）不清，会被新会话误当成
+     * "已有游戏"并混进保存/交付链路。
      */
     private suspend fun seedWorkspace(workspace: GameFileWorkspace, html: String?) {
         if (html.isNullOrBlank()) {
-            workspace.delete(GameFileWorkspaceEntryPoint.DEFAULT)
-            // 全新游戏不得继承上一款游戏的回归断言（字段体系完全不同，
-            // 旧 scenarios.json 会让新游戏平白背上必失败的断言）。
-            workspace.delete(GameScenarios.FILE)
+            // 全新游戏从零开始：入口、回归断言与上一款游戏的辅助文件一并清除
+            //（旧 scenarios.json 的字段体系与新手游完全不同，平白背上必失败的断言）。
+            workspace.reset()
             return
         }
         val current = workspace.read(GameFileWorkspaceEntryPoint.DEFAULT)
@@ -2166,7 +2186,13 @@ class GameAgent(
     private suspend fun runSmokeTest(
         html: String,
         scenariosJson: String? = null,
-        landscape: Boolean = false
+        landscape: Boolean = false,
+        /**
+         * 多文件游戏的辅助文件读取器（工作区相对路径 → 内容）：沙箱跑的是
+         * "内联合并后的自包含页面"，与真实游戏页（GameViewModel 同经 GameBundle）
+         * 共用同一合并管道——真机与沙箱行为一致。null（兼容回环）= 单文件直跑。
+         */
+        files: ((String) -> String?)? = null
     ): SmokeTestResult? {
         // null = 无可用 runner（JVM 单测）：跳过沙箱。真机上 runner 恒存在，
         // 设施异常一律返回哨兵并以"运行验证环境异常"退出——不借设施问题放行交付。
@@ -2178,10 +2204,11 @@ class GameAgent(
             "冒烟测试中：正在沙箱验证游戏可运行"
         }
         _session.update { it.copy(agentStage = stage) }
+        val prepared = files?.let { GameBundle.inline(html, it) } ?: html
         return try {
             // 精品档（deep 模式）：真实调用 restart() 完整重开后复跑半程帧。
             val result = runner.run(
-                html,
+                prepared,
                 deep = QualityTier.normalize(_session.value.qualityTier) == QualityTier.PREMIUM,
                 scenariosJson = scenariosJson,
                 landscape = landscape

@@ -91,6 +91,15 @@ class GameFileWorkspace(private val rootDir: File) {
         deleted
     }
 
+    /**
+     * 清空整个工作区（文件与版本簿记一并移除）：全新游戏从零开始——
+     * 多文件形态下旧游戏的辅助文件（js/css/scenarios）若不清理，
+     * 会被新会话的保存/交付链路误当作本游戏的文件带走（孤儿残留）。
+     */
+    suspend fun reset() = mutex.withLock {
+        rootDir.listFiles()?.forEach { it.deleteRecursively() }
+    }
+
     fun manifest(): FileManifest {
         val files = rootDir.walkTopDown()
             .filter { it.isFile && it.name != POINTER_FILE && ".versions" !in it.path }

@@ -3,6 +3,7 @@ package com.gamewishingwell.ui.viewmodels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.gamewishingwell.agent.GameAgent
+import com.gamewishingwell.agent.GameBundle
 import com.gamewishingwell.agent.GameSchema
 import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.data.GameRepository
@@ -46,10 +47,12 @@ class GameViewModel(
                     // 预览：直接播放当前编辑会话（编辑区）的最新版本。编辑区与运行区
                     // 相互独立后，未按保存按钮写入的修改只存在于编辑区——立即游玩
                     // 必须走会话内存版本，而不是运行区（games/<id>）的入库版本。
+                    // 多文件游戏经 GameBundle 把工作区辅助文件（js/css）内联进入口
+                    // html，GameScreen 拿到的仍是自包含单页面（与单文件游戏同构）。
                     source == "preview" -> {
                         val s = agent.session.value
                         Triple(
-                            s.currentHtml,
+                            agent.runnablePreviewHtml(),
                             gameId.takeIf { it > 0 },
                             s.gameSchema?.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
                         )
@@ -57,7 +60,10 @@ class GameViewModel(
                     source == "game" && gameId > 0 -> {
                         val h = repository.loadGameHtml(gameId)
                         if (h != null) repository.touchPlay(gameId)
-                        Triple(h, gameId, sessionLandscape(repository.loadGameAgentState(gameId)))
+                        // 运行区多文件：入口 + 保存区文本文件（js/css 等）内联合并
+                        val files = if (h != null) repository.loadGameTextFiles(gameId) else emptyMap()
+                        val runnable = h?.let { GameBundle.inline(it) { rel -> files[rel] } }
+                        Triple(runnable, gameId, sessionLandscape(repository.loadGameAgentState(gameId)))
                     }
                     else -> {
                         Triple(repository.loadDraftHtml(), null, sessionLandscape(repository.loadDraftAgentState()))

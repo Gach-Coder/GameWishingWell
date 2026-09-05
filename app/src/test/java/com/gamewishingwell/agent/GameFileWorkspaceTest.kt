@@ -91,6 +91,30 @@ class GameFileWorkspaceTest {
     }
 
     @Test
+    fun `reset 清空整个工作区-新游戏不继承旧辅助文件`() {
+        runBlocking {
+            val dir = File(System.getProperty("java.io.tmpdir"), "ws-reset-${System.nanoTime()}")
+            val ws = GameFileWorkspace(dir)
+            ws.writeInitial("index.html", "old-entry")
+            ws.writeInitial("js/main.js", "old-js")
+            ws.writeInitial("scenarios.json", "{\"scenarios\":[]}")
+            ws.writeUpdated("js/main.js", "old-js-v2")
+
+            ws.reset()
+            assertNull(ws.read("index.html"))
+            assertNull(ws.read("js/main.js"))
+            assertNull(ws.read("scenarios.json"))
+            // 整目录清空（含 .versions 簿记）：新游戏从零开始
+            assertTrue(dir.listFiles().orEmpty().isEmpty())
+
+            // 重建从 v1 干净起算
+            val reborn = ws.writeInitial("index.html", "new-entry")
+            assertEquals(1, reborn?.version)
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `归档滚动修剪只保留最近 KEEP_VERSIONS 个版本`() {
         runBlocking {
             val dir = File(System.getProperty("java.io.tmpdir"), "ws-prune-${System.nanoTime()}")
