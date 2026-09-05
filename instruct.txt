@@ -36,8 +36,8 @@
 		  编辑对话的”立即游玩”预览编辑区最新版本（不入运行区）；重新进入编辑对话从编辑区续作（未保存修改不丢）。
 		- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
-   DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 小米 MiMo / OpenRouter / 自定义，
-   支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”。
+   DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 小米 MiMo / MiniMax / OpenRouter / 自定义，
+   支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”；模型名称可自由编辑并带服务商下拉（可选清单=ProviderPreset.models，首位即默认，手输清单外模型同样有效）。
    页面最下方显示 版本号 + 软件编译时间（BUILD_TIME，构建时写入 BuildConfig）——
    用于确认设备上运行的构建版本（Android Studio Apply Changes 热更新不刷新系统安装时间，
    不能靠"应用信息"的安装时间判断版本新旧）。
@@ -308,14 +308,21 @@ Agent处理message流程如下：
 
   厂商           baseUrl							默认模型								协议					max_tokens  关闭思考
   -----------------------------------------------------------------------------------------------------------------------
-  DeepSeek		https://api.deepseek.com/v1		deepseek-v4-flash					OPENAI_COMPATIBLE	不发送     否
+  DeepSeek		https://api.deepseek.com/v1		deepseek-v4-flash（可选 deepseek-v4-pro）					OPENAI_COMPATIBLE	不发送     否
   Kimi			https://api.moonshot.cn/v1		moonshot-v1-8k     					OPENAI_COMPATIBLE   不发送     否
   OpenAI		https://api.openai.com/v1		gpt-4o-mini        					OPENAI_COMPATIBLE	不发送     否
   Claude		https://api.anthropic.com		claude-sonnet-4-6					ANTHROPIC           64000*     否
   智谱 GLM		https://open.bigmodel.cn/api/paas/v4	glm-5.3-flash					OPENAI_COMPATIBLE	不发送     否
   小米 MiMo		https://api.xiaomimimo.com/v1	mimo-v2.5							OPENAI_COMPATIBLE	不发送     否
-  OpenRouter		https://openrouter.ai/api/v1	（暂缺，自填"厂商/模型名"，如 deepseek/deepseek-chat-v3）	OPENAI_COMPATIBLE	不发送     否
+  MiniMax		https://api.minimaxi.com/v1	MiniMax-M3						OPENAI_COMPATIBLE	不发送     否
+  OpenRouter		https://openrouter.ai/api/v1	z-ai/glm-5.2:free（免费端点，限流；可改换"厂商/模型名"）	OPENAI_COMPATIBLE	不发送     否
   自定义         （留空自填）                    （留空自填）       						OPENAI_COMPATIBLE   不发送     否
+
+（模型下拉可选清单——ProviderPreset.models：DeepSeek=deepseek-v4-flash/v4-pro；Kimi=moonshot-v1-8k/32k/128k/kimi-k2-turbo-preview；
+  OpenAI=gpt-4o-mini/gpt-4o/gpt-4.1-mini/gpt-4.1/o4-mini；Claude=claude-sonnet-4-6/claude-opus-4-6/claude-haiku-4-5；
+  智谱=glm-5.3-flash/glm-5.3/glm-4.6/glm-4-flash；小米=mimo-v2.5/mimo-v2.5-pro；MiniMax=MiniMax-M3/M2.7/M2.5；
+  OpenRouter=全部免费端点对话模型（快照 2026-09-05，同步自 openrouter.ai/models?variant=free，已排除
+  音频输出的 lyria 系与无工具调用的 content-safety 分类器，仅保留 text-out 且支持 tools 的 19 个）；自定义=纯手输。）
 
 （*Anthropic API 强制要求 max_tokens 字段，发送模型输出上限使其不构成实际限制；
   OpenAI 兼容协议一律不发送 max_tokens——输出长度由网关按模型上限裁定，不人为设限。）

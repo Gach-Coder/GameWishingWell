@@ -73,6 +73,7 @@ fun SettingsScreen() {
     var thinkingEnabled by remember { mutableStateOf(settings.thinkingEnabled) }
     var showKey by remember { mutableStateOf(false) }
     var providerMenu by remember { mutableStateOf(false) }
+    var modelMenu by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         providerId = settings.providerId
@@ -177,20 +178,49 @@ fun SettingsScreen() {
                 modifier = Modifier.fillMaxWidth()
             )
 
-            OutlinedTextField(
-                value = model,
-                onValueChange = { model = it },
-                label = { Text("模型名称") },
-                // 预设默认模型暂缺的服务商：占位提示模型 ID 格式（OpenRouter 用"厂商/模型名"，
-                // 自定义网关格式任意）；留空时 isConfigured 不通过，必须自填后才能测试与生成。
-                placeholder = when (providerId) {
-                    "openrouter" -> {{ Text("如 deepseek/deepseek-chat-v3（厂商/模型名）") }}
-                    "custom" -> {{ Text("自填该网关的模型名") }}
-                    else -> null
-                },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+            // 模型名称：可编辑 + 服务商下拉（可选清单来自 ProviderPreset.models，首位即默认）。
+            // 手输清单外的模型名同样有效——自定义网关/新模型无需改代码；custom 无清单不提供下拉。
+            val modelOptions = currentPreset?.models.orEmpty()
+            ExposedDropdownMenuBox(
+                expanded = modelMenu,
+                onExpandedChange = { if (modelOptions.isNotEmpty()) modelMenu = it }
+            ) {
+                OutlinedTextField(
+                    value = model,
+                    onValueChange = { model = it },
+                    label = { Text("模型名称") },
+                    // 预设默认模型暂缺的服务商：占位提示模型 ID 格式（OpenRouter 用"厂商/模型名"，
+                    // 自定义网关格式任意）；留空时 isConfigured 不通过，必须自填后才能测试与生成。
+                    placeholder = when (providerId) {
+                        "openrouter" -> {{ Text("如 deepseek/deepseek-chat-v3（厂商/模型名）") }}
+                        "custom" -> {{ Text("自填该网关的模型名") }}
+                        else -> null
+                    },
+                    singleLine = true,
+                    trailingIcon = if (modelOptions.isNotEmpty()) {
+                        { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelMenu) }
+                    } else null,
+                    modifier = Modifier
+                        .menuAnchor(MenuAnchorType.PrimaryEditable)
+                        .fillMaxWidth()
+                )
+                if (modelOptions.isNotEmpty()) {
+                    ExposedDropdownMenu(
+                        expanded = modelMenu,
+                        onDismissRequest = { modelMenu = false }
+                    ) {
+                        modelOptions.forEach { m ->
+                            DropdownMenuItem(
+                                text = { Text(m) },
+                                onClick = {
+                                    model = m
+                                    modelMenu = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
 
             Row(
                 Modifier.fillMaxWidth(),
