@@ -101,8 +101,10 @@ class GameToolExecutor(
                 call, ok = false,
                 observation = "参数不是合法 JSON 对象：${e.message}" +
                     if (truncated) {
-                        "（输出在工具参数中途被截断——内容过长）。请改用 editfile 做小范围/整段替换，" +
-                            "或用 appendfile 分段追加，不要原样重发整份内容。"
+                        "（输出在工具参数中途被截断——单次内容过长，实测多见于免费/长输出模型）。" +
+                            "请改用 editfile 做小范围/整段替换，或用 appendfile 分段追加，" +
+                            "或将大文件拆成多个小文件（如 js/main.js、js/systems.js）分次 writefile，" +
+                            "不要原样重发整份内容。"
                     } else {
                         ""
                     }

@@ -106,12 +106,60 @@ internal fun formatAgentDuration(ms: Long): String {
  * - 账户额度/计费类不可重试且需要如实的用户文案——GLM 以 429+code1113 表达"余额不足"、
  *   DeepSeek 以 402 表达 Insufficient Balance；这类确定性失败若按 429 当限流重试，
  *   会白烧退避时间并把"服务不可用"伪装成"网络波动"（实测连重试 4 次后仍报网络异常）。
+ * - 每日免费配额耗尽（OpenRouter free_tier_daily 等）同理：重置点是次日，
+ *   立即失败并指引换模型/明早再试——实测曾 5 次重试烧掉 110s 后仍误报网络异常。
  * - 鉴权/模型不存在类同理：重试无意义，直接以服务状态文案失败。
+ */
+/**
+ * LLM 失败分类（internal 供单测）。
+ *
+ * 根除性纪律：**"网络问题"只留给真传输类失败**（IOException/超时/连接中断/5xx/
+ * 过载/分钟级限流——它们重试有意义且通常是网络环境问题）；一切"请求到达了
+ * 服务方并被拒绝"的 LlmError（含 API 状态码或错误类型）都是 LLM 服务侧问题，
+ * 必须给出如实的服务状态文案，不得伪装成"网络波动"（agent.log 实测曾出现
+ * 400 Provider returned error、每日配额 429、402 余额全部落到网络文案）。
+ *
+ * 已知细分：余额/credits 耗尽（GLM 429+1113、DeepSeek 402、OpenRouter credits）、
+ * 每日免费配额（free_tier_daily，重置点为次日）、上下文超长（换大上下文模型）、
+ * 模型名无效/下线、鉴权、内容安全拦截；其余 4xx 走通用"服务方拒绝"文案。
  */
 internal object LlmFailureClassifier {
 
     private val BALANCE_PATTERN = Regex(
-        "API 错误 402|余额|insufficient[_\\s]?balance|arrear|欠费|充值|资源包|\"code\":\"1113\"",
+        "API 错误 402|余额|insufficient[_\\s]?balance|insufficient[_\\s]?credits|" +
+            "spending[_\\s]?cap|out[_\\s]?of[_\\s]?credits|arrear|欠费|充值|资源包|\"code\":\"1113\"",
+        RegexOption.IGNORE_CASE
+    )
+
+    /**
+     * 每日免费配额耗尽型限流（实测 OpenRouter 样本："Rate limit exceeded:
+     * free-models-per-day" + limit_source=free_tier_daily + X-RateLimit-Reset）。
+     * 与分钟级真限流的区别：重置点是"次日"，重试到天亮也没有意义——必须立刻
+     * 如实失败（实测曾被当可重试网络问题，5 次尝试烧掉 110s 后仍报"网络连接异常"）。
+     */
+    private val DAILY_QUOTA_PATTERN = Regex(
+        "free[_-]?tier[_-]?daily|free-models-per-day|per-day|daily[_\\s]?(limit|quota)|quota[_\\s]?exceeded",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** 上下文/请求体超长：修复轮带着大文件与长历史时必现，重试无意义、指引换模型。 */
+    private val CONTEXT_LENGTH_PATTERN = Regex(
+        "context[_\\s]?length|context[_\\s]?limit|maximum[_\\s]?context|prompt is too long|" +
+            "too many tokens|payload too large|request (?:entity )?too large|reduce the (?:length|prompt)|" +
+            "exceeds the (?:model|maximum|context)|input.*too.*long|API 错误 413",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** 模型名无效/已下线（覆盖各家措辞变体；"暂时不可用"类瞬时态走 5xx/overloaded 分支）。 */
+    private val MODEL_INVALID_PATTERN = Regex(
+        "invalid[_\\s]?model|unknown[_\\s]?model|no such model|model_not_found|" +
+            "model.*(not.*(found|exist|available)|deprecat|does not exist)",
+        RegexOption.IGNORE_CASE
+    )
+
+    /** 内容安全/审核拦截：调整需求或换模型才可能解决。 */
+    private val CONTENT_POLICY_PATTERN = Regex(
+        "content[_\\s]?(filter|policy|moderation)|safety system|flagged as|敏感词|内容安全",
         RegexOption.IGNORE_CASE
     )
 
@@ -120,8 +168,21 @@ internal object LlmFailureClassifier {
         return BALANCE_PATTERN.containsMatchIn(msg)
     }
 
-    /** 可重试判定：IO 异常、超时/连接类文本、服务端过载（5xx / 429 真限流 / overloaded）。 */
+    /** 每日配额耗尽（区别于分钟级真限流）：不可重试，给换模型/明早再试的如实指引。 */
+    fun isDailyQuotaExhausted(e: Exception): Boolean {
+        val msg = e.message ?: return false
+        return DAILY_QUOTA_PATTERN.containsMatchIn(msg)
+    }
+
+    fun isContextTooLong(e: Exception): Boolean {
+        val msg = e.message ?: return false
+        return CONTEXT_LENGTH_PATTERN.containsMatchIn(msg)
+    }
+
+    /** 可重试判定（= 真传输类/瞬时服务端问题）：IO 异常、超时/连接类文本、5xx、分钟级 429、过载。
+     *  细分检查按"最具体的先判"排序，quota 先于 balance（免费配额文案常含 credits 字样）。 */
     fun isRetryable(e: Exception): Boolean {
+        if (isDailyQuotaExhausted(e)) return false
         if (isBalanceExhausted(e)) return false
         if (e is IOException) return true
         val msg = e.message ?: ""
@@ -134,19 +195,30 @@ internal object LlmFailureClassifier {
     }
 
     /**
-     * 非重试失败的如实用户文案（LLM 服务状态，不是技术细节）；null=走通用网络失败文案。
+     * 非重试失败的如实用户文案（LLM 服务状态，不是技术细节）。
+     * null 只留给 IOException 等真传输类（走通用网络失败文案）——其余 LlmError
+     * （请求已到达服务方并被拒绝）一律有专属或通用服务文案，根除"LLM 问题伪装成网络问题"。
      */
     fun userMessage(e: Exception): String? {
         val msg = e.message ?: return null
         return when {
+            isDailyQuotaExhausted(e) ->
+                "今日免费模型额度已用完（服务商每日限额），明日自动恢复，进度已保留。可在设置中更换模型或服务商后继续。"
             isBalanceExhausted(e) ->
                 "LLM 服务不可用：账户余额不足或配额已耗尽，进度已保留。请到服务商账户充值后重试。"
+            isContextTooLong(e) ->
+                "本轮对话与游戏代码的总量已超过模型上下文上限，进度已保留。请在设置中更换更大上下文的模型，或开新对话继续。"
+            MODEL_INVALID_PATTERN.containsMatchIn(msg) || Regex("API 错误 404").containsMatchIn(msg) ->
+                "LLM 服务不可用：模型或地址不可用，进度已保留。请在设置中检查模型名与 Base URL。"
             Regex("API 错误 40[13]").containsMatchIn(msg) ||
                 msg.contains(Regex("invalid[_\\s]?api[_\\s]?key|authentication|unauthorized", RegexOption.IGNORE_CASE)) ->
                 "LLM 服务不可用：API Key 无效或无访问权限，进度已保留。请在设置中检查密钥。"
-            Regex("API 错误 404").containsMatchIn(msg) ||
-                msg.contains(Regex("model.*(not.*(found|exist)|unavailable)", RegexOption.IGNORE_CASE)) ->
-                "LLM 服务不可用：模型或地址不可用，进度已保留。请在设置中检查模型名与 Base URL。"
+            CONTENT_POLICY_PATTERN.containsMatchIn(msg) ->
+                "请求被模型内容安全策略拦截，进度已保留。请调整需求描述，或在设置中更换模型。"
+            e is com.gamewishingwell.llm.LlmError && msg.contains("API 错误") ->
+                // 到达了服务方但被拒绝的其余错误（4xx/网关拒绝/上游 Provider returned error 等）：
+                // 如实归类为 LLM 服务问题（重试同一请求通常无效），不再伪装成网络异常。
+                "LLM 服务不可用：服务方拒绝了本次请求，进度已保留。请重试一次；若反复出现，请在设置中更换模型或服务商。"
             else -> null
         }
     }
@@ -2481,7 +2553,9 @@ class GameAgent(
                 if (backoffMs == null || !LlmFailureClassifier.isRetryable(e)) throw e
                 alog("LLM 调用失败（第 $attempt 次），${backoffMs / 1000}s 后自动重试：" +
                     "${e.javaClass.simpleName}: ${e.message?.take(140)}")
-                _session.update { it.copy(agentStage = "网络波动，正在自动重试（第 $attempt/${LLM_RETRY_BACKOFF_MS.size} 次）…") }
+                // 重试的都是传输/瞬时服务端类（IO/超时/5xx/分钟级限流/过载）：
+                // "服务波动"如实涵盖两类，不再把服务端问题单独说成网络问题。
+                _session.update { it.copy(agentStage = "服务波动，正在自动重试（第 $attempt/${LLM_RETRY_BACKOFF_MS.size} 次）…") }
                 delay(backoffMs)
             }
         }
