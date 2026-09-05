@@ -140,6 +140,8 @@ class OpenAiCompatibleClient(
             var lastFinishReason: String? = null
             var lastPayloadTail: String? = null
             var endedByDone = false
+            var nonDataLines = 0
+            var nonDataSnippet: String? = null
             val text = StringBuilder()
             val aggregator = ToolCallAggregator()
             while (true) {
@@ -155,7 +157,11 @@ class OpenAiCompatibleClient(
                         val delta = el["choices"]?.jsonArray?.firstOrNull()
                             ?.jsonObject?.get("delta")?.jsonObject
                         val content = delta?.get("content")?.jsonPrimitive?.contentOrNull
+                        // 思考增量的两种字段名都要认：DeepSeek/GLM 系用 reasoning_content，
+                        // OpenRouter 统一字段是 reasoning——不解析它会把思考流当"零内容"，
+                        // 空流守卫随之误判网络异常（思考模式特有的假网络错误）。
                         val reasoning = delta?.get("reasoning_content")?.jsonPrimitive?.contentOrNull
+                            ?: delta?.get("reasoning")?.jsonPrimitive?.contentOrNull
                         val toolCallDeltas = delta?.get("tool_calls")?.jsonArray
                         if (toolCallDeltas != null) aggregator.accept(toolCallDeltas)
                         if (content != null) {
@@ -168,6 +174,10 @@ class OpenAiCompatibleClient(
                             onThinking(reasoning)
                         }
                     } catch (e: Exception) { /* 忽略单帧解析失败 */ }
+                } else if (line.isNotBlank()) {
+                    // 非 data 行（SSE 注释/网关错误页片段）：留痕供异常归因
+                    nonDataLines++
+                    if (nonDataSnippet == null) nonDataSnippet = line.trim().take(120)
                 }
             }
             val toolCalls = aggregator.build()
@@ -179,9 +189,11 @@ class OpenAiCompatibleClient(
             // 连接被中途掐断（网关/代理/移动网络抖动）时 readUtf8Line 返回 null 正常退出循环——
             // 零内容 + 零工具调用 + 未收到 [DONE] 属于"假成功"：不抛错就会绕过统一重试，
             // 上层只能看到空回复/非法工具参数，表象是空转或莫名失败。显性化为可重试
-            // IOException（已带部分内容时保持旧行为：尽力返回已收内容，由上层处置）。
+            // IOException（已带部分内容/思考增量时保持旧行为：尽力返回已收内容）。
+            // 思考增量计入判定：思考后未产出正文就终止的流不再误判为空流。
             if (!endedByDone && contentChars == 0L && reasoningChars == 0L && toolCalls.isEmpty()) {
-                throw IOException("连接提前关闭：未收到 [DONE] 且无任何内容（网关/网络瞬断）")
+                val trace = nonDataSnippet?.let { "，已收非数据行：$it" } ?: ""
+                throw IOException("连接提前关闭：未收到 [DONE] 且无任何内容（网关/网络瞬断）$trace")
             }
             onDone()
             return LlmResponse(text = text.toString(), toolCalls = toolCalls)

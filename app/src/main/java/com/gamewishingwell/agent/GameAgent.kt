@@ -368,6 +368,11 @@ class GameAgent(
             .readTimeout(12, TimeUnit.MINUTES)
             .writeTimeout(60, TimeUnit.SECONDS)
             .callTimeout(0, TimeUnit.SECONDS)
+            // 回合间的沙箱（80~110s/次）与工具执行让连接闲置 1~3 分钟，而服务器
+            // keep-alive 普遍只有 ~60s——下一轮（实测常在第 3 轮前后）复用已被
+            // 服务端/NAT 悄悄回收的连接，首字节即 Connection reset / unexpected
+            // end of stream。池保活降到 30s：闲置连接自然淘汰，宁可重建也不踩雷。
+            .connectionPool(okhttp3.ConnectionPool(5, 30, TimeUnit.SECONDS))
             .build()
     }
 

@@ -119,6 +119,59 @@ class OpenAiClientTest {
     }
 
     @Test
+    fun `OpenRouter 风格的 reasoning 字段思考增量被解析`() = runBlocking {
+        // OpenRouter 统一思考字段是 delta.reasoning（非 DeepSeek 的 reasoning_content）：
+        // 不解析它会把思考流当"零内容"，空流守卫随之把思考终止误判成网络异常
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \"}}]}\n\n" +
+                        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"hard\"}}]}\n\n" +
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n" +
+                        "data: [DONE]\n\n"
+                )
+        )
+        server.start()
+
+        val thinking = StringBuilder()
+        val resp = client(server).streamChat(
+            listOf(ChatMessage("user", "hi")),
+            onDelta = {},
+            onThinking = { thinking.append(it) },
+            onDone = {}
+        )
+        assertEquals("think hard", thinking.toString())
+        assertEquals("OK", resp.text)
+
+        server.shutdown()
+    }
+
+    @Test
+    fun `仅思考增量且无 DONE 的流不再误判网络异常`() = runBlocking {
+        // 思考模型"思考后未产出正文/工具调用即终止"：思考字节已到、非空流——
+        // 应正常返回空响应（走工具模式 nudge 路径），不得抛 IOException 触发网络重试
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"choices\":[{\"delta\":{\"reasoning\":\"只有思考\"}}]}\n\n")
+        )
+        server.start()
+
+        val resp = client(server).streamChat(
+            listOf(ChatMessage("user", "hi")),
+            onDelta = {},
+            onDone = {}
+        )
+        assertEquals("", resp.text)
+        assertTrue(resp.toolCalls.isEmpty())
+
+        server.shutdown()
+    }
+
+    @Test
     fun `thinking 字段被服务端拒绝时去掉该字段重试`() = runBlocking {
         val server = MockWebServer()
         server.enqueue(
