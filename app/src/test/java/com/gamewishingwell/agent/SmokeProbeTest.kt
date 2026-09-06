@@ -62,4 +62,18 @@ class SmokeProbeTest {
         assertTrue(injected.contains("__parkedRaf"))
         assertTrue(injected.contains("reviveRafQueue()"))
     }
+
+    @Test
+    fun `画面检测注入像素多样性裁决与颜色数回传`() {
+        val injected = SmokeTestProbe.inject("<html></html>")
+        // canvas 像素多样性：纯色画布（<3 种量化颜色）判回炉，杀"零三角形只剩背景色"的假通过
+        assertTrue(injected.contains("sampleCanvasColors"))
+        assertTrue(injected.contains("playability-blank-canvas"))
+        assertTrue(injected.contains("preserveDrawingBuffer:true"))
+        // 颜色数写入结果对象并在 finalize 重建后保留（供宿主读取注入自检证据）
+        assertTrue(injected.contains("canvasColors: window.__wwSmokeResult.canvasColors"))
+        // 无 canvas 的 DOM 游戏保留文本规则；旧"文本≥30 即豁免 canvas 游戏"的通道已移除
+        assertTrue(injected.contains("playability-blank-screen"))
+        assertFalse(injected.contains("toDataURL().length > 3000"))
+    }
 }

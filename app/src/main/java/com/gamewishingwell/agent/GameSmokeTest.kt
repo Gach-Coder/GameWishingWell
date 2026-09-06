@@ -55,7 +55,10 @@ data class SmokeTestResult(
     /** 沙箱总尝试次数（设施类失败时 runner 重建 WebView 重试）。 */
     val attempts: Int = 1,
     /** 探针是否已定稿（deep 复跑中途 framesRun≥MAX 不算完成——修复宿主提前收单竞态）。 */
-    val finalized: Boolean = false
+    val finalized: Boolean = false,
+    /** 主画布像素多样性（降采样量化颜色数，无 canvas 为 0）：画面检测的量化证据，
+     *  供自检轮注入与决策日志；<3 在探针侧已判 playability-blank-canvas 失败。 */
+    val canvasColors: Int = 0
 )
 
 object NoopSmokeTestRunner : SmokeTestRunner {
@@ -70,7 +73,8 @@ object NoopSmokeTestRunner : SmokeTestRunner {
  * 驱动不经定时器队列，24 帧约 5 秒完成。DOMContentLoaded（游戏脚本注册 rAF）前不推进。
  * 任何帧内异常、全局异常（含事件回调）与 console error 都会被捕获；
  * 多点位触控派发（touchstart/touchend/click + 一次拖动）在首帧后与跑帧中段各一轮；
- * localStorage 替换为内存 stub；跑满帧后做白屏检测、顶部平台按钮角落扫描
+ * localStorage 替换为内存 stub；跑满帧后做画面空白检测（canvas 像素多样性：纯色画布判回炉，
+ * 无 canvas 的 DOM 游戏按可读文本判定）、顶部平台按钮角落扫描
  * 与可观测性不变量断言（__wwDebugState()：负血量实体/NaN 数值/实体泄漏）；
  * 内部超时仅作宿主失效时的看门狗。
  *
@@ -464,7 +468,7 @@ object SmokeTestProbe {
                 }
                 __finalized = true;
                 window.__wwSmokeFinalized = true; // 宿主完成判定的权威信号（deep 复跑中途不算完成）
-                window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: (phase === 2 ? ${MAX_FRAMES} + ticked : ticked), errors: window.__wwSmokeResult.errors, scenarios: __scenLog};
+                window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: (phase === 2 ? ${MAX_FRAMES} + ticked : ticked), errors: window.__wwSmokeResult.errors, scenarios: __scenLog, canvasColors: window.__wwSmokeResult.canvasColors};
                 return;
               }
               // 宿主驱动入口：一次调用可推进多批帧（降低 evaluateJavascript 往返次数，
@@ -534,21 +538,70 @@ object SmokeTestProbe {
                   window.__wwSmokeResult.errors.push('touch-drag:' + String(e && e.message || e));
                 }
               }
-              // 画面空白检测：跑满帧后所有 canvas 均无内容且页面无可读文本 = 白屏假通过。
-              // 空白 canvas 的 PNG 极小（<3KB），任何真实绘制都会显著增大 dataURL。
+              // 画面空白检测 v2（像素多样性裁决）：跑满帧后对每个非零尺寸 canvas 降采样统计
+              // 量化颜色数——真实游戏画面必然多于 2 种颜色；纯色画布（只剩背景/天空清除色）
+              // = 无任何实际渲染，即使页面有 HUD 文本也判失败。历史盲区：旧实现用
+              // "PNG 体积>3KB 或页面文本≥30字"双豁免，WebGL 零三角形交付（顶点全 NaN 被
+              // GPU 裁剪）凭 HUD 文本带病通过。无 canvas 的 DOM 游戏保留文本规则。
+              function sampleCanvasColors(c){
+                try {
+                  var S = 48;
+                  var t = document.createElement('canvas');
+                  t.width = S; t.height = S;
+                  var ctx = t.getContext('2d', { willReadFrequently: true });
+                  ctx.drawImage(c, 0, 0, S, S);
+                  var d = ctx.getImageData(0, 0, S, S).data;
+                  var counts = {};
+                  for (var i = 0; i < d.length; i += 4) {
+                    var key = (d[i] >> 4) + ',' + (d[i+1] >> 4) + ',' + (d[i+2] >> 4);
+                    counts[key] = (counts[key] || 0) + 1;
+                  }
+                  var keys = Object.keys(counts);
+                  var top = keys[0], topN = counts[top] || 0;
+                  for (var k = 1; k < keys.length; k++) {
+                    if (counts[keys[k]] > topN) { top = keys[k]; topN = counts[keys[k]]; }
+                  }
+                  var parts = top.split(',');
+                  var hex = '#';
+                  for (var p = 0; p < 3; p++) {
+                    var v = (Number(parts[p]) * 17).toString(16);
+                    hex += (v.length < 2 ? '0' : '') + v;
+                  }
+                  return { colors: keys.length, desc: '最多色约 ' + hex + ' 占 ' + Math.round(100 * topN / (S * S)) + '%' };
+                } catch (e) {
+                  return { colors: 0, desc: '像素不可读' };
+                }
+              }
               function blankCheck(){
                 try {
                   var canvases = document.querySelectorAll('canvas');
-                  var blank = canvases.length > 0;
+                  var live = [];
                   for (var i = 0; i < canvases.length; i++) {
                     var c = canvases[i];
                     if (c.width === 0 || c.height === 0) continue;
-                    if (c.toDataURL().length > 3000) { blank = false; break; }
+                    live.push(c);
                   }
-                  var text = ((document.body && document.body.innerText) || '').trim();
-                  if (text.length >= 30) blank = false;
-                  if (blank) {
-                    window.__wwSmokeResult.errors.push('playability-blank-screen: 画面检测未发现任何渲染内容（白屏），游戏未实际运行或未绘制');
+                  if (live.length === 0) {
+                    // DOM 游戏：无可读文本 = 白屏（旧实现对无 canvas 页面从不报空白，一并补上）
+                    var text0 = ((document.body && document.body.innerText) || '').trim();
+                    if (text0.length < 30) {
+                      window.__wwSmokeResult.errors.push('playability-blank-screen: 画面检测未发现任何渲染内容（白屏），游戏未实际运行或未绘制');
+                    }
+                    return;
+                  }
+                  var best = 0, bestDesc = '';
+                  for (var j = 0; j < live.length && j < 4; j++) {
+                    var st = sampleCanvasColors(live[j]);
+                    if (st.colors > best) { best = st.colors; bestDesc = st.desc; }
+                  }
+                  window.__wwSmokeResult.canvasColors = best;
+                  if (best < 3) {
+                    window.__wwSmokeResult.errors.push('playability-blank-canvas: 画面像素仅 ' + best + ' 种颜色' +
+                      (bestDesc ? '（' + bestDesc + '）' : '') +
+                      '——画布疑似只有背景/天空清除色的纯色填充，无任何实际渲染内容。请排查：' +
+                      '①几何体是否真正加入场景且含有效顶点（顶点表结构与索引方式必须匹配，NaN 顶点会被 GPU 全部裁剪导致只剩背景色）；' +
+                      '②渲染循环是否持续执行 renderer.render；③相机位置是否在场景内朝向内容；' +
+                      '④WebGL 画布若实际有内容但此处读不到，创建 renderer 时必须带 preserveDrawingBuffer:true');
                   }
                 } catch (e) {}
               }
@@ -773,7 +826,7 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                     // 每次轮询顺手驱动一帧批次（宿主驱动帧推进：evaluateJavascript 不经定时器队列，
                     // 不受离屏 WebView 后台节流影响），再读取探针终态。
                     val js = "(function(){try{if(window.__wwPump){window.__wwPump($FRAMES_PER_POLL);}}catch(pumpErr){}" +
-                        "try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],fin:!!window.__wwSmokeFinalized,rs:document.readyState,m:!!window.__wwSmokeInstalled,pfn:typeof window.__wwPump,pc:window.__wwPumpCount||0,sc:(r&&r.scenarios)||[]});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true,rs:document.readyState});}})()"
+                        "try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],fin:!!window.__wwSmokeFinalized,rs:document.readyState,m:!!window.__wwSmokeInstalled,pfn:typeof window.__wwPump,pc:window.__wwPumpCount||0,sc:(r&&r.scenarios)||[],cc:(r&&r.canvasColors)||0});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true,rs:document.readyState});}})()"
                     webView.evaluateJavascript(js) { value ->
                         // 取消与回调的竞态兜底：stopAll 置位后 WebView 已销毁/结果已无意义，
                         // 不再续排下一轮（否则对已销毁实例无限 200ms 重轮）。
@@ -953,7 +1006,8 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                 message = if (passed) "smoke-ok" else "smoke-failed",
                 scenarioTotal = scenEntries.size,
                 scenarioPassed = scenResults.count { it.endsWith(" 通过") },
-                scenarioResults = scenResults
+                scenarioResults = scenResults,
+                canvasColors = (json["cc"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
             )
         } catch (_: Exception) {
             fallback

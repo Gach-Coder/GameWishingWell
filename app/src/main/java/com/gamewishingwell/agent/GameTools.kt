@@ -25,6 +25,12 @@ object GameTools {
     /** 切片自适应阈值：不超过该行数的文件，切片请求一律整读返回。 */
     const val WHOLE_READ_MAX_LINES = 1200
 
+    /**
+     * 未授权整体重写的行相似度阈值（Dice）：低于判重写。灾难重写的相似度≈0
+     * （全新代码），常规功能修改 >0.8（绝大部分行保留），0.35 居中留足余量。
+     */
+    const val REWRITE_SIMILARITY_MIN = 0.35
+
     fun specs(): List<ToolSpec> = listOf(
         ToolSpec(
             name = LIST_FILES,
@@ -38,7 +44,7 @@ object GameTools {
         ),
         ToolSpec(
             name = WRITE_FILE,
-            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用——index.html（入口骨架）、js/*.js 与 css/*.css（多文件组织，由 index.html 相对路径引用，平台运行前自动合并）或 scenarios.json（功能断言）。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段——修改回合请遵守【修改范围契约】（只改用户点名的特征，未点名内容保持原样）。写入后系统自动检查产品契约/断言格式并在结果中回传。",
+            description = "写入文件（内容为完整文件）：新建 index.html、js/*.js、css/*.css、scenarios.json 等，或修改后整体落盘（JSON 等整体编辑更自然时可用）。注意：已有文件与回合起点行相似度过低的重写会被致命拒绝（未经用户授权的整体重写，多次小替换逐步达成同样被拦）——常规修改建议 editfile（更省更稳）。写入后系统自动检查产品契约/断言格式并在结果中回传。",
             parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"完整文件内容"}},"required":["content"]}"""
         ),
         ToolSpec(
@@ -82,7 +88,20 @@ data class ToolOutcome(
  */
 class GameToolExecutor(
     private val workspace: GameFileWorkspace,
-    private val validate: (String) -> ValidationReport = { GameValidator.validate(it) }
+    private val validate: (String) -> ValidationReport = { GameValidator.validate(it) },
+    /**
+     * 写入护栏——全部在【状态层】度量（回合起点快照 vs 写入结果），与用哪个工具、
+     * 分几步达成无关（操作层的语法代理必然冤杀合法编辑又漏过多步掏空，已废弃）：
+     * - [turnStartSnapshot] 回合起点的工作区文件快照（path→内容）。任何写入使该文件
+     *   与起点版本的行相似度跌破 [REWRITE_SIMILARITY_MIN] 且未授权 = 未授权整体重写，
+     *   致命拒绝（一次 writefile 达成或多次 editfile 逐步掏空等价）；新文件不受限；
+     * - [allowFullRewrite] 仅当用户指令明确授权重做/重构时为 true，解锁整体重写；
+     * - [protectedScenarioIds] 回合起点的回归断言 id 快照：非重做回合断言只增不减
+     *   （id 是断言身份；实测模型在击杀断言连续失败后直接删除断言过关）。
+     */
+    private val allowFullRewrite: Boolean = false,
+    private val turnStartSnapshot: Map<String, String> = emptyMap(),
+    private val protectedScenarioIds: Set<String>? = null
 ) {
 
     /**
@@ -199,9 +218,10 @@ class GameToolExecutor(
         if (existing != null && existing == content) {
             return outcome(call, ok = true, observation = "写入内容与当前版本完全一致，未产生变更。")
         }
-        // 一般 Agent 惯例：Write 新建或整量覆盖均可（版本化写入保底可回滚），
-        // 用 Write 还是 Edit 由模型按任务自行权衡，执行层不做策略门禁——
-        // 修改范围契约只在提示词层约束（SCOPE_FENCE_RULE）。
+        rewriteViolation(path, content)?.let { return outcome(call, ok = false, it) }
+        if (path == GameScenarios.FILE) {
+            scenarioContinuityViolation(content)?.let { return outcome(call, ok = false, it) }
+        }
         val saved = if (existing == null) {
             workspace.writeInitial(path, content)
         } else {
@@ -222,6 +242,10 @@ class GameToolExecutor(
         val existing = workspace.read(path)
             ?: return outcome(call, ok = false, observation = "文件不存在：$path。请先用 writefile 创建文件。")
         val updated = if (existing.endsWith("\n") || existing.isEmpty()) existing + content else existing + "\n" + content
+        rewriteViolation(path, updated)?.let { return outcome(call, ok = false, it) }
+        if (path == GameScenarios.FILE) {
+            scenarioContinuityViolation(updated)?.let { return outcome(call, ok = false, it) }
+        }
         val saved = workspace.writeUpdated(path, updated)
             ?: return outcome(call, ok = false, observation = "写入失败：$path（沙箱路径非法或哈希校验未通过）")
         fullReadMarks.remove(path)
@@ -259,10 +283,64 @@ class GameToolExecutor(
         if (updated == content) {
             return outcome(call, ok = true, observation = "替换前后内容一致，未产生变更。")
         }
+        rewriteViolation(path, updated)?.let { return outcome(call, ok = false, it) }
+        if (path == GameScenarios.FILE) {
+            scenarioContinuityViolation(updated)?.let { return outcome(call, ok = false, it) }
+        }
         val saved = workspace.writeUpdated(path, updated)
             ?: return outcome(call, ok = false, observation = "写入失败：$path（沙箱路径非法或哈希校验未通过）")
         fullReadMarks.remove(path)
         return mutatedOutcome(call, path, updated, saved.version, replaced = occurrences, newString = newString)
+    }
+
+    /**
+     * 未授权整体重写检测（状态层，写盘前执行，非 null=违规文本，调用方直接拒绝且不落盘）：
+     * 写入结果与【回合起点】版本的行相似度跌破阈值即判重写——与写入机制无关
+     * （writefile 一次达成 / 多次 editfile 逐步掏空 / appendfile 顶飞，同一把尺子），
+     * 新文件不受限，用户授权重做/重构放行。极小文件（起点 <8 个非空行）不判，噪声太大。
+     */
+    private fun rewriteViolation(path: String, newContent: String): String? {
+        if (allowFullRewrite) return null
+        val origin = turnStartSnapshot[path] ?: return null
+        val originLines = origin.lines().filter { it.isNotBlank() }
+        if (originLines.size < 8) return null
+        val sim = lineSimilarity(originLines, newContent)
+        if (sim >= GameTools.REWRITE_SIMILARITY_MIN) return null
+        return "致命错误：$path 相对回合起点的行相似度仅 ${(sim * 100).toInt()}" +
+            "（低于 ${(GameTools.REWRITE_SIMILARITY_MIN * 100).toInt()}%），构成未授权的整体重写" +
+            "（无论 writefile 一次达成还是多次 editfile 逐步替换，执行层按回合起点比对，逐步掏空同样会被拦）。" +
+            "请在既有代码上做局部精确修改；用户明确要求重做/重构（或授权精简）时才会放行整体重写。文件未被改动。"
+    }
+
+    /** 非空行的 Dice 相似度（多重集交集 ×2 / 两侧行数和）：对重排稳健，实现无依赖。 */
+    private fun lineSimilarity(originLines: List<String>, newContent: String): Double {
+        if (originLines.isEmpty()) return 1.0
+        val newLines = newContent.lines().filter { it.isNotBlank() }
+        if (newLines.isEmpty()) return 0.0
+        val pool = newLines.toMutableList()
+        var common = 0
+        for (l in originLines) {
+            if (pool.remove(l)) common++
+        }
+        return 2.0 * common / (originLines.size + newLines.size)
+    }
+
+    /**
+     * 回归套件连续性预检（写盘前执行，非 null=违规文本，调用方直接拒绝且不落盘）：
+     * 修改回合断言只增不减——id 是断言身份，修内容保 id、新增追加均可；
+     * 删除/合并需用户授权重做（实测模型在击杀断言连续失败后整条删除断言过关）。
+     */
+    private fun scenarioContinuityViolation(content: String): String? {
+        if (protectedScenarioIds == null || allowFullRewrite) return null
+        val parsed = GameScenarios.parse(content)
+        // 解析失败或空套件：交给 checkObservation 报格式问题（"断言被删除"是误报）
+        if (parsed.isEmpty()) return null
+        val lostIds = protectedScenarioIds - parsed.map { it.id }.toSet()
+        if (lostIds.isEmpty()) return null
+        return "致命错误：修改回合的回归断言只增不减（执行层强制）——" +
+            "以下已存在断言被删除：${lostIds.joinToString("、")}。" +
+            "修断言内容请保留 id 原位改写（对照失败回报的字段轨迹修正 expect/steps）；" +
+            "新增回归断言直接追加；删除或合并条目需用户明确授权（重做游戏/精简断言）。文件未被改动。"
     }
 
     /**

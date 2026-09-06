@@ -1458,8 +1458,20 @@ class GameAgent(
             QualityTier.normalize(_session.value.qualityTier)
         )
         // 修改范围契约只在提示词层约束（scopeFence 注入 SCOPE_FENCE_RULE）：
-        // 执行层不做检查或撤回——LLM 若仍主动发挥，由用户以停止键/撤销兜底。
+        // 执行层护栏在工具执行器里——覆盖写入致命、整文件重写需授权、断言只增不减。
         val scopeFence = existingHtml != null && !allowEntryRewrite
+        // 整文件重写授权：仅用户指令明确说重做/重构时解锁（推倒重来/从头做同义）。
+        val allowFullRewrite = Regex("重构|重写|重做|推倒|从头").containsMatchIn(instruction)
+        // 回合起点状态快照（护栏的度量基准）：文件→内容。写入护栏全部按"结果 vs 起点"
+        // 的状态差分度量（套件 id 守恒、整体重写相似度），与写入机制无关。
+        val turnStartSnapshot = runCatching {
+            workspace.manifest().files.associate { it.path to (workspace.read(it.path) ?: "") }
+        }.getOrDefault(emptyMap())
+        val protectedScenarioIds = turnStartSnapshot[GameScenarios.FILE]
+            ?.let { GameScenarios.parse(it).map { s -> s.id }.toSet() }.takeIf { !it.isNullOrEmpty() }
+        if (allowFullRewrite) {
+            alog("full-rewrite authorized by user instruction (重构/重做关键词)")
+        }
         val executor = GameToolExecutor(
             workspace,
             // 多文件契约：本地 script/link 引用按工作区存在性裁决（存在=合法组织，
@@ -1473,7 +1485,10 @@ class GameAgent(
                     localFileExists = { rel -> workspaceFileExists(rel) },
                     inlineView = true
                 )
-            }
+            },
+            allowFullRewrite = allowFullRewrite,
+            turnStartSnapshot = turnStartSnapshot,
+            protectedScenarioIds = protectedScenarioIds
         )
 
         var outcome = runToolLoop(
@@ -1683,15 +1698,15 @@ class GameAgent(
                     continue
                 }
 
-                // 正文完整 HTML 的分流：
-                // - 工具从未成功（mutatedOnce=false，不会 function calling 的模型）：按隐式写入
-                //   处理（等价 overwrite 写入）——这是它们产出代码的唯一通路；
-                // - 工具已正常工作：正文出代码是提示词违规而非降级通路——用它覆写已验证的
-                //   工作区等于清掉健康状态，且模型不知道发生了覆写（后续在错误状态上空转）。
-                //   忽略并纠正，不碰工作区；修改范围契约只在提示词层约束，正文写入不做检查或撤回。
+                // 正文完整 HTML 的分流（与覆盖禁令同源）：
+                // - 入口尚不存在且工具从未成功：按隐式创建处理（不会 function calling
+                //   的模型产出首版的唯一通路）；
+                // - 其余任何情况（工具已工作 / 入口已存在）：正文出代码是提示词违规，
+                //   一律忽略并纠正——用正文覆写已存在文件等同于 writefile 覆盖，
+                //   绕过执行层的致命拒绝（实测模型会在 30KB 正文里夹带整套重写）。
                 var content = current
                 if (directHtml != null && directHtml != current) {
-                    if (mutatedOnce) {
+                    if (current != null || mutatedOnce) {
                         if (nudgesLeft <= 0) {
                             failTurn(
                                 "本轮没有产生新的修改。你可以重试，或直接描述想要的效果（如「再简单一点」「加个计分板」）。",
@@ -1707,18 +1722,11 @@ class GameAgent(
                         )
                         continue
                     }
-                    val saved = if (current == null) {
-                        workspace.writeInitial(GameFileWorkspaceEntryPoint.DEFAULT, directHtml)
-                    } else {
-                        workspace.writeUpdated(GameFileWorkspaceEntryPoint.DEFAULT, directHtml)
-                    }
+                    val saved = workspace.writeInitial(GameFileWorkspaceEntryPoint.DEFAULT, directHtml)
                     if (saved != null) {
                         content = directHtml
                         mutatedOnce = true
-                        // 发布保留更大候选：修复提示后的赶工短版往往残缺（白屏），
-                        // 中断试玩应拿到此前最完整的版本。
-                        val published = if ((current?.length ?: 0) >= directHtml.length) current else directHtml
-                        _session.update { it.copy(currentHtml = published) }
+                        _session.update { it.copy(currentHtml = directHtml) }
                     }
                 }
 
@@ -1756,7 +1764,7 @@ class GameAgent(
                                 )
                                 return GenOutcome.Failed
                             }
-                            alog("sandbox: passed=${smoke?.passed} frames=${smoke?.framesRun} attempts=${smoke?.attempts} errors=${smoke?.errors?.joinToString(";")?.take(400)}")
+                            alog("sandbox: passed=${smoke?.passed} frames=${smoke?.framesRun} colors=${smoke?.canvasColors} attempts=${smoke?.attempts} errors=${smoke?.errors?.joinToString(";")?.take(400)}")
                             if (smoke != null && !smoke.passed) {
                                 val smokeErrors = smokeActionableErrors(smoke)
                                 // 超时且无任何真实错误：帧有推进=慢环境时序问题，按通过处理（落入下方
@@ -1829,6 +1837,18 @@ class GameAgent(
                                             "字段轨迹全程不变＝机制未发生（修游戏逻辑或断言字段）；提示字段不存在＝对齐 expect 字段名；" +
                                             "断言在期限内任一帧为真即通过，不要为通过断言而弱化游戏逻辑。"
                                     } else ""
+                                    // 数值污染溯源路由：NaN/undefined/纯色画布类错误指向数据结构错位，
+                                    // 自由修复时模型易走"过滤坏值/默认值兜底"的掩盖式修法（实测把可检测的
+                                    // 渲染故障修成不可检测的静默空几何），点名根因方向。
+                                    val numericHint = if (smokeErrors.any { err ->
+                                        err.contains("NaN") || err.contains("undefined") ||
+                                            err.contains("Computed radius") || err.contains("non-finite") ||
+                                            err.startsWith("playability-blank-canvas")
+                                    }) {
+                                        "\n其中数值类错误（NaN/undefined/纯色画布）请溯源修复：顶点或数据数组的结构与索引方式是否匹配、" +
+                                            "引用的字段/键是否存在——禁止用过滤坏值（isFinite 筛选丢弃）或默认值兜底（a||默认）消除报错，" +
+                                            "那只会把画面故障变成不可检测的静默失败，沙箱的像素检测仍会拦截。"
+                                    } else ""
                                     // 失败历史只保留最近两条全文：更早的折叠为摘要（信息可从最近反馈
                                     // 与遗留问题注入恢复），防多轮失败把上下文越堆越厚。
                                     if (smokeFailMsgIdx.size >= 2) {
@@ -1844,6 +1864,7 @@ class GameAgent(
                                             smokeErrors.take(5).joinToString("；") +
                                             manifestNote +
                                             scenarioHint +
+                                            numericHint +
                                             "\n请用 editfile 修复；沙箱跑通前不要结束。"
                                     )
                                     smokeFailMsgIdx += messages.lastIndex
@@ -1860,6 +1881,12 @@ class GameAgent(
                                 alog("scenarios: ${smoke.scenarioPassed}/${smoke.scenarioTotal} " +
                                     smoke.scenarioResults.joinToString("|") { it.take(60) })
                             }
+                            // 画面检测证据：颜色数是"渲染真实发生"的量化事实（能到这里的沙箱
+                            // 均已通过≥3 色门槛），与断言证据同权注入自检——模型据实自查视觉
+                            // 内容，替代无执行依据的自我感觉。
+                            val visualEvidence = smoke?.takeIf { it.canvasColors > 0 }?.let {
+                                "沙箱画面检测：主画布实际渲染出 ${it.canvasColors} 种颜色（像素多样性门槛≥3，纯色/空白画布会被判回炉）。"
+                            }
                             if (!fixTurn && !scenarioNudged && scenariosJson == null &&
                                 GameScenarios.enabledForTier(tier)
                             ) {
@@ -1873,7 +1900,10 @@ class GameAgent(
                             if (review != null) {
                                 alog("self-review round: ${review.first} (rounds so far=$round)")
                                 _session.update { it.copy(agentStage = review.first) }
-                                messages += ChatMessage("user", (scenarioEvidence?.plus("\n\n") ?: "") + review.second)
+                                val evidencePrefix = listOfNotNull(visualEvidence, scenarioEvidence)
+                                    .joinToString("\n\n")
+                                    .let { if (it.isEmpty()) "" else it + "\n\n" }
+                                messages += ChatMessage("user", evidencePrefix + review.second)
                                 continue
                             }
                             // 精品档防敷衍：自检期间零修改直通时，一次性注入丰富度增强指令

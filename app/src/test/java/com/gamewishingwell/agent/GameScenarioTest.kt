@@ -227,12 +227,20 @@ class GameScenarioTest {
         assertNull(scenOutcome.html)
         assertTrue(scenOutcome.observation.contains("共 1 条"))
 
-        // 非法断言文件：ok=false 反馈模型重写。
+        // 非法断言内容（覆盖写入已被禁止，用局部 editfile 把 JSON 改非法）：
+        // ok=false 反馈模型重写。
         val badOutcome = executor.execute(
-            ToolCallData("t3", GameTools.WRITE_FILE, """{"path":"scenarios.json","content":"{broken"}""")
+            ToolCallData("t3", GameTools.EDIT_FILE, """{"path":"scenarios.json","old_string":"\\"scenarios\\":[","new_string":"scenarios:["}""")
         )
         assertFalse(badOutcome.ok)
         assertTrue(badOutcome.observation.contains("合法 JSON"))
+
+        // 空套件覆盖（状态层护栏：整体重写放行，但空/非法套件被拒绝，id 只增不减由连续性门管）。
+        val overwriteOutcome = executor.execute(
+            ToolCallData("t4", GameTools.WRITE_FILE, """{"path":"scenarios.json","content":"{}"}""")
+        )
+        assertFalse(overwriteOutcome.ok)
+        assertTrue(overwriteOutcome.observation.contains("合法 JSON"))
 
         // 入口指针不被 scenarios.json 写入带偏。
         assertEquals("index.html", workspace.manifest().pointer)
