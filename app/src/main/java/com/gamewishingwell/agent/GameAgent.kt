@@ -1606,7 +1606,9 @@ class GameAgent(
         var mutatedOnce = false
         var lastReport: ValidationReport? = null
         var stubborn: Map<String, Int> = emptyMap()
-        var idleRounds = 0
+        // 失速跟踪器（唯一决策出口）：被驳回的完成宣告链 / 侦查空转 / 连续无工具轮，
+        // 收编旧 idleRounds 与 toollessRounds 两个并行计数器。
+        val stallTracker = LoopStallTracker()
         var nudgesLeft = 3
         // 可玩性自检轮随质量档位与回合类型分档：快速/轻量无自检、均衡一轮、精品两轮；
         // 修复轮除快速档外仅一轮回归自检。每轮自检后重新走校验+沙箱验收。
@@ -1632,9 +1634,6 @@ class GameAgent(
         val smokeFailMsgIdx = mutableListOf<Int>()
         var readfileCalls = 0
         var sandboxAttempts = 0
-        // 连续"既无工具调用也无代码输出"的轮数：≥2 判定模型不会 function calling，
-        // 工具模式提示词禁止正文出代码会把它锁死——整体降级到兼容回环。
-        var toollessRounds = 0
         // 已记录的 readfile 结果在消息历史中的下标：文件一旦被修改即失效，
         // 替换为过期提示——既防上下文膨胀（每读一次多几万 token 拷贝），
         // 也防模型拿旧拷贝当编辑依据导致 old_string 失配、浪费轮次。
@@ -1668,7 +1667,7 @@ class GameAgent(
 
             // 终止分支：模型不再发起工具调用。
             if (resp.toolCalls.isEmpty()) {
-                toollessRounds++
+                stallTracker.noteDeclared()
                 val directHtml = HtmlExtractor.extract(resp.text).html
                 val current = workspace.read(GameFileWorkspaceEntryPoint.DEFAULT)
 
@@ -1677,8 +1676,8 @@ class GameAgent(
                 // 工具失效降级：连续多轮无工具调用也无整份代码输出（不支持/未启用
                 // function calling 的模型）。兼容回环允许正文输出完整 HTML，对这类
                 // 模型是唯一可用通路（首次制作正是靠它成功的）。
-                if (!mutatedOnce && toollessRounds >= 2) {
-                    alog("route: legacy fallback (tool-less model, $toollessRounds rounds no tools)")
+                if (!mutatedOnce && stallTracker.consecutiveToolless >= 2) {
+                    alog("route: legacy fallback (tool-less model, ${stallTracker.consecutiveToolless} rounds no tools)")
                     return GenOutcome.LegacyFallback(current ?: directHtml ?: "", round)
                 }
                 if (!mutatedOnce && current == null) {
@@ -1800,6 +1799,39 @@ class GameAgent(
                                             internalDetail = "orientation-mismatch 累计 $orientationStrikes 次：方向期望与游戏形态错位（模型无法通过修改游戏满足错误期望），交回用户修正"
                                         )
                                         return GenOutcome.Failed
+                                    }
+                                    // 被驳回的完成宣告跟踪（空转熔断收紧的核心）：本轮零工具调用
+                                    // 且验证又失败——沙箱为确定性执行，文件未变则判决必相同，
+                                    // 重复宣告而不行动即病理。第 2 次注入决策强制指令
+                                    // （修改文件/修改断言并说明理由/再空转即终止），第 3 次熔断。
+                                    // 实测该病理曾 6 连空转烧 184k 字符分析文本（08:40 回合），
+                                    // 同签名升级提示与 24 轮无修改熔断均接不住。
+                                    when (val stall = stallTracker.noteDeclarationRejected()) {
+                                        is StallAction.Fuse -> {
+                                            alog("declaration-stall fuse: ${stall.internalReason}")
+                                            failTurn(USER_MSG_CHANGE_MODEL, internalDetail = stall.internalReason)
+                                            return GenOutcome.Failed
+                                        }
+                                        is StallAction.Steer -> {
+                                            alog("declaration-stall steer: x${stall.count}")
+                                            _session.update { it.copy(agentStage = "校验中：连续宣告未通过，正在要求落盘修改") }
+                                            // 决策指令替代重复的完整失败反馈（旧反馈按既有规则折叠），
+                                            // 防六连空转里 35k 级分析文本把上下文越堆越厚。
+                                            if (smokeFailMsgIdx.size >= 2) {
+                                                val folded = smokeFailMsgIdx.removeAt(0)
+                                                messages[folded] = ChatMessage(
+                                                    "user",
+                                                    "（更早一次沙箱失败反馈已折叠：未解决的错误会出现在最近一次反馈或遗留问题清单里，无需回看原文。）"
+                                                )
+                                            }
+                                            messages += ChatMessage(
+                                                "user",
+                                                declarationSteerMessage(stall.count, smokeErrors.firstOrNull()?.take(160))
+                                            )
+                                            smokeFailMsgIdx += messages.lastIndex
+                                            continue
+                                        }
+                                        StallAction.None -> {}
                                     }
                                     val normalized = ErrorSignature.normalize("冒烟测试失败:" + smokeErrors.joinToString(";"))
                                     val known = RetryBookkeeping.record(_session.value.knownErrors, ErrorCategory.USER_RUNTIME, normalized)
@@ -1954,6 +1986,28 @@ class GameAgent(
                     }
                     appendEscalation(messages, maxRepeat, "校验", stubbornDetail)
                     alog("contract errors: ${report.errors.joinToString(";") { it.category + ":" + it.message.take(120) }}")
+                    // 被驳回的完成宣告（静态契约版）：与沙箱失败路径同一跟踪器——
+                    // 零工具宣告且校验有 error，重复而不行动按同一节奏收紧。
+                    when (val stall = stallTracker.noteDeclarationRejected()) {
+                        is StallAction.Fuse -> {
+                            alog("declaration-stall fuse (static): ${stall.internalReason}")
+                            failTurn(USER_MSG_CHANGE_MODEL, internalDetail = stall.internalReason)
+                            return GenOutcome.Failed
+                        }
+                        is StallAction.Steer -> {
+                            alog("declaration-stall steer (static): x${stall.count}")
+                            _session.update { it.copy(agentStage = "校验中：连续宣告未通过，正在要求落盘修改") }
+                            messages += ChatMessage(
+                                "user",
+                                declarationSteerMessage(
+                                    stall.count,
+                                    report.errors.firstOrNull()?.let { "${it.category}:${it.message}" }?.take(160)
+                                )
+                            )
+                            continue
+                        }
+                        StallAction.None -> {}
+                    }
                     messages += ChatMessage(
                         "user",
                         validationFeedback(
@@ -1978,9 +2032,8 @@ class GameAgent(
             }
 
             // 工具执行分支：assistant 的调用请求 + 每个调用的观察结果回填进消息历史。
-            // 有工具调用的轮次重置无工具轮计数：判定"模型不会 function calling"必须是
-            // 连续无工具（此前只增不减，readfile 一轮夹在两次纯文本之间就会被误判降级）。
-            toollessRounds = 0
+            // 连续无工具计数在 noteToolRound 内清零：判定"模型不会 function calling"
+            // 必须是连续无工具（readfile 一轮夹在两次纯文本之间不算）。
             messages += ChatMessage("assistant", resp.text, toolCalls = resp.toolCalls)
             var mutatedThisRound = false
             for (call in resp.toolCalls) {
@@ -2029,25 +2082,22 @@ class GameAgent(
                 }
             }
             lastReport?.takeIf { it.hasErrors }?.let { recordKnownErrors(it) }
-            idleRounds = if (mutatedThisRound) 0 else idleRounds + 1
-            when {
-                // 空转熔断：模型长时间只读不写（探索/兜圈）时如实终止回合——
-                // 不是交付，也没有带错交付；用户可重试或换模型。
-                idleRounds >= 24 -> {
-                    failTurn(
-                        USER_MSG_CHANGE_MODEL,
-                        internalDetail = "连续 $idleRounds 轮无文件修改（空转熔断）"
-                    )
+            // 轮次结局分类（Mutated/Recon）交由失速跟踪器统一裁决：侦查空转沿用
+            // 24 轮熔断 + 每 8 轮催促；任何写入同时清零被驳回宣告链（行动即出狱）。
+            when (val stall = stallTracker.noteToolRound(mutated = mutatedThisRound)) {
+                is StallAction.Fuse -> {
+                    failTurn(USER_MSG_CHANGE_MODEL, internalDetail = stall.internalReason)
                     return GenOutcome.Failed
                 }
-                idleRounds > 0 && idleRounds % 8 == 0 -> {
+                is StallAction.Steer -> {
                     _session.update {
                         it.copy(
-                            agentStage = "代码生成中：已连续 $idleRounds 轮没有文件修改，正在催促模型落盘"
+                            agentStage = "代码生成中：已连续 ${stall.count} 轮没有文件修改，正在催促模型落盘"
                         )
                     }
-                    messages += ChatMessage("user", "已连续 $idleRounds 轮没有文件修改。请直接完成 writefile / editfile 修改，或停止调用工具并输出最终总结。")
+                    messages += ChatMessage("user", "已连续 ${stall.count} 轮没有文件修改。请直接完成 writefile / editfile 修改，或停止调用工具并输出最终总结。")
                 }
+                StallAction.None -> {}
             }
         }
     }
@@ -2479,6 +2529,20 @@ class GameAgent(
      * 之后周期性重复。bug 修复轮数不设上限（多轮属正常），退出方式为交付成功、
      * 无进展熔断（空转/无产出）、环境/网络异常或用户停止键。
      */
+    /**
+     * 被驳回完成宣告的决策强制指令（第 2 次起注入，替代重复的完整失败反馈）：
+     * 把"隔空辩论"压缩为一轮决策——模型若认为断言不合理，这里显式开出带理由
+     * 要求的逃生门（改 scenarios.json），不再让它空转多轮才自己找到这条路。
+     */
+    private fun declarationSteerMessage(count: Int, errorBrief: String?): String =
+        "你已连续 $count 次宣告完成但验证未通过" +
+            (errorBrief?.let { "（最近失败：$it…）" } ?: "") +
+            "，且期间未做任何文件修改——沙箱为确定性执行，文件不变则结论必然不变。" +
+            "请在本轮三选一立即执行：" +
+            "① 用 editfile 修改游戏文件修复问题；" +
+            "② 若你认为断言本身不合理，用 editfile 修改 scenarios.json 中该条断言，并在回复中用一行说明修改理由；" +
+            "③ 再次不携带工具调用地宣告完成将终止本回合。"
+
     private fun appendEscalation(
         messages: MutableList<ChatMessage>,
         signatureRepeat: Int,

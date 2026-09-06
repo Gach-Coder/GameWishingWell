@@ -173,6 +173,56 @@ function restart(){}
     }
 
     @Test
+    fun `连续被驳回的完成宣告第2次注入决策指令第3次熔断`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-stall-${System.nanoTime()}")
+        val script = ScriptedLlmClient(
+            listOf(
+                // 识别层 Lite 补丁（direct-make 路径）
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                // 第 1 轮：写入合法游戏（mutatedOnce 置位，沙箱按均衡档运行）
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-write", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                // 第 2~4 轮：零工具宣告完成——沙箱恒败（确定性），复刻 08:40 回合病理
+                LlmResponse("我认为已经完成了"),
+                LlmResponse("再确认一遍，确实完成了"),
+                LlmResponse("以上就是最终版本")
+            )
+        )
+        val agent = newAgent(
+            dir, client = script,
+            smoke = StubSmokeRunner(
+                SmokeTestResult(
+                    passed = false, framesRun = 24, message = "smoke-failed",
+                    errors = listOf("scenario-fail[塔防/开局进入 playing 状态]: 期限 300 帧内未达成（断言在期限内任一帧为真即通过）")
+                )
+            )
+        )
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "balanced")
+
+        val s = agent.session.value
+        assertFalse(s.isGenerating)
+        // 第 3 次被驳回即熔断：如实失败（无法推进口径，failTurn 写入 error 字段），不带错交付
+        assertFalse(s.gameGenerated)
+        assertTrue("熔断应给出无法推进的用户文案", s.error?.contains("未能推进") == true)
+        // 第 2 次驳回注入决策强制指令（三选一：改文件/改断言并说明理由/再空转即终止）
+        assertTrue(
+            "第 4 次 LLM 调用（第 3 次宣告轮）的历史应含决策指令",
+            script.calls[3].first.any { it.content.contains("三选一") && it.content.contains("scenarios.json") }
+        )
+        // 第 1 次驳回走既有反馈路径（不打扰正常修复环入口）
+        assertTrue(
+            script.calls[2].first.any { it.content.contains("冒烟测试未通过") }
+        )
+        // 1 次识别 + 4 轮循环即收束（旧机制下同类空转实测 6+ 轮）
+        assertEquals(5, script.calls.size)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
     fun `多文件生成回合-同轮并行写 css js 与入口并正确验收发布`() = runBlocking {
         val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-multi-${System.nanoTime()}")
         // __wwDebugState 定义在 js 文件里（多文件组织的常态）：验收必须校验内联合并视图
