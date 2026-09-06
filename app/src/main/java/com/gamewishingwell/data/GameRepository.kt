@@ -41,6 +41,9 @@ class GameRepository(private val context: Context) {
 
         /** 每个文件保留的历史版本数（超出部分在写入时修剪）。 */
         const val KEEP_VERSIONS = 20
+
+        /** 文件可视系统只读预览的字节上限（超出截断展示，避免超大归档拖垮渲染）。 */
+        const val FILE_PREVIEW_LIMIT_BYTES = 256 * 1024
     }    private val json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true
@@ -266,24 +269,60 @@ class GameRepository(private val context: Context) {
     }
 
     /**
-     * 文件可视系统：列出游戏存储文件夹（games/<id>）的一级条目——
-     * 子目录在前、其余按名称排序；只读概要信息，不提供打开能力。
+     * 文件可视系统：列出游戏存储文件夹（games/<id>）内 [relativePath] 子目录的一级条目
+     * （空串 = 根目录）——子目录在前、其余按名称排序；路径经规范化校验不得逃出游戏目录。
      */
-    suspend fun listGameFiles(gameId: Long): List<GameFileEntry> = withContext(Dispatchers.IO) {
+    suspend fun listGameFiles(gameId: Long, relativePath: String = ""): List<GameFileEntry> =
+        withContext(Dispatchers.IO) {
+            val dir = resolveInGameDir(gameId, relativePath) ?: return@withContext emptyList()
+            if (!dir.isDirectory) return@withContext emptyList()
+            dir.listFiles()
+                ?.map { f ->
+                    GameFileEntry(
+                        name = f.name,
+                        isDirectory = f.isDirectory,
+                        sizeBytes = if (f.isFile) f.length() else 0L,
+                        childCount = if (f.isDirectory) f.listFiles()?.size ?: 0 else 0,
+                        lastModified = f.lastModified()
+                    )
+                }
+                ?.sortedWith(compareByDescending<GameFileEntry> { it.isDirectory }.thenBy { it.name })
+                ?: emptyList()
+        }
+
+    /**
+     * 文件可视系统：只读打开游戏目录内一个文本文件（查看与复制用，无任何写入路径）。
+     * 目标是目录、文件不存在或路径逃出游戏目录（../ 等）一律返回 null；
+     * 内容超过 [FILE_PREVIEW_LIMIT_BYTES] 截断预览；含 NUL 字节判为二进制不做文本展示。
+     */
+    suspend fun readGameFile(gameId: Long, relativePath: String): GameFileContent? =
+        withContext(Dispatchers.IO) {
+            val file = resolveInGameDir(gameId, relativePath) ?: return@withContext null
+            if (!file.isFile) return@withContext null
+            val size = file.length()
+            val truncated = size > FILE_PREVIEW_LIMIT_BYTES
+            val bytes = file.inputStream().use { it.readNBytes(FILE_PREVIEW_LIMIT_BYTES) }
+            val binary = bytes.indexOf(0.toByte()) >= 0
+            // 截断点可能切在多字节序列中间，解码尾部至多出现一个替换符，展示前去掉
+            val text = if (binary) "" else String(bytes, Charsets.UTF_8).let { if (truncated) it.trimEnd('\uFFFD') else it }
+            GameFileContent(
+                name = file.name,
+                relativePath = relativePath,
+                sizeBytes = size,
+                lastModified = file.lastModified(),
+                text = text,
+                truncated = truncated,
+                binary = binary
+            )
+        }
+
+    /** 把游戏目录内相对路径解析为 File：规范化后必须仍位于 games/<id> 之下，防 ../ 逃逸。 */
+    private fun resolveInGameDir(gameId: Long, relativePath: String): File? {
         val dir = File(gamesDir, gameId.toString())
-        if (!dir.isDirectory) return@withContext emptyList()
-        dir.listFiles()
-            ?.map { f ->
-                GameFileEntry(
-                    name = f.name,
-                    isDirectory = f.isDirectory,
-                    sizeBytes = if (f.isFile) f.length() else 0L,
-                    childCount = if (f.isDirectory) f.listFiles()?.size ?: 0 else 0,
-                    lastModified = f.lastModified()
-                )
-            }
-            ?.sortedWith(compareByDescending<GameFileEntry> { it.isDirectory }.thenBy { it.name })
-            ?: emptyList()
+        if (!dir.isDirectory) return null
+        val root = dir.canonicalPath + File.separator
+        val target = File(dir, relativePath)
+        return if (target.canonicalPath == dir.canonicalPath || target.canonicalPath.startsWith(root)) target else null
     }
 
     // ---------- 草稿 ----------

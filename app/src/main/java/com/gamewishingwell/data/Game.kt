@@ -17,7 +17,7 @@ data class GameIndex(
     val games: List<GameMeta> = emptyList()
 )
 
-/** 文件可视系统条目：游戏存储文件夹内一个文件/子目录的概要信息（仅展示，不打开）。 */
+/** 文件可视系统条目：游戏存储文件夹内一个文件/子目录的概要信息。 */
 data class GameFileEntry(
     val name: String,
     val isDirectory: Boolean,
@@ -25,6 +25,20 @@ data class GameFileEntry(
     /** 目录内的直接子项数（文件恒为 0）。 */
     val childCount: Int = 0,
     val lastModified: Long
+)
+
+/** 文件可视系统：只读打开一个文本文件的读取结果（仅供查看与选中复制，无写入路径）。 */
+data class GameFileContent(
+    val name: String,
+    /** 相对游戏根目录（games/<id>）的路径，如 ".versions/3-index.html"。 */
+    val relativePath: String,
+    val sizeBytes: Long,
+    val lastModified: Long,
+    /** 展示的文本内容；[truncated] 为真时只是前缀。 */
+    val text: String,
+    val truncated: Boolean,
+    /** 含 NUL 字节，视为二进制文件，不提供文本预览（text 为空）。 */
+    val binary: Boolean
 )
 
 /** 一次工具调用请求：id 与参数原样字符串由协议层产出，执行层自行解析参数 JSON。 */
