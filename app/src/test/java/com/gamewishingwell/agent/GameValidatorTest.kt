@@ -123,4 +123,48 @@ class GameValidatorTest {
         val report = GameValidator.validate(html)
         assertFalse(report.errors.any { it.category == "observability" })
     }
+
+    @Test
+    fun `辅助文件按类型轻量校验`() {
+        // 干净 js：无任何问题（入口级伪检查如可观测性契约不适用于纯 JS）
+        assertTrue(
+            GameValidator.validateAuxFile("js/main.js", "var WW = window.WW || {};\nWW.go = function(){ return 1; };").checks.isEmpty()
+        )
+        // js 的 eval 与 ES module 语法仍是硬约束
+        assertTrue(
+            GameValidator.validateAuxFile("js/a.js", "var r = eval('1');").errors.any { it.message.contains("eval") }
+        )
+        assertTrue(
+            GameValidator.validateAuxFile("js/b.js", "import { x } from './x.js';").errors.any { it.message.contains("ES module") }
+        )
+        // css：url() 外链 error、本地引用 warning
+        assertTrue(
+            GameValidator.validateAuxFile("css/s.css", "body{background:url(https://x.com/a.png)}").errors.any { it.category == "resources" }
+        )
+        assertTrue(
+            GameValidator.validateAuxFile("css/s.css", "body{background:url(img/a.png)}").warnings.any { it.message.contains("本地资源") }
+        )
+        // 不出现入口级伪错误
+        assertFalse(
+            GameValidator.validateAuxFile("js/main.js", "var a = 1;").errors.any { it.category == "observability" }
+        )
+    }
+
+    @Test
+    fun `多文件模式-超大纯内联入口给出拆分建议`() {
+        val bigScript = "var x = 1;\n".repeat(700)
+        val html = "<html><body><script>window.__wwDebugState=function(){};\n$bigScript</script></body></html>"
+        val report = GameValidator.validate(html, localFileExists = { true })
+        assertTrue(report.warnings.any { it.category == "structure" && it.message.contains("拆分") })
+        // 已有本地引用（已拆分状态）不再提示
+        val split = "<html><head><script src=\"js/main.js\"></script></head><body></body></html>"
+        val r2 = GameValidator.validate(split, localFileExists = { true })
+        assertFalse(r2.warnings.any { it.category == "structure" })
+        // 单文件模式（兼容回环，无工作区）不给结构建议
+        val r3 = GameValidator.validate(html)
+        assertFalse(r3.warnings.any { it.category == "structure" })
+        // 体量不大的内联不提示
+        val r4 = GameValidator.validate(selfContained, localFileExists = { true })
+        assertFalse(r4.warnings.any { it.category == "structure" })
+    }
 }

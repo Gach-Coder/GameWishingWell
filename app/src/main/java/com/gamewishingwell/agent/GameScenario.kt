@@ -8,9 +8,13 @@ import kotlinx.serialization.json.Json
  * 功能断言（场景回归测试）：把策划验收边界固化为可执行断言，由沙箱确定性裁决。
  *
  * 吸收 Generator-Critic 工作流的语义验证层，但把裁决权从 LLM Critic 交给确定性执行：
- * 每条断言 = 输入脚本（视口百分比点按/拖动）+ 确定性帧推进（复用探针 tick 队列，
- * 每帧 50ms 游戏时间）+ 针对 __wwDebugState() 快照的布尔表达式，全部在真实
- * Chromium 内核里求值——"LLM 提出（模型编写断言），确定门裁决（探针执行）"。
+ * 每条断言 = 输入脚本（视口百分比点按/拖动）+ eventually 语义（针对 __wwDebugState()
+ * 快照的布尔表达式在期限 [horizon] 内任一帧为真即通过，逐帧求值、翻真即停），
+ * 全部在真实 Chromium 内核里求值——"LLM 提出（模型编写断言），确定门裁决（探针执行）"。
+ *
+ * 时间归执行器、内容归作者：模型只写"什么该为真"（expect）与"怎么戳游戏"（steps），
+ * 不再预测"第几帧会发生什么"——断言在期限内翻真即通过，期限未到为真不是失败；
+ * 失败回报自带字段轨迹与输入派发点状态，"机制未发生 / 字段错位"两类原因各自独立成信号。
  *
  * scenarios.json 由生成模型用文件工具写入并维护（它知道自己的快照字段），
  * 持久化在游戏工作区跨迭代存活：修复玩家报障时把问题固化为新断言追加，
@@ -23,7 +27,7 @@ data class ScenarioStep(
     val tap: List<Double>? = null,
     /** 视口百分比拖动 [x0Pct, y0Pct, x1Pct, y1Pct]。 */
     val drag: List<Double>? = null,
-    /** 确定性推进 N 帧（每帧 50ms 游戏时间）。 */
+    /** 可选：派发下一步输入前先确定性推进 N 帧（每帧 50ms 游戏时间）——只控制输入节奏，与断言判定无关。 */
     val frames: Int? = null
 )
 
@@ -35,8 +39,10 @@ data class GameScenario(
     /** 人类可读的断言名称（回传给模型时展示）。 */
     val name: String = "",
     val steps: List<ScenarioStep> = emptyList(),
-    /** 针对 s（= __wwDebugState() 返回快照）的布尔表达式，如 s.score > 0。 */
-    val expect: String
+    /** 针对 s（= __wwDebugState() 返回快照）的布尔表达式，如 s.score > 0；期限内任一帧为真即通过。 */
+    val expect: String,
+    /** 期限（帧）：默认 [GameScenarios.HORIZON_DEFAULT_FRAMES]，上限 [GameScenarios.HORIZON_MAX_FRAMES]。 */
+    val horizon: Int? = null
 )
 
 object GameScenarios {
@@ -44,9 +50,13 @@ object GameScenarios {
     const val FILE = "scenarios.json"
     const val MAX_SCENARIOS = 6
     const val MAX_STEPS = 12
-    const val MAX_FRAMES_PER_SCENARIO = 40
+    /** 断言期限默认值（帧，每帧 50ms 游戏时间）＝ 15 秒游戏时间。 */
+    const val HORIZON_DEFAULT_FRAMES = 300
+    /** 断言期限上限（帧）＝ 30 秒游戏时间；沙箱墙钟预算的硬顶。 */
+    const val HORIZON_MAX_FRAMES = 600
+    /** 输入步骤之间执行器默认推进的帧数（让输入生效并被逐帧求值观察到）。 */
+    const val INTER_STEP_FRAMES = 30
     const val MAX_EXPECT_LEN = 300
-    const val DEFAULT_FRAMES = 24
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
@@ -86,8 +96,9 @@ object GameScenarios {
         val list = parse(raw)
         if (list.isEmpty()) {
             return false to "scenarios.json 未解析出可执行断言。必须输出合法 JSON：" +
-                "{\"scenarios\":[{\"id\":\"...\",\"system\":\"...\",\"name\":\"...\",\"steps\":[{\"tap\":[50,80]},{\"frames\":24}],\"expect\":\"s.score > 0\"}]}；" +
-                "expect 为针对 __wwDebugState() 快照 s 的布尔表达式，且不得为空或超过 $MAX_EXPECT_LEN 字符。"
+                "{\"scenarios\":[{\"id\":\"...\",\"system\":\"...\",\"name\":\"...\",\"steps\":[{\"tap\":[50,80]}],\"expect\":\"s.score > 0\"}]}；" +
+                "expect 为针对 __wwDebugState() 快照 s 的布尔表达式（期限内任一帧为真即通过），" +
+                "且不得为空或超过 $MAX_EXPECT_LEN 字符。"
         }
         val weak = list.filter { containsTautology(it.expect) }
         if (weak.isNotEmpty()) {
@@ -100,7 +111,8 @@ object GameScenarios {
             "${sc.system.ifBlank { "通用" }}/${sc.name}(${sc.steps.size}步:${sc.expect.take(60)})"
         }
         return true to "功能断言文件检查：解析成功，共 ${list.size} 条——$summary。" +
-            "沙箱交付验收时会逐条确定性执行（点按/拖动→推进帧→比对快照），未通过将以 scenario-fail 回传。"
+            "执行器按序派发输入并在期限（默认 ${HORIZON_DEFAULT_FRAMES} 帧≈15 秒游戏时间）内逐帧求值，任一帧为真即通过；" +
+            "引用的快照字段必须真实存在（不存在会立即回报可用字段清单），失败回报自带字段轨迹。"
     }
 
     /** 恒真/近恒真子式检测：这类断言无法失败，写了等于没测（实测出现过 entities.length>=0）。 */
@@ -130,7 +142,7 @@ object GameScenarios {
                 step.drag != null && step.drag.size >= 4 ->
                     ScenarioStep(drag = step.drag.take(4).map { it.coerceIn(0.0, 100.0) })
                 step.frames != null ->
-                    ScenarioStep(frames = step.frames.coerceIn(1, MAX_FRAMES_PER_SCENARIO))
+                    ScenarioStep(frames = step.frames.coerceIn(1, HORIZON_MAX_FRAMES))
                 else -> null
             }
         }.take(MAX_STEPS)
@@ -138,8 +150,9 @@ object GameScenarios {
             id = raw.id?.trim().orEmpty().ifEmpty { label },
             system = raw.system?.trim().orEmpty(),
             name = label,
-            steps = steps.ifEmpty { listOf(ScenarioStep(frames = DEFAULT_FRAMES)) },
-            expect = expect
+            steps = steps,
+            expect = expect,
+            horizon = raw.horizon?.coerceIn(1, HORIZON_MAX_FRAMES)
         )
     }
 
@@ -149,7 +162,8 @@ object GameScenarios {
         val system: String? = null,
         val name: String? = null,
         val steps: List<RawStep>? = null,
-        val expect: String? = null
+        val expect: String? = null,
+        val horizon: Int? = null
     )
 
     @Serializable

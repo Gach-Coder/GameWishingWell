@@ -152,31 +152,6 @@ internal fun pickStreamPreview(content: String, thinking: String, toolArgChars: 
  *   （agent.log 实测：同断言连烧 90+ 轮，模型反复选择修逻辑而不肯对齐断言）；
  * - 快照呈"零敌人/零实体 + state playing"特征时附定向线索（帧预算不足等到出怪）。
  */
-internal fun alignmentHintFor(failCounts: Map<String, Int>, sampleError: String?): String {
-    val repeated = failCounts.filter { it.value >= 3 }
-    if (repeated.isEmpty()) return ""
-    val arbitrated = repeated.filter { it.value >= 5 }
-    val zeroActivity = sampleError?.let {
-        Regex(""""enemyCount":\s*0|"entities":\s*\[\]""").containsMatchIn(it) &&
-            Regex(""""state":\s*"playing"""").containsMatchIn(it)
-    } == true
-    return if (arbitrated.isNotEmpty()) {
-        val arbList = arbitrated.entries.joinToString("；") { "「${it.key}」（${it.value} 轮）" }
-        "\n【断言对齐仲裁（强制，优先于之前的任何重写/换思路建议）】$arbList 已连续多轮未通过，" +
-            "且此前多轮修改游戏逻辑均未解决——判定为断言与实现/测试预算不对齐：" +
-            "本轮必须修改 scenarios.json 对应条目（增加 steps 的 frames 帧预算让机制有时间发生，" +
-            "或修正 expect 的字段名/阈值以匹配实际快照），使断言可判定；" +
-            "禁止再修改 index.html，除非能明确指出快照中的行为缺陷。" +
-            (if (zeroActivity) "快照显示 enemyCount=0/entities 为空且 state=playing：大概率是帧预算不足以等到出怪/敌人到达——增加 frames，而不是继续改出怪逻辑。" else "")
-    } else {
-        val list = repeated.entries.joinToString("；") { "「${it.key}」已连续 ${it.value} 轮未通过" }
-        "\n【断言对齐判定】$list。请对照最近回传的实际快照重新判定：" +
-            "若游戏状态本身合理（其它断言通过、系统按验收行为运行），是断言字段名/阈值/steps 帧预算与实现不符——" +
-            "应修改 scenarios.json 对应条目（expect 或 steps），而不是继续改游戏逻辑；" +
-            "确属游戏行为缺陷才修 index.html。"
-    }
-}
-
 /**
  * LLM 失败分类（internal 供单测）：
  * - 账户额度/计费类不可重试且需要如实的用户文案——GLM 以 429+code1113 表达"余额不足"、
@@ -729,11 +704,17 @@ class GameAgent(
                         failTurn("请先在「设置」中配置 API Key、地址和模型")
                         return@runTurnSafely
                     }
+                    val planStartMs = System.currentTimeMillis()
+                    alog("planning: 策划层 LLM 开始（systems=${schema.gameSystems.size}）")
                     val draftPlan = PlanningEngine.draftWithLlm(
                         schema = schema,
                         llm = llm,
                         existingTitle = _session.value.designPlan?.title,
                         currentUserRequest = pending.userRequest
+                    )
+                    alog(
+                        "planning: 策划层 LLM 完成，耗时 ${((System.currentTimeMillis() - planStartMs) / 1000.0).toInt()}s" +
+                            "（${draftPlan.implementations.size} 个系统定稿）"
                     )
                     currentCoroutineContext().ensureActive()
                     val finalPlan = PlanningEngine.finalize(
@@ -1448,9 +1429,9 @@ class GameAgent(
             else -> "游戏策划中：正在根据确认结果定稿 ${plan.gameSystems.joinToString("、")}（已排除 ${plan.excludedSystems.size} 个系统）"
         }
         val decisionEntry = if (isFixTurn) {
-            "修复轮：沿用已确认方案（${plan.templateClass}，${plan.implementations.size} 个系统不变），只修复异常、功能特性不变；文件计划 index.html"
+            "修复轮：沿用已确认方案（${plan.templateClass}，${plan.implementations.size} 个系统不变），只修复异常、功能特性不变；文件计划 index.html（多文件形态下按需修改对应 js/css）"
         } else {
-            "决策层定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html（HTML→CSS→JS）"
+            "决策层定稿：${plan.templateClass}，实现 ${plan.implementations.size} 个系统、排除 ${plan.excludedSystems.size} 个系统；P0=${plan.p0Features.size} P1=${plan.p1Features.size} P2=${plan.p2Features.size}；文件计划 index.html + css/style.css + js/<系统>.js（多文件组织，运行前合并）"
         }
         _session.update { s ->
             s.copy(
@@ -1459,7 +1440,7 @@ class GameAgent(
                 agentStage = planningStage,
                 gameSchema = intent,
                 designPlan = plan,
-                filePlan = listOf("index.html"),
+                filePlan = listOf("index.html", "css/*.css", "js/*.js"),
                 decisionLog = s.decisionLog + decisionEntry
             )
         }
@@ -1488,7 +1469,16 @@ class GameAgent(
             workspace,
             // 多文件契约：本地 script/link 引用按工作区存在性裁决（存在=合法组织，
             // 缺失=error 引导模型先 writefile 创建），外部资源与二进制禁令不变。
-            validate = { GameValidator.validate(it, allowedEngines, localFileExists = { rel -> workspaceFileExists(rel) }) }
+            // 校验对象是内联后的合并视图——可观测性契约（__wwDebugState）与 eval 禁令
+            // 可能落在被引用的 js 文件里，只看原始入口会误报"缺少契约"回炉。
+            validate = { html ->
+                GameValidator.validate(
+                    GameBundle.inline(html) { rel -> workspaceRead(rel) },
+                    allowedEngines,
+                    localFileExists = { rel -> workspaceFileExists(rel) },
+                    inlineView = true
+                )
+            }
         )
 
         var outcome = runToolLoop(
@@ -1498,7 +1488,7 @@ class GameAgent(
             instruction = instruction,
             plan = plan,
             firstGeneration = existingHtml.isNullOrBlank(),
-            seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
+            seedWorkspaceFp = workspaceFingerprint(workspace),
             allowedEngines = allowedEngines,
             fixTurn = isFixTurn,
             scopeFence = scopeFence
@@ -1574,8 +1564,9 @@ class GameAgent(
     /**
      * 工具模式 Agent Loop：
      * 终止 = 模型某轮不再发起工具调用；验收 = 工作区当前 index.html 通过基础校验
-     * 与沙箱冒烟测试，且修改轮（[seedHash] 非 null）相对种子版本发生了实际内容
-     * 变化——防止模型不做任何 editfile 就空口宣称完成。
+     * 与沙箱冒烟测试，且工作区整体指纹（[seedWorkspaceFp]，覆盖全部文件而非仅入口）
+     * 相对种子状态发生了实际变化——防止模型不做任何写入就空口宣称完成；
+     * 度量覆盖辅助文件（js/css）与 scenarios.json 的修改，纯辅助修复不会被误拒。
      * 交付约束：不存在"带错交付"——同一错误签名 3 次注入"换思路"、6 次起强制
      * "重写问题模块/换实现"，连续 10 次同一签名或总轮次达 40 时如实失败终止
      * （保留中间版本可试玩，属主动止损而非带错交付）；用户停止键可随时中断。
@@ -1587,7 +1578,7 @@ class GameAgent(
         instruction: String,
         plan: DesignPlan,
         firstGeneration: Boolean,
-        seedHash: String? = null,
+        seedWorkspaceFp: String? = null,
         /** 本轮允许的内置引擎集合（generateFromIntent 一次算好传入，验收与写入校验同源）。 */
         allowedEngines: Set<String> = GameEngines.BUNDLED.keys,
         /** 修复轮（运行报错回传/修复快车道）：自检降为一轮回归检查，且不参与预算复核。 */
@@ -1620,9 +1611,15 @@ class GameAgent(
         var scenarioNudged = false
         var scenarioEvidence: String? = null
         // 回合结构指标（跨游戏横向度量迭代健康度）：readfile 调用次数、断言失败累计、
-        // 沙箱总尝试次数；同断言连续失败计数用于"修断言还是修游戏"的对齐路由。
-        val scenarioFailCounts = mutableMapOf<String, Int>()
+        // 沙箱总尝试次数。
         var scenarioFailTotal = 0
+        // 方向断言连续失败计数：orientation-mismatch 是"模型无法修"的失败类别
+        // （期望来自 Game Schema/用户确认，改游戏或旋转画布都不能满足错误期望），
+        // 累计 3 次即判定方向期望与游戏形态错位，确定性逃生交回用户，不再回炉模型。
+        var orientationStrikes = 0
+        // 历史中的沙箱失败反馈下标：只保留最近两条全文，更早的折叠为一句摘要——
+        // 每次失败的详情（含断言轨迹）全文进历史会持续抬高后续每轮的延迟。
+        val smokeFailMsgIdx = mutableListOf<Int>()
         var readfileCalls = 0
         var sandboxAttempts = 0
         // 连续"既无工具调用也无代码输出"的轮数：≥2 判定模型不会 function calling，
@@ -1631,7 +1628,7 @@ class GameAgent(
         // 已记录的 readfile 结果在消息历史中的下标：文件一旦被修改即失效，
         // 替换为过期提示——既防上下文膨胀（每读一次多几万 token 拷贝），
         // 也防模型拿旧拷贝当编辑依据导致 old_string 失配、浪费轮次。
-        val readResultIndices = mutableListOf<Int>()
+        val readResultMarks = mutableListOf<Pair<Int, String>>()
 
         while (true) {
             round++
@@ -1691,10 +1688,30 @@ class GameAgent(
                     continue
                 }
 
-                // 中途退化：模型在正文直接给出整份代码 → 按隐式写入处理（等价 overwrite 写入）。
-                // 修改范围契约只在提示词层约束，正文写入不做检查或撤回。
+                // 正文完整 HTML 的分流：
+                // - 工具从未成功（mutatedOnce=false，不会 function calling 的模型）：按隐式写入
+                //   处理（等价 overwrite 写入）——这是它们产出代码的唯一通路；
+                // - 工具已正常工作：正文出代码是提示词违规而非降级通路——用它覆写已验证的
+                //   工作区等于清掉健康状态，且模型不知道发生了覆写（后续在错误状态上空转）。
+                //   忽略并纠正，不碰工作区；修改范围契约只在提示词层约束，正文写入不做检查或撤回。
                 var content = current
                 if (directHtml != null && directHtml != current) {
+                    if (mutatedOnce) {
+                        if (nudgesLeft <= 0) {
+                            failTurn(
+                                "本轮没有产生新的修改。你可以重试，或直接描述想要的效果（如「再简单一点」「加个计分板」）。",
+                                internalDetail = "正文 HTML 违规提醒后仍未通过工具修改（nudge 耗尽）"
+                            )
+                            return GenOutcome.Failed
+                        }
+                        nudgesLeft--
+                        messages += ChatMessage(
+                            "user",
+                            "检测到回复正文包含完整 HTML，已忽略（未写入任何文件）：文件内容一律通过 writefile/editfile 写入，回复正文只用于与玩家沟通。" +
+                                "请改用工具落实你要做的修改，完成后停止调用工具并输出总结。"
+                        )
+                        continue
+                    }
                     val saved = if (current == null) {
                         workspace.writeInitial(GameFileWorkspaceEntryPoint.DEFAULT, directHtml)
                     } else {
@@ -1713,10 +1730,16 @@ class GameAgent(
                 // 模型声称完成：以工作区内容为准重新校验，通过且（修改轮）确实
                 // 发生了内容变化才接受；防止模型不做任何修改就宣称完成。
                 if (content != null) {
-                    val report = GameValidator.validate(content, allowedEngines, localFileExists = { rel -> workspaceFileExists(rel) })
+                    // 验收同样校验内联合并视图（__wwDebugState 可能定义在被引用的 js 文件里）
+                    val report = GameValidator.validate(
+                        GameBundle.inline(content) { rel -> workspaceRead(rel) },
+                        allowedEngines,
+                        localFileExists = { rel -> workspaceFileExists(rel) },
+                        inlineView = true
+                    )
                     lastReport = report
                     if (!report.hasErrors) {
-                        val changed = seedHash == null || GameFileWorkspace.sha256(content) != seedHash
+                        val changed = workspaceFingerprint(workspace) != seedWorkspaceFp
                         if (changed) {
                             if (!firstPassDone) {
                                 firstPassDone = true
@@ -1754,19 +1777,27 @@ class GameAgent(
                                 }
                                 if (smokeErrors.isEmpty()) alog("sandbox timeout WITHOUT errors -> treat as pass (slow env, frames=${smoke.framesRun})")
                                 if (smokeErrors.isNotEmpty()) {
-                                    // 断言失败记账与对齐路由：同一条断言连续多次失败时，
-                                    // 大概率是断言与实现不对齐（字段名/阈值/帧预算）而非游戏 bug——
-                                    // 快照显示系统行为合理时应修断言，别让模型反复改游戏逻辑空烧轮次。
+                                    // 断言失败只做回合指标累计——失败原因的定位由断言回报自带：
+                                    // eventually 语义下"期限未达成"回报附字段轨迹与输入点状态，
+                                    // "字段不存在"独立成信号，无需按失败次数累积的对齐路由。
                                     val failedLabels = smokeErrors.mapNotNull { err ->
                                         Regex("""scenario-fail\[([^\]]+)]""").find(err)?.groupValues?.get(1)
                                     }
-                                    if (failedLabels.isNotEmpty()) {
-                                        scenarioFailTotal += failedLabels.size
-                                        failedLabels.forEach { label ->
-                                            scenarioFailCounts[label] = (scenarioFailCounts[label] ?: 0) + 1
-                                        }
+                                    scenarioFailTotal += failedLabels.size
+                                    // 方向错位逃生门：orientation-mismatch 累计 3 次 = 期望（来自
+                                    // 确认门/Game Schema）与游戏实际形态错位，模型无法通过修改
+                                    // 游戏满足错误期望（旋转画布被禁止、玩法形态由需求决定）——
+                                    // 确定性终止并把修正权交回用户，而不是无限回炉换措辞。
+                                    orientationStrikes += smokeErrors.count { it.startsWith("orientation-mismatch") }
+                                    if (orientationStrikes >= 3) {
+                                        alog("orientation escape: $orientationStrikes strikes -> hand back to user")
+                                        failTurn(
+                                            "画面方向多次验证未通过：游戏画面与确认时选择的「${if (expectLandscape) "横板" else "竖版"}」方向不符。" +
+                                                "请回复正确的画面方向（横板/竖版）或描述期望的画面形态，我会按正确方向重新调整。",
+                                            internalDetail = "orientation-mismatch 累计 $orientationStrikes 次：方向期望与游戏形态错位（模型无法通过修改游戏满足错误期望），交回用户修正"
+                                        )
+                                        return GenOutcome.Failed
                                     }
-                                    val alignmentHint = alignmentHintFor(scenarioFailCounts, smokeErrors.joinToString(";"))
                                     val normalized = ErrorSignature.normalize("冒烟测试失败:" + smokeErrors.joinToString(";"))
                                     val known = RetryBookkeeping.record(_session.value.knownErrors, ErrorCategory.USER_RUNTIME, normalized)
                                     saveGlobalErrorSignatures(known)
@@ -1791,17 +1822,36 @@ class GameAgent(
                                         smokeErrors.firstOrNull { StubbornErrorTracker.issueSignature("smoke", it) == topSig }
                                     }
                                     appendEscalation(messages, maxRepeat, "沙箱运行", stubbornDetail)
+                                    // 失败反馈附工作区清单：模型不必再用 listfiles 探测状态
+                                    // （实测一次死循环回合里 31 个 listfiles 轮全是这类信息补全）。
+                                    val manifestNote = runCatching {
+                                        "；当前工作区：" + workspace.manifest().files
+                                            .joinToString("、") { "${it.path}(v${it.version})" }
+                                            .take(240)
+                                    }.getOrDefault("")
                                     val scenarioHint = if (smokeErrors.any { it.startsWith("scenario-fail") }) {
-                                        "\n其中 scenario-fail 为功能断言未通过：先对照实际快照判断是游戏行为问题（修 index.html 逻辑）" +
-                                            "还是断言与实现不对齐（同步修 scenarios.json 的 expect/字段名），不要为通过断言而弱化游戏逻辑。"
+                                        "\n其中 scenario-fail 为功能断言未通过，回报已自带定位信息：" +
+                                            "字段轨迹全程不变＝机制未发生（修游戏逻辑或断言字段）；提示字段不存在＝对齐 expect 字段名；" +
+                                            "断言在期限内任一帧为真即通过，不要为通过断言而弱化游戏逻辑。"
                                     } else ""
+                                    // 失败历史只保留最近两条全文：更早的折叠为摘要（信息可从最近反馈
+                                    // 与遗留问题注入恢复），防多轮失败把上下文越堆越厚。
+                                    if (smokeFailMsgIdx.size >= 2) {
+                                        val folded = smokeFailMsgIdx.removeAt(0)
+                                        messages[folded] = ChatMessage(
+                                            "user",
+                                            "（更早一次沙箱失败反馈已折叠：未解决的错误会出现在最近一次反馈或遗留问题清单里，无需回看原文。）"
+                                        )
+                                    }
                                     messages += ChatMessage(
                                         "user",
                                         "基础校验已通过，但冒烟测试未通过（确定性 tick ${smoke.framesRun} 帧）：" +
                                             smokeErrors.take(5).joinToString("；") +
-                                            scenarioHint + alignmentHint +
+                                            manifestNote +
+                                            scenarioHint +
                                             "\n请用 editfile 修复；沙箱跑通前不要结束。"
                                     )
+                                    smokeFailMsgIdx += messages.lastIndex
                                     continue
                                 }
                             }
@@ -1860,8 +1910,8 @@ class GameAgent(
                         nudgesLeft--
                         messages += ChatMessage(
                             "user",
-                            "本轮还没有对 index.html 做任何实际修改，不能就此结束。请先 readfile 获取最新代码，" +
-                                "再用 editfile 落实以下需求：$instruction"
+                            "本轮还没有对工作区做任何实际修改，不能就此结束。请用 writefile/editfile 落实以下需求" +
+                                "（必要时先 readfile 获取最新代码）：$instruction"
                         )
                         continue
                     }
@@ -1913,8 +1963,9 @@ class GameAgent(
                 _session.update { it.copy(agentStage = "工具执行中：${call.name}") }
                 val outcome = executor.execute(call)
                 if (outcome.name == GameTools.READ_FILE) readfileCalls++
-                // 空转计数看"是否写入过任何文件"（含 scenarios.json）；
-                // currentHtml 发布与读结果过期只由入口文件（index.html）变更触发。
+                // 空转计数看"是否写入过任何文件"（含 scenarios.json 与 js/css 辅助文件）；
+                // currentHtml 发布只由入口文件（index.html）变更触发——辅助文件内容不是
+                // HTML，发布会顶掉可玩版本；读结果过期按写入路径精确进行（见循环末尾）。
                 if (outcome.workspaceTouched) {
                     mutatedThisRound = true
                     mutatedOnce = true
@@ -1933,19 +1984,23 @@ class GameAgent(
                     toolCallId = outcome.callId
                 )
                 if (outcome.ok && outcome.name == GameTools.READ_FILE) {
-                    readResultIndices += messages.lastIndex
+                    readResultMarks += messages.lastIndex to (outcome.path ?: GameFileWorkspaceEntryPoint.DEFAULT)
                 }
-                if (outcome.mutated) {
-                    // 此前所有 readfile 结果均已过期：折叠为提示，避免历史里堆积
-                    // 多份完整文件拷贝（上下文膨胀）并误导后续 old_string。
-                    for (i in readResultIndices) {
-                        messages[i] = ChatMessage(
-                            ChatMessage.ROLE_TOOL,
-                            "（此读取结果已过期：文件已被修改。请依据最近一次 editfile 返回的修改点上下文继续编辑；如需全貌再重新 readfile。）",
-                            toolCallId = messages[i].toolCallId
-                        )
+                // 写入让同路径的历史 readfile 结果过期：折叠为提示，避免历史里堆积
+                // 多份完整文件拷贝（上下文膨胀）并误导后续 old_string。按路径精确过期——
+                // 写 index.html 不作废 js/css 文件的读取结果（其内容未变，继续可用省一次重读），反之亦然。
+                if (outcome.workspaceTouched && outcome.ok && outcome.path != null) {
+                    val expired = readResultMarks.filter { it.second == outcome.path }
+                    if (expired.isNotEmpty()) {
+                        for ((i, _) in expired) {
+                            messages[i] = ChatMessage(
+                                ChatMessage.ROLE_TOOL,
+                                "（此读取结果已过期：文件已被修改。请依据最近一次 editfile 返回的修改点上下文继续编辑；如需全貌再重新 readfile。）",
+                                toolCallId = messages[i].toolCallId
+                            )
+                        }
+                        readResultMarks.removeAll(expired)
                     }
-                    readResultIndices.clear()
                 }
             }
             lastReport?.takeIf { it.hasErrors }?.let { recordKnownErrors(it) }
@@ -2184,7 +2239,10 @@ class GameAgent(
         scopeFence: Boolean = false
     ): String = buildString {
         if (firstGeneration) {
-            append("参考模板（这是可读取的 game_template.html，不是用户需求）：\n\n<game_template>\n")
+            append(
+                "参考模板（单文件最小示例，只示范契约与写法，不是用户需求；正式游戏按【工具工作流】做多文件组织——" +
+                    "把模板里的 <style>/<script> 内容独立为 css/style.css 与 js/*.js 并在 index.html 引用，代码写法不变）：\n\n<game_template>\n"
+            )
             append(GamePrompt.readTemplate(appContext))
             append("\n</game_template>\n\n")
         } else {
@@ -2255,6 +2313,20 @@ class GameAgent(
     /** 当前会话工作区是否存在某文件（多文件契约的存在性裁决）。 */
     private fun workspaceFileExists(rel: String): Boolean =
         runCatching { GameFileWorkspace(gameWorkspaceDir()).resolve(rel)?.isFile == true }.getOrDefault(false)
+
+    /**
+     * 工作区整体指纹（全部文件 path@sha256 的聚合）："防空口完成"门的度量对象。
+     * 旧实现只比对入口哈希——多文件组织下纯辅助文件修复（js/css）或纯断言修复
+     * （scenarios.json）不改变入口，正确的修改会被门拒绝并被 nudge 引导去改 index.html
+     * （"存在正确动作但被门拒绝"与断言 40 帧硬顶同族）。指纹覆盖全部文件后，
+     * 任何真实写入都算数；净零修改（写入后又改回种子状态）仍按无修改处理。
+     */
+    internal fun workspaceFingerprint(workspace: GameFileWorkspace): String =
+        runCatching {
+            workspace.manifest().files
+                .sortedBy { it.path }
+                .joinToString("|") { "${it.path}@${it.sha256}" }
+        }.getOrDefault("")
 
     /**
      * 编辑区运行副本（预览入口）：入口 html（会话当前发布版本）+ 工作区辅助文件
@@ -2415,7 +2487,7 @@ class GameAgent(
 
     /** 只把校验器发现的事实回喂给 LLM，不再引入质量自检翻案或策划范围重做环节。 */
     private fun validationFeedback(report: ValidationReport, signature: String): String = buildString {
-        append("基础校验未通过（错误签名 $signature），请修复以下问题后重新输出完整 HTML：\n")
+        append("基础校验未通过（错误签名 $signature），请用工具修复以下问题：\n")
         report.errors.take(10).forEach { issue ->
             append("- [${issue.category}] ${issue.file}:${issue.line} ${issue.message}\n")
         }

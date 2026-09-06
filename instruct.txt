@@ -150,7 +150,27 @@ Agent处理message流程如下：
 	→ Agent Loop：（bug 修复轮数不设上限，多轮属正常；仅无进展与运行验证环境异常两类非修复性退出；
 	  输出零截断：不携带 max_tokens、工具观察与消息全量透传；网络层超时（连接30s/读静默12min/写60s）是死连接探测器
 	  而非 LLM 时长限制——只要流上有字节就永不触发，触发后走自动重试不截断输出；整体时长不设限，停止键是用户侧唯一主动中断）
-	主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/appendfile/editfile，沙箱严格限游戏工作区目录）
+		主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/appendfile/editfile，沙箱严格限游戏工作区目录）
+		多文件组织为工具模式默认工作方式：首生成先列文件计划（index.html 骨架引用 + css/style.css + js/config.js、
+		  js/<系统>.js、js/main.js 按依赖顺序），同一轮并行 writefile 建立（先写被引用文件、最后写入口——
+		  入口校验即时核对引用存在性）；跨文件经全局命名空间协作（普通 script，无 ES module）；
+		  修改迭代新增系统优先新建 js/<系统>.js + 入口补引用，而非往已有大文件里堆；
+		  质量档位联动（快速=可全内联单文件直出/轻量=三件套/均衡=按系统拆分/精品=每系统一文件+分段拼装）；
+		  辅助文件（js/css）写入不发布 currentHtml、不走入口 HTML 校验（防伪错误与误发布把模型逼回单文件形态），
+		  只做按类型轻量校验（js：eval/module 禁令；css：url() 外链），ToolOutcome.path 支撑读结果按路径精确过期；
+		  入口校验与交付验收的对象是内联合并视图（GameBundle.inline 后再 validate，inlineView=true 跳过拆分建议）——
+		  __wwDebugState 与 eval 禁令可能落在被引用的 js 文件里，只看原始入口会误报"缺少契约"回炉；
+		  入口纯内联超 600 行时校验附"建议拆分"warning（非错误，修复回合忽略）
+		  反无用功加固（2026-09 深扫落地，与断言根治同族缺陷的系统性清除）：
+		  - 正文 HTML 守卫：工具已正常工作（mutatedOnce）后，正文出现完整 HTML 一律忽略并纠正
+		    （"文件内容一律通过工具写入"），不再隐式覆写已验证的工作区——隐式写入仅保留给
+		    "工具从未成功"的降级模型（其唯一产出通路）；
+		  - 失败反馈信息补全：沙箱失败反馈附当前工作区清单（模型无需 listfiles 探测状态，
+		    消除死循环回合里 31 个探测轮的动机）；listfiles 无写入时去重回指针（任何写入即失效）；
+		  - 方向错位逃生门：orientation-mismatch 累计 3 次即确定性终止并把修正权交回用户
+		    （"模型无法修"的失败类别——期望来自确认门/Game Schema，不再无限回炉换措辞）；
+		  - 失败历史折叠：沙箱失败反馈只保留最近两条全文，更早的折叠为摘要（防多轮失败堆厚上下文）；
+		  - 策划层 LLM 调用打点（开始/耗时/定稿系统数）——消除确认后到首轮之间的观测黑洞。
 	readfile 整读自适应：千行级以内文件的切片请求直接整读返回（实测修复轮 60~70% 轮次耗在切片重读上，每片一次 LLM 往返），
 	  真正的大文件（>1200 行）保留切片语义；工具描述与纪律提示同步要求"多区段一轮并行 readfile、修改一轮并行 editfile"
 		写入策略与修改范围契约：
@@ -162,11 +182,14 @@ Agent处理message流程如下：
 			首次创建轮与用户明确要求重做的回合不注入。
 		无截断机制（彻底贯彻）：不捕获/不处理 finish_reason 截断信号；请求不携带 max_tokens（Anthropic 协议因 API 强制要求发送模型上限值），
 		  工具观察（tool_result）与消息不做任何长度裁切——截断输出/裁切上下文只会制造非法工具参数与残缺代码；
-		  模型输出体量由任务自然约束（首次生成体量大时允许 writefile 骨架 + appendfile 分段拼装）
+		  模型输出体量由任务自然约束（多文件组织分而治之：单次 writefile 体量小不易截断；
+		    大文件仍可 writefile 骨架 + appendfile 分段拼装）
 			→ 模型发起 tool call → 宿主经 GameFileWorkspace 执行（版本化文件+指针切换+同会话加锁+hash防并发覆盖；
 			  修改用 old_string 逐字符精确替换且要求唯一（或 replace_all），全量重写仅限首次生成或 overwrite=true 结构性重构）
 			→ 每次写入后宿主自动检查产品契约（外部资源/eval 禁令，无解析器代差），报告作为"观察"附在 tool_result 回传
-			→ 模型不再发起工具调用即自然终止；验收 = 产品契约通过 + 修改轮内容哈希≠种子哈希（防"空口完成"）+ 沙箱运行通过（均衡/精品档另含 scenarios.json 功能断言全通过）+ 可玩性自检轮全部完成
+			→ 模型不再发起工具调用即自然终止；验收 = 产品契约通过 + 工作区整体指纹≠种子指纹（防"空口完成"——
+			  指纹=全部文件 path@sha256 聚合：纯辅助文件修复 js/css 与纯断言修复 scenarios.json 都算实际修改，
+			  旧"只比入口哈希"会把正确修改误拒并引导模型去改 index.html）+ 沙箱运行通过（均衡/精品档另含 scenarios.json 功能断言全通过）+ 可玩性自检轮全部完成
 			→ 每次写入即刻发布中间版本到会话，中断后玩家可立即试玩
 			→ 回合耗时回显：四类回合入口（发送消息/确认门确认/报障修复/再试一次）起算计时，回复结算附带"本轮耗时"——
 			  成功回复为"（本次 Agent Loop 共 N 轮，耗时 X）"、聊天与失败回复为"（耗时 X/本轮耗时 X）"；
@@ -220,16 +243,23 @@ Agent处理message流程如下：
 			  负血量实体未移除（hp<0 应当帧移除）、数值 NaN/Infinity、活动实体超 500（泄漏）、
 			  deep 重启后 state 仍为 over（重置不完整）——"不抛错但明显不对"的低级逻辑 bug 在交付前被客观拦截
 			+ 功能断言/场景回归（均衡/精品档，GameScenario）：策划验收边界固化为可执行断言——
-			  生成模型用 writefile 在工作区维护 scenarios.json（{"scenarios":[{id,system,name,steps,expect}]}，
+			  生成模型用 writefile 在工作区维护 scenarios.json（{"scenarios":[{id,system,name,steps,expect,horizon?}]}，
 			  最多 6 条/每条 12 步），expect 为针对 s（=__wwDebugState() 快照）的布尔表达式，
-			  steps 为视口百分比输入脚本（tap/drag）+ 确定性帧推进（frames，每帧 50ms）；
+			  steps 为视口百分比输入序列（tap/drag），frames 退化为可选的步间节奏；
+			  eventually 语义（根治断言死循环的契约层）：断言在期限（默认 300 帧≈15 秒游戏时间、上限 600 帧）
+			  内任一帧为真即通过，探针逐帧求值、翻真即停——时间归执行器、内容归作者，
+			  模型不再预测"第几帧会发生什么"，帧预算不再可能是失败原因（旧实现的 40 帧硬顶 + "帧要给足"预言条款已删除）；
 			  主跑帧与不变量检查全绿后，探针在同一 finalize 调用内同步逐条执行：
-			  restart() 重置 → 按 steps 派发输入 → 独立帧预算（≤40帧）推进 → 对快照求值断言；
-			  失败以 scenario-fail[系统/名称]+实际快照（截断300字符）回传驱动修复（附"修逻辑还是对齐断言"引导）；
+			  restart() 重置 → 复活心跳（__parkedRaf 暂存帧边界外的 rAF 注册、阶段重置计数后回灌队列——
+			  旧实现回调节链在主阶段末断裂、场景阶段游戏冻结，断言只能对初始状态求值，任何游戏逻辑修改都无法翻真，
+			  与 40 帧硬顶同为历史 28 分钟死循环的根因）→ 按 steps 派发输入（步间默认推进 30 帧）→ 期限内逐帧判定；
+			  失败回报三类独立自明信号（不再混叠、无需对齐路由）：
+			  ①字段不存在（expect 引用的一级快照字段第 0 帧确定性校验，附可用字段清单）；
+			  ②期限未达成（附字段轨迹：引用字段每 8 帧采样 + 输入派发点帧号与 state + 终态快照）；
+			  ③表达式语法/执行错误；旧"3/5 轮断言对齐路由"（alignmentHintFor）随信号自明整体删除；
 			  全部通过才放行——裁决权在确定性执行而非 LLM Critic（"LLM 提出，确定门裁决"）；
 			  写 scenarios.json 时执行器即时做解析校验反馈（不发布 currentHtml、不跑 HTML 契约、不切入口指针）；
 			  恒真式静态拒绝：expect 含 >=0（计数/长度天然非负）、!== undefined/null、typeof 判存在等近恒真子式时写入即打回（实测出现过 entities.length>=0 这类"写了等于没测"的断言）；
-			  断言对齐路由：同一断言连续 3 次未通过时，反馈强制模型先做对齐判定——快照显示系统按验收行为运行则修断言（expect/steps）而非反复改游戏逻辑；
 			  回归保护：文件持久化在游戏工作区跨迭代存活，修复玩家报障时把问题固化为新断言追加，
 			  此后每次修改重跑全部断言，防"修好新问题弄坏旧功能"；档位缺失时一次性 nudge 补写（仅生成轮）；
 			  套件上限 6 条：超限时提示合并同类或替换最弱断言（保留核心闭环与已修复缺陷条目）；
@@ -401,15 +431,15 @@ GameWishingWell/
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
 	      │  │  ├─ agent/
 	      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / 工具模式 Agent Loop（含无工具降级回环与修复快车道）；回合整体运行于全局 agentScope——策划+生成是同一个可取消任务
-	      │  │  │  ├─ GameTools.kt           # 工具定义(listfiles/readfile/writefile/editfile) + 沙箱执行器（写后自动校验回传）
+		      │  │  │  ├─ GameTools.kt           # 工具定义(listfiles/readfile/writefile/editfile) + 沙箱执行器（写后自动校验回传；辅助文件按类型轻量校验、不作入口发布）
 	      │  │  │  ├─ GameIntent.kt          # 意图层：dev/chat 二分类（正则优先+Lite LLM 复核）；修复快车道由会话状态推导
       │  │  │  ├─ GameRecognition.kt     # 识别层：会话级 Game Schema JSON、白名单校验、确认门；IntentEngine 纯文本特征正则
       │  │  │  ├─ GamePlan.kt            # 策划层：LLM 逐系统阐述具体实现、P0/P1/P2、验收清单
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
 	      │  │  │  ├─ GameBundle.kt          # 多文件运行前合并：入口 index.html + 工作区 js/css 相对引用 → 内联为自包含页面（真机/沙箱同管道）
-	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单）；运行校验由沙箱承担
+		      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单/辅助文件轻量校验/超大内联拆分建议）；运行校验由沙箱承担
 	      │  │  │  ├─ GameEngines.kt        # 内置引擎条件注册表（ww-engine 解析/BUNDLED/allowedFor 条件矩阵）
-	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控
+	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控/eventually 期限（horizon）
 	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试 + 功能断言执行 + 画面方向断言（横板按横屏视口运行）
       │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入（归档滚动保留，delete 同步清理版本簿记）
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账

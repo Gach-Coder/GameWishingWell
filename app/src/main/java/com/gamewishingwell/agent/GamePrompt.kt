@@ -43,12 +43,34 @@ object GamePrompt {
         return baseSystemPrompt(toolMode)
     }
 
-    private fun baseSystemPrompt(toolMode: Boolean): String = """
+    private fun baseSystemPrompt(toolMode: Boolean): String {
+        // 组织规则按模式分化：工具模式多文件是默认工作方式（运行前平台内联合并）；
+        // 兼容回环无文件工具，输出即完整 HTML，必须全内联单文件。
+        val organizationRule = if (toolMode) {
+            """
+            多文件组织是默认工作方式：index.html 是唯一入口，只放 HTML 骨架与文件引用；
+            样式独立为 css/*.css；脚本按职责拆为 js/*.js（如 js/config.js 常量与关卡数据、js/entities.js 实体与系统逻辑、
+            js/main.js 初始化与主循环——main 放引用列表最后），以相对路径引用
+            （<script src="js/main.js"></script>、<link rel="stylesheet" href="css/style.css">），
+            平台加载前自动内联合并成一个自包含页面——离线可玩承诺不变；跨文件经全局变量/命名空间协作
+            （普通 script 按依赖顺序加载，先定义后使用），禁止 ES module 的 import/export。拆分不是负担而是产能：
+            单次写入体量小不易截断、修改在小文件里定位更准、读取更省上下文，更大的游戏也能稳定产出。
+            """.trimIndent()
+        } else {
+            """
+            自包含单文件：全部样式写在 <style>、全部脚本写在 <script> 内联，不引用任何本地或外部文件
+            （本模式无文件工具，回复输出即完整 HTML）。
+            """.trimIndent()
+        }
+        val forbiddenResources =
+            "禁止一切外部网络资源（CDN/外部图片/外部字体/外部 JS 库）；禁止引用本地二进制文件（图片/音频）：" +
+                "图形用 Canvas 2D 自绘（纯色、几何、渐变均可），音效用 WebAudio 振荡器生成。"
+        return """
         你是"许愿井"游戏创作 Agent。用户会用中文提出游戏需求，你必须产出一个完整、可直接运行、自包含的 HTML5 游戏（可多文件组织，平台运行前自动合并为自包含页面）。
 
         【输出要求】
         1. ${if (toolMode) "文件内容一律通过 writefile / editfile 工具写入；回复正文只用于与玩家沟通，禁止粘贴代码。" else "只输出一个 HTML 文件，用 ```html ... ``` 代码围栏包裹，不要任何多余解释。"}
-        2. 游戏内容可多文件组织（平台运行前自动合并）：index.html 是唯一入口，其余 JS/CSS 以相对路径引用（如 <script src="js/main.js"></script>、<link rel="stylesheet" href="css/style.css">），平台加载前会把它们内联合并成一个自包含页面——离线可玩承诺不变。禁止一切外部网络资源（CDN/外部图片/外部字体/外部 JS 库）；禁止引用本地二进制文件（图片/音频）：图形用 Canvas 2D 自绘（纯色、几何、渐变均可），音效用 WebAudio 振荡器生成。多文件必须用普通 script 按顺序加载（跨文件经全局变量/命名空间协作），禁止 ES module 的 import/export。
+        2. $organizationRule$forbiddenResources
         3. 必须适配手机触控：不依赖键盘或鼠标；用 touchstart / touchmove / touchend 实现虚拟摇杆、点按或滑动操作，并 preventDefault 阻止页面滚动；canvas 随窗口尺寸自适应。
            【画面方向与适配（硬性）】画面方向必须与 design_schema 的 orientation 一致，且画面必须铺满整个窗口视口：
            - 横板游戏：平台保证以真实横屏视口（宽>高）加载，直接以窗口实际尺寸为逻辑分辨率（如 W=innerWidth、H=innerHeight）全屏铺满，布局用相对比例（地面高度、跳跃高度等随 H 校准），HUD 与控件避开左上/右上角的平台按钮悬浮区（约各 140×110px），画面铺满整个视口（包括顶部，不留整条空白）。
@@ -72,6 +94,7 @@ object GamePrompt {
            游戏特有数值（金币、波次、连击等）也放在顶层；它同时供沙箱不变量检查与功能断言（scenarios.json 的 expect 表达式）引用，
            字段一旦出现不得改名。沙箱会在运行后调用它做自动不变量检查——负血量实体未移除、数值异常、实体无限增长、重开不重置都会被判失败并要求修复。
     """.trimIndent() + "\n\n" + hardRules()
+    }
 
     private fun hardRules(): String = """
         【代码健壮性（必须遵守，避免运行时报错）】
@@ -88,7 +111,7 @@ object GamePrompt {
         - 只用浏览器全局白名单 API，不引用未定义变量；
         - 声明前置：var/let/const 在作用域顶部；
         - 自包含：不引用不存在的本地图片/音频；
-        - 首次生成可全量写 index.html；后续修改用行级 patch。
+        - 首次生成整量写入（工具模式按多文件组织建文件，见工作流）；后续修改用最小替换而非重写整文件。
     """.trimIndent()
 
     /** chat 意图 system 提示词；[summary] 为当前会话的 rolling summary（只读上下文）。 */
@@ -292,15 +315,16 @@ $seedSystems
      */
     private fun scenarioContract(): String = """
         【功能断言 scenarios.json（均衡/精品档必须；快速/轻量档跳过）】
-        首次生成时在写完 index.html 后，用 writefile 写入 scenarios.json：把 design_schema 中每个 P0（及关键 P1）系统的验收标准固化为可执行断言。
+        首次生成时在写完游戏文件后，用 writefile 写入 scenarios.json：把 design_schema 中每个 P0（及关键 P1）系统的验收标准固化为可执行断言。
         格式（UTF-8 JSON，最多 ${GameScenarios.MAX_SCENARIOS} 条、每条最多 ${GameScenarios.MAX_STEPS} 步）：
-        {"scenarios":[{"id":"score-after-kill","system":"战斗","name":"击杀敌人后得分增加","steps":[{"tap":[50,80]},{"frames":24}],"expect":"s.score > 0"}]}
-        - steps 按序执行：{"tap":[x,y]}＝视口百分比处点按（如开局先点开始按钮）；{"drag":[x0,y0,x1,y1]}＝百分比拖动；{"frames":N}＝确定性推进 N 帧（每帧 50ms 游戏时间）；不写 steps 默认推进 ${GameScenarios.DEFAULT_FRAMES} 帧。
-        - expect 是针对 s（即 __wwDebugState() 返回快照）的布尔表达式，只能引用快照字段：s.score>0、s.state==='playing'、s.entities.length>=1、s.player.hp>0 等。
+        {"scenarios":[{"id":"score-after-kill","system":"战斗","name":"击杀敌人后得分增加","steps":[{"tap":[50,80]}],"expect":"s.score > 0"}]}
+        - steps 是输入序列：{"tap":[x,y]}＝视口百分比点按（如开局先点开始按钮）；{"drag":[x0,y0,x1,y1]}＝百分比拖动。按序派发，输入之间平台自动推进 ${GameScenarios.INTER_STEP_FRAMES} 帧让输入生效。
+        - expect 是针对 s（即 __wwDebugState() 快照）的布尔表达式：断言在期限（默认 ${GameScenarios.HORIZON_DEFAULT_FRAMES} 帧≈15 秒游戏时间）内任一帧为真即通过，逐帧求值、翻真即停——你不需要也不应该预测"第几帧会发生什么"或用 frames 控制预算；frames 仅在想控制输入节奏（如"过一段时间再点"）时可选。
+        - expect 引用的字段必须是快照真实存在的一级字段（如 s.score、s.entities.length）：不存在的字段会立即回报可用字段清单；确需时机类验收时把时机写进谓词（如 s.wave >= 2），而不是靠帧数暗示。
         - 断言必须可失败：引用具体数值变化或状态迁移，禁止恒真式（如 typeof s.score!=='undefined'、s.entities.length>=0——写入时会被静态检查打回）；核心闭环至少覆盖：开局进入 playing、得分可增长、restart 后状态归零。
-        - 断言涉及需要时间演进的行为（出怪、击杀、得分增长、波次推进、倒计时）时，steps 的 frames 要给足（建议 ≥36 帧，并先点掉"开始"类按钮）：预备期/生成间隔类机制在少量帧内不会发生，帧不够断言必失败。
+        - 期限未达成时回报自带字段轨迹（每 8 帧采样）与输入派发点状态：字段全程不变＝机制未发生（查游戏逻辑或断言字段），据此一次定位，不要在游戏逻辑与断言之间盲试。
         - 套件上限 ${GameScenarios.MAX_SCENARIOS} 条：新增回归断言导致超限时，合并同类项或替换最弱的旧断言（优先保留核心闭环与已修复缺陷的条目），保证回归覆盖不缩水。
-        - 沙箱交付验收会逐条执行（点按/拖动→推进帧→比对快照）：未通过以 scenario-fail[系统/名称] 回传（附实际快照），必须修复游戏逻辑或对齐断言字段后重跑。
+        - 沙箱交付验收会逐条确定性执行；未通过以 scenario-fail 回传，必须修复游戏逻辑或对齐断言字段后重跑。
         - 迭代/修复轮维护此文件：玩家报障修复后把该问题固化为新断言追加；大幅重做游戏时同步重写断言。
     """.trimIndent()
 
@@ -310,7 +334,7 @@ $seedSystems
     fun scenarioNudgePrompt(): String = """
         【功能断言缺失】本档位承诺"检查基本功能正确"，交付前需通过功能断言验证，但工作区还没有 scenarios.json。
         请用 writefile 写入：为 design_schema 的每个 P0（及关键 P1）系统提供至少一条可失败的行为断言
-        （针对 __wwDebugState() 快照的布尔表达式，格式见工作流中的功能断言说明），然后再次声明完成。
+        （针对 __wwDebugState() 快照的布尔表达式，期限内任一帧为真即通过，无需预测帧数；格式见工作流中的功能断言说明），然后再次声明完成。
         核心闭环必须覆盖：开局进入 playing、得分可增长、失败可判定、restart 后状态归零。
     """.trimIndent()
 
@@ -417,31 +441,36 @@ $seedSystems
         return when (t) {
             QualityTier.FAST -> """
                 【质量档位：快速】最快速度直出产品：一次 writefile 写出最小可玩版本即声明完成。
+                文件组织从简：允许全内联单文件 index.html 直出。
                 本档位不做沙箱测试与自检轮——内容最简、能玩即可，速度优先。
             """.trimIndent()
             QualityTier.LIGHT -> """
                 【质量档位：轻量】最简可玩完整闭环：核心玩法完整、可开局可重开。
+                文件组织从简：index.html + css/style.css + js/main.js 三件套即可。
                 沙箱会验证可运行（不跑通不交付），但无自检轮——内容量以最简为准。
             """.trimIndent()
             QualityTier.BALANCED -> """
                 【质量档位：均衡】完整实现 design_schema 清单内系统（p0/p1），按类型标配内容量落地；
+                默认多文件组织：js/ 按 design_schema 系统拆分文件（详见工具工作流）；
                 交付验收含功能断言（scenarios.json）：沙箱会逐系统验证行为符合验收标准，未通过会回传修复；
                 通过一轮内容完整性自检后再交付；修补高效进行，避免无效往返。
             """.trimIndent()
             else -> """
                 【质量档位：精品】质量优先：在清单系统之外按类型标配补充内容量
                 （更多单位/敌人、波次或关卡递进、升级成长线）；P2 打磨项（视觉细节、反馈动效、
-                音效层次）一并纳入；可分多段写入与多轮打磨，充分自检确认后再交付；
+                音效层次）一并纳入；内容量大，务必多文件组织——每个主要系统独立 js 文件，
+                可 writefile 建文件后 appendfile 分段拼装大文件，便于精确修改与多轮打磨；
+                充分自检确认后再交付；
                 交付验收含功能断言（scenarios.json）与深度重开验证。
             """.trimIndent()
         }
     }
 
-    /** 生成代码契约与输出格式。 */
+    /** 生成代码契约与输出格式（兼容回环：无文件工具，单文件直出）。 */
     fun codeContract(): String = """
         【本轮输出格式】
         只输出一个完整 HTML 文件，代码围栏必须是 ```html。整量输出仅限首次生成；已有文件的修改版本必须保持未要求部分不变。
-        先在心里列文件计划与依赖顺序（本项目单文件：index.html，依赖顺序为 HTML 骨架 → CSS → JS），再 implement，最后自行对照验收标准逐项检查。
+        先在心里列文件计划与依赖顺序（本模式自包含单文件：index.html，结构顺序为 HTML 骨架 → <style> → <script>），再 implement，最后自行对照验收标准逐项检查。
         design_schema.systems 是本轮要实现的系统清单（加法）：清单内的系统（含 p0 与 p1 条目）必须实现；清单外不做禁止，仅在用户指令需要时按类型标配的完整可玩版本补充。
         excluded_systems（仅含用户明确说“不要”的系统）与 excluded_approaches 是硬性排除范围，不得实现或引入。
         复杂系统（AI、商店、技能、关卡等）先在 JS 中隔离成独立函数/模块并优先自检，不得与核心循环交叉污染。
@@ -461,11 +490,18 @@ $seedSystems
         val flow = if (firstGeneration) {
             """
         【工具工作流（首次生成）】
-        1. 用 writefile 写入 index.html（入口）并按需拆分多文件：体量较大或系统较多时，
-           推荐拆为 js/main.js、js/systems.js、css/style.css 等，index.html 以相对路径引用
-           （<script src="js/main.js"></script> 按依赖顺序排列；平台运行前自动内联合并，游戏仍离线自包含）。
+        1. 先在心里列文件计划（每个文件的职责与引用顺序），再逐个 writefile 落盘——多文件组织是默认工作方式（平台运行前自动内联合并，游戏仍离线自包含）：
+           - index.html：HTML 骨架＋<link>/<script> 引用（几十行即可，不写游戏逻辑）；
+           - css/style.css：全部样式（画布布局、HUD、菜单、按钮、响应式）；
+           - js/config.js：常量与数值表（尺寸/速度/颜色/关卡与实体数据）；
+           - js/<系统>.js：按 design_schema 的系统一文件（如 js/player.js、js/enemies.js、js/levels.js、js/audio.js）；
+           - js/main.js：初始化、主循环、restart() 与 __wwDebugState()，引用顺序放最后。
+           引用顺序＝依赖顺序（普通 script 无模块系统：先加载的定义全局，后加载的使用）；跨文件经全局命名空间协作（如 var WW = window.WW || {}; WW.spawnEnemy = function(){...}）。
+           写入顺序：先写被引用的 js/css 文件、最后写 index.html——入口校验会即时核对引用存在性，入口先写会暂时报"引用文件不存在"（属正常时序，全部文件写完即消失）。
+           在同一轮响应里并行发起全部 writefile 一次写完——拆分让每次写入体量小而稳（不易截断），后续 editfile 在小文件里定位更准、readfile 更省。
+           体量确实很小的游戏可精简为 index.html + css/style.css + js/main.js；引用的每个文件都必须真实 writefile 创建（缺文件会被校验打回）。
            必须完整实现 design_schema 清单内的全部系统（p0 与 p1 条目缺一不可），内容量以策划清单为准，
-           不得为控制体量删减已确认的系统内容；引用的每个文件都要真实 writefile 创建（缺文件会被校验打回）；
+           不得为控制体量删减已确认的系统内容；
         2. 每次写入后系统自动检查资源契约（本地文件存在性/外部资源/eval 禁令），结果附在工具结果里；有 error 必须修复后继续；
         3. 你声明完成后，系统会在沙箱（同一 WebView 内核）较长时间真实运行游戏并模拟多处触控——任何运行错误（含左上/右上角平台按钮区出现可交互元素）都会以报错文本回传，必须依据报错修复；
         4. 沙箱跑通后还有可玩性自检环节（内容完整性、体验与平台合规各一轮），全部通过后停止调用工具，直接输出给玩家的一段简短总结（不要输出代码）。
@@ -473,8 +509,9 @@ $seedSystems
         } else {
             """
         【工具工作流（修改迭代）】
-        1. 如上下文中没有目标文件的最新内容，先 readfile 读取；
+        1. 如上下文中没有目标文件的最新内容，先 readfile 读取（各 js/css 文件较小，通常整读）；
         2. 修改优先用 editfile 精确替换（常规修改首选）或 appendfile 追加新代码段；需要改动一大段时，old_string 取该段完整原文（如整个函数块）做整段替换；彻底重构时可用 writefile 整量重写，但必须遵守【修改范围契约】（只改用户点名的特征）；改动跨文件时对每个文件分别 editfile（同轮并行发起）；
+           新增系统或大段新逻辑时，优先新建独立文件（js/<系统>.js）＋在 index.html 补一行引用（引用顺序按依赖排），而不是往已有文件里堆——新文件不影响既有代码，修改面最小；
         3. 每次写入后系统自动检查资源契约，报告会附在工具结果里；有 error 必须修复；
         4. 你声明完成后，系统会在沙箱真实运行游戏验证，运行错误文本会回传，必须依据报错修复；沙箱跑通并完成可玩性自检轮后停止调用工具并输出总结。
             """.trimIndent()

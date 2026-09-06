@@ -38,7 +38,7 @@ object GameTools {
         ),
         ToolSpec(
             name = WRITE_FILE,
-            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用，可写 index.html（游戏本体）或 scenarios.json（功能断言）。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段——修改回合请遵守【修改范围契约】（只改用户点名的特征，未点名内容保持原样）。写入后系统自动检查产品契约/断言格式并在结果中回传。",
+            description = "整量写入文件（内容为完整文件）：新建文件或彻底重写时使用——index.html（入口骨架）、js/*.js 与 css/*.css（多文件组织，由 index.html 相对路径引用，平台运行前自动合并）或 scenarios.json（功能断言）。修改已有文件通常优先 editfile（改动最小、更省更稳），appendfile 适合追加新代码段——修改回合请遵守【修改范围契约】（只改用户点名的特征，未点名内容保持原样）。写入后系统自动检查产品契约/断言格式并在结果中回传。",
             parameters = """{"type":"object","properties":{"path":{"type":"string","description":"$PATH_DESC"},"content":{"type":"string","description":"完整文件内容"}},"required":["content"]}"""
         ),
         ToolSpec(
@@ -69,7 +69,9 @@ data class ToolOutcome(
     /** 回填给模型的观察文本。 */
     val observation: String,
     /** 是否产生了任何工作区写入（含 scenarios.json 等非入口文件）：驱动空转计数。 */
-    val workspaceTouched: Boolean = mutated
+    val workspaceTouched: Boolean = mutated,
+    /** 本次读/写动作的实际文件路径（读结果按路径精确过期的依据；错误返回可为 null）。 */
+    val path: String? = null
 )
 
 /**
@@ -91,6 +93,9 @@ class GameToolExecutor(
      * 不检查、不限制行为——只是不重复发送模型上下文里已有的同一份内容。
      */
     private val fullReadMarks = mutableMapOf<String, String>()
+
+    /** 最近一次 listfiles 的清单文本：无写入时重复请求只回指针（去重同 fullReadMarks 模式）。 */
+    private var lastListing: String? = null
 
     suspend fun execute(call: ToolCallData): ToolOutcome {
         val args = try {
@@ -133,6 +138,16 @@ class GameToolExecutor(
                 "- ${f.path}：v${f.version}，${f.bytes} 字节，sha256=${f.sha256.take(12)}"
             }
         }
+        // 清单去重：无写入时重复 listfiles 只回指针（实测死循环回合里 31 个 listfiles
+        // 轮全是状态探测——信息在上文，重发清单纯属上下文膨胀）；任何成功写入即失效。
+        if (listing == lastListing) {
+            return outcome(
+                call, ok = true,
+                observation = "工作区清单自上次 listfiles 后未变化（无写入发生，文件与版本见上文最近一次清单）；" +
+                    "当前入口 ${manifest.pointer}。如需文件内容请 readfile。"
+            )
+        }
+        lastListing = listing
         return outcome(call, ok = true, observation = "工作区文件清单（入口 ${manifest.pointer}）：\n$listing")
     }
 
@@ -157,21 +172,23 @@ class GameToolExecutor(
                     call, ok = true,
                     observation = "文件 $path（${lines.size} 行）自本回合上次完整读取后未发生变更，" +
                         "完整内容就在上文最近一次 readfile 结果里——请直接基于它用 editfile 修改，不要重复整读；" +
-                        "确需局部核对可用 start_line/end_line 切片。"
+                        "确需局部核对可用 start_line/end_line 切片。",
+                    path = path
                 )
             }
             fullReadMarks[path] = hash
             return if (smallFileOverride) {
                 outcome(
                     call, ok = true,
-                    observation = "文件 $path 共 ${lines.size} 行（不大，已直接返回全文；后续修改请基于此内容，无需再切片读取）：\n$content"
+                    observation = "文件 $path 共 ${lines.size} 行（不大，已直接返回全文；后续修改请基于此内容，无需再切片读取）：\n$content",
+                    path = path
                 )
             } else {
-                outcome(call, ok = true, observation = "文件 $path 内容如下（共 ${lines.size} 行）：\n$content")
+                outcome(call, ok = true, observation = "文件 $path 内容如下（共 ${lines.size} 行）：\n$content", path = path)
             }
         }
         val slice = lines.subList(startLine - 1, endLine).joinToString("\n")
-        return outcome(call, ok = true, observation = "文件 $path 第 $startLine-$endLine 行（共 ${lines.size} 行）：\n$slice")
+        return outcome(call, ok = true, observation = "文件 $path 第 $startLine-$endLine 行（共 ${lines.size} 行）：\n$slice", path = path)
     }
 
     private suspend fun writeFile(call: ToolCallData, args: JsonObject): ToolOutcome {
@@ -250,8 +267,14 @@ class GameToolExecutor(
 
     /**
      * 变更类工具的成功返回：附上自动契约检查（观察）；editfile 额外附修改点上下文片段。
-     * 按路径分流：入口文件（index.html）走 HTML 契约校验并作为 currentHtml 发布依据；
-     * scenarios.json（功能断言）解析校验后只作工作区触碰，不发布、不跑 HTML 校验。
+     * 按路径三分流：
+     * - 入口 index.html：跑 HTML 契约校验（本地引用存在性/外部资源/eval 禁令等），
+     *   并作为 currentHtml 发布依据（mutated=true，html 非空）；
+     * - scenarios.json（功能断言）：解析校验后只作工作区触碰，不发布、不跑 HTML 校验；
+     * - 其余辅助文件（js 与 css 文件等）：按文件类型做轻量校验（js 的安全禁令与
+     *   module 语法、css 的 url() 外链），同样不发布不跑入口校验——把 js/css 文本当 HTML
+     *   校验必然产生"缺少 __wwDebugState"之类伪错误，且会被误发布为 currentHtml；
+     *   历史上正是这两点把模型逼回"全部塞进 index.html"的单文件形态。
      */
     private fun mutatedOutcome(
         call: ToolCallData,
@@ -262,6 +285,8 @@ class GameToolExecutor(
         newString: String? = null,
         appended: Int? = null
     ): ToolOutcome {
+        lastListing = null // 任何成功写入都改变清单（版本递增），去重缓存即失效
+        val contextBlock = if (newString != null) editContextSnippet(content, newString) else null
         if (path == GameScenarios.FILE) {
             val (checkOk, checkText) = GameScenarios.checkObservation(content)
             val head = when {
@@ -277,16 +302,30 @@ class GameToolExecutor(
                 html = null,
                 report = null,
                 observation = head + "\n" + checkText,
-                workspaceTouched = true
+                workspaceTouched = true,
+                path = path
             )
         }
-        val report = validate(content)
         val head = when {
             appended != null -> "已追加 $appended 行并写入 $path（v$version，现共 ${content.lines().size} 行）。"
             replaced != null -> "已替换 $replaced 处并写入 $path（v$version，${content.length} 字符）。"
             else -> "已写入 $path（v$version，${content.length} 字符）。"
         }
-        val contextBlock = if (newString != null) editContextSnippet(content, newString) else null
+        if (path != GameFileWorkspaceEntryPoint.DEFAULT) {
+            val auxReport = GameValidator.validateAuxFile(path, content)
+            return ToolOutcome(
+                callId = call.id,
+                name = call.name,
+                ok = true,
+                mutated = false,
+                html = null,
+                report = null,
+                observation = head + (contextBlock ?: "") + formatValidation(auxReport),
+                workspaceTouched = true,
+                path = path
+            )
+        }
+        val report = validate(content)
         val observation = head + (contextBlock ?: "") + formatValidation(report)
         return ToolOutcome(
             callId = call.id,
@@ -295,7 +334,8 @@ class GameToolExecutor(
             mutated = true,
             html = content,
             report = report,
-            observation = observation
+            observation = observation,
+            path = path
         )
     }
 
@@ -318,14 +358,20 @@ class GameToolExecutor(
         return "\n修改点上下文（第 ${from + 1}-${to + 1} 行，文件原文）：\n$snippet\n"
     }
 
-    private fun outcome(call: ToolCallData, ok: Boolean, observation: String): ToolOutcome = ToolOutcome(
+    private fun outcome(
+        call: ToolCallData,
+        ok: Boolean,
+        observation: String,
+        path: String? = null
+    ): ToolOutcome = ToolOutcome(
         callId = call.id,
         name = call.name,
         ok = ok,
         mutated = false,
         html = null,
         report = null,
-        observation = observation
+        observation = observation,
+        path = path
     )
 
     private fun formatValidation(report: ValidationReport): String = buildString {

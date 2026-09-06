@@ -47,6 +47,13 @@ object GameValidator {
 
     const val FILE_INDEX_HTML = "index.html"
 
+    /**
+     * 多文件模式的结构建议阈值：入口完全内联（无本地 js/css 引用）且
+     * 内联脚本+样式超过该行数时提示拆分——纯建议（warning），
+     * 提示文案明确"修复报障回合无需处理"，避免与修改范围契约打架。
+     */
+    const val INLINE_BLOAT_WARN_LINES = 600
+
     private val forbiddenJsRegex = Regex("""\beval\s*\(|new\s+Function\s*\(|\brequire\s*\(|\bimport\s*\(""")
     private val moduleSyntaxRegex = Regex(
         """\bimport\s*(\{|\*)|\bimport\s+['"]|\bimport\s+[\w$]+\s+from\b|\bexport\s+(default\s+)?(function\b|class\b|const\b|let\b|var\b|\{)"""
@@ -63,7 +70,12 @@ object GameValidator {
          * 引用改为存在性校验（存在=合法多文件组织，缺失=error 引导模型先创建）；
          * null（兼容回环等无工作区场景）维持单文件禁令——本地引用一律 error。
          */
-        localFileExists: ((String) -> Boolean)? = null
+        localFileExists: ((String) -> Boolean)? = null,
+        /**
+         * 入参是否为内联合并后的视图：是则跳过"超大内联建议拆分"结构提示
+         * （合并视图天然全内联，该提示只对原始入口有意义）。
+         */
+        inlineView: Boolean = false
     ): ValidationReport {
         if (html.isBlank()) {
             return ValidationReport(
@@ -167,6 +179,30 @@ object GameValidator {
             )
         }
 
+        // 结构建议（仅多文件模式、纯内联且体量很大时）：引导拆分为 js/*.js + css/*.css。
+        // 不构成交付门槛；文案声明修复回合可忽略，模型在生成/重构时机自行采纳。
+        // inlineView（内联合并视图）天然全内联，不适用本提示。
+        if (localFileExists != null && !inlineView) {
+            val hasLocalRef =
+                doc.select("script[src]").any { GameBundle.isLocalRef(it.attr("src").trim()) } ||
+                    doc.select("link[rel=stylesheet][href]").any { GameBundle.isLocalRef(it.attr("href").trim()) }
+            if (!hasLocalRef) {
+                fun lineCount(content: String): Int =
+                    if (content.isEmpty()) 0 else content.count { it == '\n' } + 1
+                val inlineLines = doc.getElementsByTag("script").filter { !it.hasAttr("src") }
+                    .sumOf { lineCount(it.data()) } +
+                    doc.getElementsByTag("style").sumOf { lineCount(it.data()) }
+                if (inlineLines > INLINE_BLOAT_WARN_LINES) {
+                    checks += ValidationIssue(
+                        "structure", FILE_INDEX_HTML, 1,
+                        "index.html 内联脚本/样式约 $inlineLines 行：建议拆分为 js/*.js 与 css/*.css 多文件组织" +
+                            "（平台运行前自动内联合并，离线不变；本条为结构建议非错误，修复用户报障的回合无需处理）",
+                        "warning"
+                    )
+                }
+            }
+        }
+
         // 可观测性契约：必须暴露 window.__wwDebugState() 供沙箱做不变量断言
         //（负血量实体未移除 / NaN 数值 / 实体泄漏等"不抛错但明显不对"的低级 bug）。
         if (!html.contains("__wwDebugState")) {
@@ -204,6 +240,54 @@ object GameValidator {
                 )
             }
 
+        return ValidationReport(checks.distinctBy { "${it.category}|${it.message}" })
+    }
+
+    /**
+     * 辅助文件（js 与 css 等非入口文件）的轻量契约检查：
+     * 入口级校验（HTML 结构/引用存在性/可观测性契约）不适用于纯 JS/CSS 文本——
+     * jsoup 会把它们当 HTML 解析，产生"缺少 __wwDebugState"之类伪错误。
+     * 这里只查与文件类型相关的硬约束：js 查安全禁令与 ES module 语法；
+     * css 查 url() 外链（error）与无法内联的本地引用（warning）。
+     */
+    fun validateAuxFile(path: String, content: String): ValidationReport {
+        if (content.isBlank()) return ValidationReport()
+        val checks = mutableListOf<ValidationIssue>()
+        when {
+            path.endsWith(".js", ignoreCase = true) -> {
+                forbiddenJsRegex.findAll(content).forEach { m ->
+                    checks += ValidationIssue(
+                        "static-runtime", path, 1,
+                        "安全契约禁止 eval / new Function / 动态 require / import()：${m.value}", "error"
+                    )
+                }
+                moduleSyntaxRegex.findAll(content).forEach { m ->
+                    checks += ValidationIssue(
+                        "static-runtime", path, 1,
+                        "多文件游戏禁用 ES module 的 import/export（平台按普通 script 顺序内联合并，" +
+                            "跨文件请用全局变量/命名空间协作）：${m.value.take(60)}", "error"
+                    )
+                }
+            }
+            path.endsWith(".css", ignoreCase = true) -> {
+                cssUrlRegex.findAll(content).forEach { match ->
+                    val url = match.groupValues[1]
+                    when {
+                        url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true) ||
+                            url.startsWith("//") ->
+                            checks += ValidationIssue(
+                                "resources", path, 1,
+                                "CSS 引用外部资源（离线可玩承诺）：$url", "error"
+                            )
+                        !url.startsWith("data:", ignoreCase = true) && !url.startsWith("#") ->
+                            checks += ValidationIssue(
+                                "resources", path, 1,
+                                "CSS 引用的本地资源缺失（二进制无法内联）：$url", "warning"
+                            )
+                    }
+                }
+            }
+        }
         return ValidationReport(checks.distinctBy { "${it.category}|${it.message}" })
     }
 }

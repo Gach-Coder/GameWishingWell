@@ -32,8 +32,23 @@ class GameScenarioTest {
         assertEquals("战斗", list[0].system)
         assertEquals(listOf(ScenarioStep(tap = listOf(50.0, 80.0)), ScenarioStep(frames = 24)), list[0].steps)
         assertEquals("s.score > 0", list[0].expect)
-        // 无 steps 时默认推进 DEFAULT_FRAMES 帧。
-        assertEquals(listOf(ScenarioStep(frames = GameScenarios.DEFAULT_FRAMES)), list[1].steps)
+        // 无 steps 时保持空序列：执行器推进到期限逐帧求值（eventually，无需预言帧数）。
+        assertEquals(emptyList<ScenarioStep>(), list[1].steps)
+    }
+
+    @Test
+    fun `parse reads horizon with default and cap`() {
+        val list = GameScenarios.parse(
+            """[
+              {"id":"a","name":"A","expect":"s.score>0","horizon":120},
+              {"id":"b","name":"B","expect":"s.score>0","horizon":9999},
+              {"id":"c","name":"C","expect":"s.score>0"}
+            ]"""
+        )
+        assertEquals(120, list[0].horizon)
+        assertEquals(GameScenarios.HORIZON_MAX_FRAMES, list[1].horizon)
+        // null = 执行器使用默认期限。
+        assertNull(list[2].horizon)
     }
 
     @Test
@@ -61,9 +76,9 @@ class GameScenarioTest {
         )
         assertEquals(1, list.size)
         assertEquals(5, list[0].steps.size)
-        // 超界百分比被钳制到 0-100，帧数钳制到每断言预算。
+        // 超界百分比被钳制到 0-100，步间节奏帧数钳制到期限上限。
         assertEquals(listOf(100.0, 0.0), list[0].steps[3].tap)
-        assertEquals(GameScenarios.MAX_FRAMES_PER_SCENARIO, list[0].steps[4].frames)
+        assertEquals(GameScenarios.HORIZON_MAX_FRAMES, list[0].steps[4].frames)
     }
 
     @Test

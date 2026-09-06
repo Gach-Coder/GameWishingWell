@@ -173,6 +173,114 @@ function restart(){}
     }
 
     @Test
+    fun `多文件生成回合-同轮并行写 css js 与入口并正确验收发布`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-multi-${System.nanoTime()}")
+        // __wwDebugState 定义在 js 文件里（多文件组织的常态）：验收必须校验内联合并视图
+        val entryHtml = """<!DOCTYPE html><html><head>
+<link rel="stylesheet" href="css/style.css">
+</head><body><script src="js/main.js"></script></body></html>"""
+        val jsContent = "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
+        val script = ScriptedLlmClient(
+            listOf(
+                // 识别层 Lite 补丁（direct-make 路径的系统参考抽取）
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                // 第 1 轮：同轮并行写入三个文件（先被引用的 js/css、最后入口）
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-css", "writefile", """{"path":"css/style.css","content":${jsonStr("body{margin:0;background:#111}")}}"""),
+                        ToolCallData("c-js", "writefile", """{"path":"js/main.js","content":${jsonStr(jsContent)}}"""),
+                        ToolCallData("c-html", "writefile", """{"path":"index.html","content":${jsonStr(entryHtml)}}""")
+                    )
+                ),
+                // 第 2 轮：声明完成（快速档跳过沙箱/断言/自检，直接验收）
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+
+        val s = agent.session.value
+        assertFalse(s.isGenerating)
+        assertTrue(s.gameGenerated)
+        // 发布的 currentHtml 是入口本身——不是同批最后写入的 js/css 内容（旧 bug 会误发布）
+        assertEquals(entryHtml, s.currentHtml)
+        // 三个文件都真实落盘
+        val root = File(dir, "agent/workspace/draft")
+        assertTrue(File(root, "index.html").isFile)
+        assertTrue(File(root, "js/main.js").isFile)
+        assertTrue(File(root, "css/style.css").isFile)
+        // 预览副本把 js/css 内联合并进入口（真机游玩看到的就是这份）
+        val preview = agent.runnablePreviewHtml() ?: ""
+        assertTrue(preview.contains("__wwDebugState"))
+        assertTrue(preview.contains("background:#111"))
+        assertFalse(preview.contains("js/main.js"))
+        // 全程没有"缺少可观测性契约"伪错误（旧实现只看原始入口，js 里的定义看不见；
+        // css/js 写入被当 HTML 校验也会误报）
+        assertFalse(s.messages.any { it.content.contains("缺少可观测性契约") })
+        // 三个 writefile 在同一轮 assistant 消息里并行发起（第 2 轮请求历史可见）
+        assertTrue(script.calls[2].first.any { it.toolCalls.size == 3 })
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `工作区指纹覆盖辅助文件修改`() = runBlocking {
+        // "防空口完成"门的度量对象必须是工作区整体而非仅入口哈希：
+        // 纯 js 修复（多文件时代的常态修法）与纯断言修复都必须算作变化，
+        // 否则正确修改被门拒绝、nudge 反而引导模型去改 index.html（与 40 帧硬顶同族）。
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-fp-${System.nanoTime()}")
+        val agent = newAgent(dir, client = null)
+        val ws = GameFileWorkspace(File(dir, "agent/workspace/draft"))
+        ws.writeInitial("index.html", "<html>a</html>")
+        ws.writeInitial("js/main.js", "var a = 1;")
+        val fp1 = agent.workspaceFingerprint(ws)
+        // 修改辅助文件：指纹必须变化
+        ws.writeUpdated("js/main.js", "var a = 2;")
+        assertTrue(fp1 != agent.workspaceFingerprint(ws))
+        // 改回原状：净零修改，指纹复原（空口完成仍被拒）
+        ws.writeUpdated("js/main.js", "var a = 1;")
+        assertEquals(fp1, agent.workspaceFingerprint(ws))
+        // 断言文件（scenarios.json）同样计入
+        ws.writeInitial("scenarios.json", "{}")
+        assertTrue(fp1 != agent.workspaceFingerprint(ws))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `正文 HTML 在工具已工作后被忽略不覆写工作区`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-prose-${System.nanoTime()}")
+        val proseHtml = validHtml.replace("score: 0", "score: 1")
+        val script = ScriptedLlmClient(
+            listOf(
+                // 识别层 Lite 补丁
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                // 第 1 轮：正常工具写入（工具通路已建立）
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-write", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                // 第 2 轮：正文夹带另一份完整 HTML——工具已工作，必须忽略而非覆写
+                LlmResponse("我做完了：\n```html\n$proseHtml\n```"),
+                // 第 3 轮：纯文本声明完成 → 正常验收
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+
+        val s = agent.session.value
+        assertTrue(s.gameGenerated)
+        // 工作区未被正文 HTML 覆写（旧实现会把 proseHtml 写进入口并以其交付）
+        assertEquals(validHtml, s.currentHtml)
+        // 第 2 轮的违规被纠正而非静默吞掉：第 3 轮照常发生（共 4 次 LLM 调用）
+        assertEquals(4, script.calls.size)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
     fun `chat 回复携带最近对话历史`() = runBlocking {
         val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-chat-${System.nanoTime()}")
         val script = ScriptedLlmClient(
@@ -229,25 +337,6 @@ function restart(){}
         val p = pickStreamPreview("", "", 62_300)
         assertTrue(p!!.contains("62300"))
     }
-    @Test
-    fun `断言对齐提示分档-3轮判定5轮强制仲裁`() {
-        // <3 轮：不注入提示
-        assertEquals("", alignmentHintFor(mapOf("战斗/击杀" to 2), null))
-        // ≥3 轮：判定提示（对照快照二选一）
-        val hint3 = alignmentHintFor(mapOf("塔防/波次" to 3), null)
-        assertTrue(hint3.contains("断言对齐判定"))
-        assertTrue(hint3.contains("3 轮"))
-        assertTrue(hint3.contains("scenarios.json"))
-        // ≥5 轮：强制仲裁，压过重写建议并禁改逻辑
-        val hint5 = alignmentHintFor(mapOf("塔防/基地" to 6), null)
-        assertTrue(hint5.contains("仲裁"))
-        assertTrue(hint5.contains("优先于"))
-        assertTrue(hint5.contains("禁止再修改 index.html"))
-        // 零活动快照（state=playing 且 enemyCount=0/entities 空）→ 帧预算定向线索
-        val snap = """scenario-fail[塔防/基地]: 断言不满足；实际快照 {"state":"playing","enemyCount":0,"entities":[]}"""
-        assertTrue(alignmentHintFor(mapOf("塔防/基地" to 6), snap).contains("大概率是帧预算不足"))
-        // 非零活动快照不给该线索（避免误导）
-        val activeSnap = """scenario-fail[x]: 实际快照 {"state":"playing","enemyCount":5,"entities":[{"type":"enemy"}]}"""
-        assertFalse(alignmentHintFor(mapOf("塔防/基地" to 6), activeSnap).contains("大概率是帧预算不足"))
-    }
+    // 断言对齐提示（alignmentHintFor 3/5 轮阶梯）已随 eventually 断言语义根治而删除：
+    // 失败回报自带字段轨迹与输入点状态，"机制未发生/字段错位"独立成信号，无需按次数升级的判定文案。
 }

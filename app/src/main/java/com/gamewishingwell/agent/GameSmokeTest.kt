@@ -138,7 +138,6 @@ object SmokeTestProbe {
               window.addEventListener('error', function(e){
                 window.__wwSmokeResult.errors.push(String((e && e.message) || e || 'unknown-error'));
               });
-              var realRaf = window.requestAnimationFrame && window.requestAnimationFrame.bind(window);
               var realCaf = window.cancelAnimationFrame && window.cancelAnimationFrame.bind(window);
               var ticked = 0;
               var __finalized = false; // 终态防覆盖：deep 复跑会重置 ticked，超时回调不得覆盖已通过结果
@@ -151,13 +150,22 @@ object SmokeTestProbe {
               var __landscape = ${if (landscape) "true" else "false"};
               var phase = 1;   // 1=首次运行 2=restart 后复跑
               var limit = ${MAX_FRAMES};
+              // 帧边界外（主阶段结束→场景/deep 阶段重置计数之间的空窗）的 rAF 注册
+              // 暂存于此，阶段重置后复活——此前回调节链在此断裂（回落到离屏被冻结的
+              // 真实定时器＝永久丢失），场景阶段游戏冻结、断言只能对 restart 后的
+              // 初始状态求值，任何游戏逻辑修改都无法让谓词翻真（历史断言死循环的隐藏根因）。
+              var __parkedRaf = [];
               window.requestAnimationFrame = function(cb){
-                // 阈值用动态 limit（主跑帧/场景阶段/deep 复跑各有预算）：
-                // 场景阶段会重置 ticked 并给独立帧预算，合成队列须保持接管，
-                // 否则第 24 帧后新注册的 rAF 会落到离屏被冻结的真实定时器上。
                 if (ticked < limit) { window.__wwSmokePending.push(cb); return window.__wwSmokePending.length; }
-                return realRaf ? realRaf(cb) : 0;
+                __parkedRaf.push(cb);
+                return __parkedRaf.length + 1048576;
               };
+              function reviveRafQueue(){
+                if (__parkedRaf.length) {
+                  var park = __parkedRaf.splice(0, __parkedRaf.length);
+                  for (var i = 0; i < park.length; i++) window.__wwSmokePending.push(park[i]);
+                }
+              }
               window.cancelAnimationFrame = function(id){
                 if (realCaf) { try { realCaf(id); } catch(e) {} }
               };
@@ -290,48 +298,118 @@ object SmokeTestProbe {
                   }
                   window.__wwSmokePending.length = 0;
                   var savedTicked = ticked, savedLimit = limit;
-                  ticked = 0; limit = ${GameScenarios.MAX_FRAMES_PER_SCENARIO};
-                  var steps = (sc.steps && sc.steps.length) ? sc.steps : [{frames: ${GameScenarios.DEFAULT_FRAMES}}];
-                  for (var sI = 0; sI < steps.length && sI < ${GameScenarios.MAX_STEPS}; sI++) {
-                    var st = steps[sI];
-                    if (!st) continue;
-                    if (st.tap && st.tap.length >= 2) {
-                      pokeAtPct(st.tap[0], st.tap[1]);
-                    } else if (st.drag && st.drag.length >= 4) {
-                      dragAtPct(st.drag[0], st.drag[1], st.drag[2], st.drag[3]);
-                    } else if (st.frames) {
-                      var n = Math.min(Math.max(1, st.frames | 0), ${GameScenarios.MAX_FRAMES_PER_SCENARIO});
-                      for (var fI = 0; fI < n && ticked < limit; fI++) { scenStep(); }
-                    }
-                  }
-                  // 收尾：把剩余帧预算跑完，让已注册的 rAF 回调全部执行完毕再取快照。
-                  while (ticked < limit) { scenStep(); }
-                  ticked = savedTicked; limit = savedLimit;
-                  var newErrs = window.__wwSmokeResult.errors.length - errBefore;
-                  var snap = null;
-                  try { snap = window.__wwDebugState(); } catch (e2) { snap = null; }
-                  var verdict = false, why = '';
-                  if (newErrs > 0) {
-                    why = '场景执行期间出现运行错误（见 errors）';
-                  } else if (!snap || typeof snap !== 'object') {
+                  // eventually 语义：期限（默认 ${GameScenarios.HORIZON_DEFAULT_FRAMES} 帧、上限 ${GameScenarios.HORIZON_MAX_FRAMES} 帧）内
+                  // 逐帧求值、任一帧为真即通过——时间归执行器，作者只写"什么该为真"。
+                  var horizon = Math.min(Math.max(1, (sc.horizon | 0) || ${GameScenarios.HORIZON_DEFAULT_FRAMES}), ${GameScenarios.HORIZON_MAX_FRAMES});
+                  ticked = 0; limit = horizon;
+                  reviveRafQueue(); // 复活主阶段边界暂存的心跳：场景阶段游戏必须真实运行
+                  // 断言求值函数（探针基础设施，非游戏代码，不受安全契约约束）。
+                  var evalExpect = null;
+                  try {
+                    evalExpect = new Function('s', 'return (' + String(sc.expect).slice(0, ${GameScenarios.MAX_EXPECT_LEN}) + ');');
+                  } catch (eE) { evalExpect = null; }
+                  // 字段发现：expect 引用的一级快照字段在第 0 帧即确定性校验——
+                  // 字段错位立刻回报可用字段清单，不再跑到期限结束才让模型猜。
+                  var fields = [], seen = {}, mF, reF = /(?:^|[^.\w$])s\.([A-Za-z_$][\w$]*)/g;
+                  while ((mF = reF.exec(String(sc.expect)))) { if (!seen[mF[1]]) { seen[mF[1]] = 1; fields.push(mF[1]); } }
+                  var snap0 = null;
+                  try { snap0 = window.__wwDebugState(); } catch (e1) { snap0 = null; }
+                  var why = '';
+                  if (evalExpect === null) {
+                    why = '断言表达式语法错误（修正 expect 后重写 scenarios.json）';
+                  } else if (!snap0 || typeof snap0 !== 'object') {
                     why = '__wwDebugState() 未返回状态对象';
                   } else {
-                    try {
-                      // 断言表达式在此求值（探针基础设施，非游戏代码，不受安全契约约束）。
-                      verdict = !!new Function('s', 'return (' + String(sc.expect).slice(0, ${GameScenarios.MAX_EXPECT_LEN}) + ');')(snap);
-                    } catch (e3) {
-                      why = '断言表达式执行出错：' + String(e3 && e3.message || e3);
+                    var missing = [];
+                    for (var k = 0; k < fields.length; k++) { if (!(fields[k] in snap0)) missing.push('s.' + fields[k]); }
+                    if (missing.length) {
+                      var avail = [];
+                      for (var key in snap0) { if (snap0.hasOwnProperty(key)) avail.push(key); }
+                      why = '断言引用的字段 ' + missing.join(',') + ' 不在快照中（可用字段：' + avail.join(',') +
+                        '）——修正 expect 字段名，或让 __wwDebugState() 暴露该字段';
                     }
                   }
-                  entry.ok = verdict;
-                  if (!verdict && !why) {
-                    var snapStr = '';
-                    try { snapStr = JSON.stringify(snap); } catch (e4) { snapStr = String(snap); }
-                    if (snapStr.length > 300) snapStr = snapStr.slice(0, 300) + '…';
-                    why = '断言不满足；实际快照 ' + snapStr;
+                  if (!why) {
+                    // 轨迹采集：引用字段的采样值（每 8 帧）+ 输入派发点状态——
+                    // 失败回报自带时间维度，"机制未发生"与"还没到时间"一眼可辨。
+                    var fieldVals = function(s){
+                      var o = {};
+                      for (var k = 0; k < fields.length; k++) {
+                        var v = s ? s[fields[k]] : undefined;
+                        o[fields[k]] = (v === undefined) ? '(无)' :
+                          (v && typeof v === 'object' ? (('length' in v) ? ('len:' + v.length) : 'obj') : v);
+                      }
+                      try { return JSON.stringify(o); } catch (eV) { return '{}'; }
+                    };
+                    var trace = ['帧0 ' + fieldVals(snap0)], inputs = [];
+                    var passed = false, passFrame = -1, evalErr = '';
+                    var probeOnce = function(){
+                      try {
+                        var s2 = window.__wwDebugState();
+                        if (!!evalExpect(s2)) { passed = true; passFrame = ticked; }
+                      } catch (e3) { evalErr = String(e3 && e3.message || e3); }
+                    };
+                    var advance = function(n){
+                      for (var fI = 0; fI < n && ticked < limit; fI++) {
+                        scenStep();
+                        if (!passed && !evalErr) probeOnce();
+                        if (passed) break;
+                        if ((ticked & 7) === 0) { try { trace.push('帧' + ticked + ' ' + fieldVals(window.__wwDebugState())); } catch (eS) {} }
+                      }
+                    };
+                    // 输入序列：tap/drag 立即派发并记录派发点状态；frames 仅为步间节奏（可选）；
+                    // 输入之间执行器默认推进 ${GameScenarios.INTER_STEP_FRAMES} 帧让输入生效并被逐帧观察到。
+                    var steps = (sc.steps && sc.steps.length) ? sc.steps : [];
+                    for (var sI = 0; sI < steps.length && sI < ${GameScenarios.MAX_STEPS} && !passed && !evalErr; sI++) {
+                      var st = steps[sI];
+                      if (!st) continue;
+                      var inputDesc = '';
+                      if (st.tap && st.tap.length >= 2) {
+                        pokeAtPct(st.tap[0], st.tap[1]);
+                        inputDesc = 'tap[' + st.tap[0] + ',' + st.tap[1] + ']';
+                      } else if (st.drag && st.drag.length >= 4) {
+                        dragAtPct(st.drag[0], st.drag[1], st.drag[2], st.drag[3]);
+                        inputDesc = 'drag[' + st.drag.join(',') + ']';
+                      } else if (st.frames) {
+                        advance(Math.min(Math.max(1, st.frames | 0), horizon));
+                        continue;
+                      }
+                      if (inputDesc) {
+                        var stAt = '';
+                        try { var s3 = window.__wwDebugState(); if (s3 && s3.state !== undefined) stAt = String(s3.state); } catch (e4) {}
+                        inputs.push(inputDesc + '@帧' + ticked + (stAt ? '(state=' + stAt + ')' : ''));
+                        probeOnce();
+                      }
+                      if (!passed && !evalErr) advance(${GameScenarios.INTER_STEP_FRAMES});
+                    }
+                    // 剩余期限跑满（advance 内建翻真即停与轨迹采样）。
+                    if (!passed && !evalErr) advance(horizon);
+                    if (passed) {
+                      entry.ok = true;
+                      entry.reason = '第 ' + passFrame + ' 帧达成';
+                    } else if (evalErr) {
+                      why = '断言表达式执行出错：' + evalErr;
+                    } else {
+                      try { trace.push('帧' + ticked + ' ' + fieldVals(window.__wwDebugState())); } catch (e9) {}
+                      var snapStr = '';
+                      try { snapStr = JSON.stringify(window.__wwDebugState()); } catch (e5) { snapStr = ''; }
+                      if (snapStr.length > 260) snapStr = snapStr.slice(0, 260) + '…';
+                      var traceStr = trace.join(' → ');
+                      if (traceStr.length > 340) traceStr = '…' + trace.slice(Math.floor(trace.length / 2)).join(' → ');
+                      why = '期限 ' + horizon + ' 帧内未达成（断言在期限内任一帧为真即通过）' +
+                        '；字段轨迹: ' + traceStr +
+                        (inputs.length ? '；输入: ' + inputs.join(', ') : '') +
+                        '；终态 ' + snapStr;
+                    }
                   }
-                  entry.reason = why;
-                  if (!verdict) {
+                  ticked = savedTicked; limit = savedLimit;
+                  var newErrs = window.__wwSmokeResult.errors.length - errBefore;
+                  if (newErrs > 0) {
+                    entry.ok = false;
+                    why = '场景执行期间出现运行错误（见 errors）';
+                  }
+                  entry.reason = why || entry.reason;
+                  if (!entry.ok) {
                     window.__wwSmokeResult.errors.push('scenario-fail[' + (entry.system ? entry.system + '/' : '') + entry.name + ']: ' + why + '（断言：' + String(sc.expect) + '）');
                   }
                   __scenLog.push(entry);
@@ -376,6 +454,7 @@ object SmokeTestProbe {
                   runScenarioPhase();
                   if (__deep) {
                     phase = 2; ticked = 0; limit = Math.floor(${MAX_FRAMES} / 2);
+                    reviveRafQueue(); // deep 复跑同样需要活着的心跳（restart 自行续链，这里兜底空窗期注册）
                     exerciseRestart();
                     return;
                   }

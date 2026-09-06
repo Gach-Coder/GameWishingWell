@@ -60,6 +60,72 @@ class GameToolsTest {
     }
 
     @Test
+    fun `listfiles 无写入时去重回指针，写入后失效`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        executor.execute(call(GameTools.WRITE_FILE, """{"content":"v1"}"""))
+        val out1 = executor.execute(call(GameTools.LIST_FILES, "{}"))
+        assertTrue(out1.observation.contains("index.html"))
+        assertTrue(out1.observation.contains("sha256="))
+        // 无写入的重复探测只回指针（信息在上文，不再堆一份全量清单进历史）
+        val out2 = executor.execute(call(GameTools.LIST_FILES, "{}"))
+        assertTrue(out2.observation.contains("未变化"))
+        assertFalse(out2.observation.contains("sha256="))
+        // 写入使版本变化，去重失效，重新全量返回
+        executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"}"""))
+        val out3 = executor.execute(call(GameTools.LIST_FILES, "{}"))
+        assertTrue(out3.observation.contains("v2"))
+        assertTrue(out3.observation.contains("sha256="))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `多文件形态-写辅助 js 文件不作入口发布且不产生伪校验错误`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        ws.writeInitial("index.html", validHtml)
+        val out = executor.execute(
+            call(
+                GameTools.WRITE_FILE,
+                """{"path":"js/main.js","content":"var WW = window.WW || {};\nWW.go = function(){ return 1; };"}"""
+            )
+        )
+        assertTrue(out.ok)
+        // 辅助文件：不算入口变更（不发布 currentHtml）、无入口校验报告，但计入工作区触碰
+        assertFalse(out.mutated)
+        assertNull(out.html)
+        assertNull(out.report)
+        assertTrue(out.workspaceTouched)
+        assertEquals("js/main.js", out.path)
+        // 观察里没有"缺少可观测性契约"之类入口伪错误
+        assertFalse(out.observation.contains("__wwDebugState"))
+        assertTrue(out.observation.contains("基础校验通过"))
+        // 入口内容不受影响
+        assertEquals(validHtml, ws.read("index.html"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `多文件形态-辅助 js 的 eval 与 module 语法被轻量校验拦截`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        val out = executor.execute(
+            call(GameTools.WRITE_FILE, """{"path":"js/hack.js","content":"var r = eval('1+1');"}""")
+        )
+        assertTrue(out.ok)
+        assertFalse(out.mutated)
+        assertTrue(out.observation.contains("eval"))
+        val out2 = executor.execute(
+            call(GameTools.WRITE_FILE, """{"path":"js/mod.js","content":"import { a } from './a.js';"}""")
+        )
+        assertTrue(out2.observation.contains("ES module"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
     fun `writefile 可覆盖已存在文件且版本递增`() = runBlocking {
         val (ws, dir) = newWorkspace()
         val executor = GameToolExecutor(ws)

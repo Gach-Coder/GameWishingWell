@@ -37,4 +37,29 @@ class SmokeProbeTest {
         assertTrue(out.indexOf("__wwSmokeInstalled") > out.indexOf("<html"))
         assertTrue(out.contains("</html>"))
     }
+
+    @Test
+    fun `场景执行器注入 eventually 语义与轨迹定位机制`() {
+        val injected = SmokeTestProbe.inject("<html></html>", scenariosJson = "[]")
+        // eventually：期限内逐帧求值、任一帧为真即通过（时间归执行器，作者不预言帧数）
+        assertTrue(injected.contains("horizon"))
+        assertTrue(injected.contains("任一帧为真即通过"))
+        assertTrue(injected.contains(GameScenarios.HORIZON_DEFAULT_FRAMES.toString()))
+        assertTrue(injected.contains(GameScenarios.HORIZON_MAX_FRAMES.toString()))
+        // 翻真即停 + 逐帧求值
+        assertTrue(injected.contains("passFrame"))
+        assertTrue(injected.contains("probeOnce"))
+        // 失败回报自带字段轨迹与输入派发点状态（时间维度信息）
+        assertTrue(injected.contains("字段轨迹"))
+        assertTrue(injected.contains("state="))
+        // 字段发现：expect 引用字段第 0 帧确定性校验、缺失即回报可用字段清单
+        assertTrue(injected.contains("不在快照中"))
+        assertTrue(injected.contains("可用字段"))
+        // 输入步骤间默认推进（帧预算由执行器承担）
+        assertTrue(injected.contains("advance(${GameScenarios.INTER_STEP_FRAMES})"))
+        // 心跳保活：帧边界外的 rAF 注册暂存并在阶段重置后复活——
+        // 否则场景阶段游戏冻结、断言只能对初始状态求值（历史死循环的隐藏根因）
+        assertTrue(injected.contains("__parkedRaf"))
+        assertTrue(injected.contains("reviveRafQueue()"))
+    }
 }
