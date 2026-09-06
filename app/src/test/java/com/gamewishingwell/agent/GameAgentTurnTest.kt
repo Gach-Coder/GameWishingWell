@@ -63,8 +63,55 @@ class GameAgentTurnTest {
             html: String,
             deep: Boolean,
             scenariosJson: String?,
-            landscape: Boolean
+            landscape: Boolean,
+            light: Boolean
         ): SmokeTestResult = result
+    }
+
+    /** 记录每次调用的 (scenariosJson, light) 并按场景返回确定性结果：
+     *  light 恒报同一运行时错误（驱动咨询式升级）；scenarios 首败后过（驱动两段门修复）；
+     *  纯运行（无 scenarios）恒过。 */
+    private class RecordingSmokeRunner : SmokeTestRunner {
+        data class Call(val scenariosJson: String?, val light: Boolean)
+        val calls = mutableListOf<Call>()
+        private var assertionFails = 0
+        override suspend fun run(
+            html: String,
+            deep: Boolean,
+            scenariosJson: String?,
+            landscape: Boolean,
+            light: Boolean
+        ): SmokeTestResult {
+            calls += Call(scenariosJson, light)
+            return when {
+                light -> SmokeTestResult(
+                    passed = false, framesRun = 6, message = "smoke-failed",
+                    errors = listOf("ReferenceError: startGame is not defined")
+                )
+                scenariosJson != null ->
+                    if (assertionFails++ == 0) SmokeTestResult(
+                        passed = false, framesRun = 24, message = "smoke-failed",
+                        errors = listOf("scenario-fail[战斗/断言X]: 期限 300 帧内未达成（断言：s.score > 999）")
+                    ) else SmokeTestResult(passed = true, framesRun = 24, message = "smoke-ok")
+                else -> SmokeTestResult(passed = true, framesRun = 24, message = "smoke-ok")
+            }
+        }
+    }
+
+    /** 前 [failTimes] 次返回失败结果、之后返回通过：驱动"连败后修复成功"的确定性脚本。 */
+    private class FlakySmokeRunner(
+        private val failTimes: Int,
+        private val fail: SmokeTestResult,
+        private val pass: SmokeTestResult
+    ) : SmokeTestRunner {
+        private var runs = 0
+        override suspend fun run(
+            html: String,
+            deep: Boolean,
+            scenariosJson: String?,
+            landscape: Boolean,
+            light: Boolean
+        ): SmokeTestResult = if (runs++ < failTimes) fail else pass
     }
 
     private val validHtml = """<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><script>
@@ -327,6 +374,137 @@ function restart(){}
         // 同一实例以 game-<id> 续作（编辑上下文不中断）；草稿键位让位给新会话
         assertSame(draftAgent, hub.agentFor(meta.id))
         assertNotSame(draftAgent, hub.agentFor(null))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `同一断言连败四次注入错位定向指令`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-stuck-${System.nanoTime()}")
+        // 姿态：writefile 修改 + 宣告交替——宣告空转熔断（无修改连败 3 次）不会触发，
+        // 走"有修改但修不对"的错位路由（同一 scenario 连败 4 次阈值）。
+        // 桩沙箱失败 4 次后转通过：回合确定性 ACCEPTED 收尾，终态消息序列稳定可断言
+        //（calls 持有可变列表引用，回合未收尾时按下标断言"未来消息"会受追加污染）。
+        val htmlB = validHtml.replace("score: 0", "score: 1")
+        fun write(content: String) = LlmResponse(
+            "", toolCalls = listOf(
+                ToolCallData("c-${content.hashCode()}", "writefile", """{"path":"index.html","content":${jsonStr(content)}}""")
+            )
+        )
+        val scenarioJson = """{"scenarios":[{"id":"k","system":"战斗","name":"击杀计数","expect":"s.score > 0"}]}"""
+        val scenariosWrite = LlmResponse(
+            "", toolCalls = listOf(
+                ToolCallData("c-scen", "writefile", """{"path":"scenarios.json","content":${jsonStr(scenarioJson)}}""")
+            )
+        )
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                write(validHtml),          // r1 写入
+                LlmResponse("完成"),        // r2 宣告 → 断言失败 ×1
+                write(htmlB),               // r3 修改
+                LlmResponse("完成"),        // r4 宣告 → ×2
+                write(validHtml),           // r5 修改
+                LlmResponse("完成"),        // r6 宣告 → ×3
+                write(htmlB),               // r7 修改
+                LlmResponse("完成"),        // r8 宣告 → ×4 → 反馈应含错位定向指令
+                scenariosWrite,             // r9 按指令 ② 改写断言
+                LlmResponse("已按指引改写断言"), // r10 宣告 → 沙箱通过 → 消费自检轮
+                LlmResponse("自查完成")      // r11 宣告 → 通过 → ACCEPTED
+            )
+        )
+        val agent = newAgent(
+            dir, client = script,
+            smoke = FlakySmokeRunner(
+                failTimes = 4,
+                fail = SmokeTestResult(
+                    passed = false, framesRun = 24, message = "smoke-failed",
+                    errors = listOf("scenario-fail[战斗与经济/击杀敌人后金币增长]: 期限 300 帧内未达成；字段轨迹: …帧300 {\"gold\":1255}（断言：s.gold < 200 && s.towers === 2）")
+                ),
+                pass = SmokeTestResult(passed = true, framesRun = 24, message = "smoke-ok")
+            )
+        )
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "balanced")
+        assertTrue("改写断言后应交付", agent.session.value.gameGenerated)
+
+        // 终态反馈序列（折叠保留最近两条全文）：[fold, fold, fb3(常规), fb4(错位指令)]
+        val feedbacks = script.calls.last().first
+            .filter { it.role == "user" && (it.content.contains("冒烟测试未通过") || it.content.contains("沙箱失败反馈")) }
+        assertTrue("应有 4 条失败反馈（含折叠摘要），实际 ${feedbacks.size}", feedbacks.size >= 4)
+        assertFalse(
+            "第 3 次失败不应注入错位指令",
+            feedbacks[feedbacks.size - 2].content.contains("断言与游戏设计错位")
+        )
+        val lastFeedback = feedbacks.last().content
+        assertTrue(
+            "第 4 次失败应注入错位定向指令",
+            lastFeedback.contains("断言与游戏设计错位") && lastFeedback.contains("三选一")
+        )
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `首代生成两段门-早期写的断言不干扰运行验收`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-twogate-${System.nanoTime()}")
+        val badScen = """{"scenarios":[{"id":"x","system":"战斗","name":"断言X","expect":"s.score > 999"}]}"""
+        val goodScen = """{"scenarios":[{"id":"x","system":"战斗","name":"断言X","expect":"s.score > 0"}]}"""
+        fun write(path: String, content: String, tag: String) = ToolCallData(tag, "writefile", """{"path":"$path","content":${jsonStr(content)}}""")
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                // r1：同轮并行写入口 + 一条会失败的断言（早期主动写断言的形态）
+                LlmResponse("", toolCalls = listOf(write("index.html", validHtml, "c-h"), write("scenarios.json", badScen, "c-s1"))),
+                LlmResponse("完成"),                       // r2 宣告：运行门过 → 同宣告补断言门 → 失败反馈
+                LlmResponse("", toolCalls = listOf(write("scenarios.json", goodScen, "c-s2"))), // r3 修断言
+                LlmResponse("完成"),                       // r4 宣告：断言门过 → 消费自检轮
+                LlmResponse("自查完成")                     // r5 宣告：通过 → ACCEPT
+            )
+        )
+        val smoke = RecordingSmokeRunner()
+        val agent = newAgent(dir, client = script, smoke = smoke)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "balanced")
+        assertTrue("修复断言后应交付", agent.session.value.gameGenerated)
+
+        // 两段门：同一宣告内先运行门（不带断言）再断言门（既有断言立即补验）
+        assertEquals(4, smoke.calls.size)
+        assertNull("首段不得携带断言（运行时门先行）", smoke.calls[0].scenariosJson)
+        assertTrue("次段应携带既有断言（同宣告补验）", smoke.calls[1].scenariosJson != null)
+        // 断言失败进入了正常修复反馈（r3 的请求历史可见 scenario-fail）
+        assertTrue(script.calls[3].first.any { it.content.contains("scenario-fail") })
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `中途轻量冒烟触发与咨询式升级`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-lightsmoke-${System.nanoTime()}")
+        val htmlB = validHtml.replace("score: 0", "score: 1")
+        fun write(content: String, tag: String) = LlmResponse(
+            "", toolCalls = listOf(ToolCallData(tag, "writefile", """{"path":"index.html","content":${jsonStr(content)}}""")
+        ))
+        // r1 写入口，r2..r17 再写 16 次：第 8 次写入后触发轻量冒烟#1（咨询通知），
+        // 再 8 次后触发#2（同错复现 → 升级为正式修复反馈），r18 宣告交付（轻量档无断言/自检）。
+        val steps = mutableListOf<LlmResponse>(
+            LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}""")
+        )
+        for (i in 1..17) steps += write(if (i % 2 == 1) validHtml else htmlB, "c-$i")
+        steps += LlmResponse("完成")
+        val script = ScriptedLlmClient(steps)
+        val smoke = RecordingSmokeRunner()
+        val agent = newAgent(dir, client = script, smoke = smoke)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "light")
+        assertTrue("轻量档应交付", agent.session.value.gameGenerated)
+
+        // 两次轻量冒烟（light=true 且不带断言），第三次为交付门全量运行
+        val lights = smoke.calls.filter { it.light }
+        assertEquals(2, lights.size)
+        assertTrue(lights.all { it.scenariosJson == null })
+        assertFalse("交付门不得是轻量模式", smoke.calls.last().light)
+        // 咨询通知与升级反馈都在历史中
+        val allText = script.calls.last().first.joinToString(" ") { it.content }
+        assertTrue("首次应为咨询式通知", allText.contains("可能因部分文件尚未写完"))
+        assertTrue("同错复现应升级为正式反馈", allText.contains("连续两次发现同样错误"))
         dir.deleteRecursively()
         Unit
     }

@@ -161,6 +161,35 @@ class GameScenarioTest {
     }
 
     @Test
+    fun `checkObservation rejects monotonic field with absolute upper bound`() {
+        // 收入/得分类只增字段配绝对值上界：收入累积后永不满足（实测 s.gold<200 烧 20+ 轮修复）。
+        val (ok1, text1) = GameScenarios.checkObservation(
+            """{"scenarios":[{"id":"a","name":"花费金币建造","expect":"s.gold < 200 && s.towers === 2"}]}"""
+        )
+        assertFalse(ok1)
+        assertTrue(text1.contains("结构性不可满足"))
+
+        // 常见变体同样拦截：coins/money/score/kills 配 < 或 <=
+        for (trap in listOf(
+            """{"scenarios":[{"id":"x","name":"X","expect":"s.coins <= 50"}]}""",
+            """{"scenarios":[{"id":"x","name":"X","expect":"s.money < 99"}]}""",
+            """{"scenarios":[{"id":"x","name":"X","expect":"s.kills < 10"}]}"""
+        )) {
+            assertFalse("应拦截: $trap", GameScenarios.checkObservation(trap).first)
+        }
+
+        // 合法方向不拦：>（增长方向一致）、递减字段（lives 只减）配上界、相对比较
+        for (fine in listOf(
+            """{"scenarios":[{"id":"a","name":"A","expect":"s.score > 0"}]}""",
+            """{"scenarios":[{"id":"a","name":"A","expect":"s.lives < 3"}]}""",
+            """{"scenarios":[{"id":"a","name":"A","expect":"s.gold < s.goldInitial"}]}""",
+            """{"scenarios":[{"id":"a","name":"A","expect":"s.player.hp <= 20"}]}"""
+        )) {
+            assertTrue("不应拦截: $fine", GameScenarios.checkObservation(fine).first)
+        }
+    }
+
+    @Test
     fun `scenario tier gating is balanced and premium only`() {
         assertFalse(GameScenarios.enabledForTier(QualityTier.FAST))
         assertFalse(GameScenarios.enabledForTier(QualityTier.LIGHT))

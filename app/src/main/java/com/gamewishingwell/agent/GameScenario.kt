@@ -107,6 +107,19 @@ object GameScenarios {
                 "。禁止 >=0（计数/长度天然非负）、!== undefined / !== null / typeof 判存在这类写法；" +
                 "请改写为可失败的数值变化或状态迁移断言（如 s.score > 0、s.wave >= 1、s.state === 'playing'）。"
         }
+        // 结构性不可满足陷阱：单调递增字段（收入/得分/击杀类）配绝对值上界——游戏进程
+        // 中该字段以增长为主，"小于某绝对值"只在开局窗口可翻真，收入一旦累积超过即永不
+        // 满足（实测 s.gold<200 配击杀收入曾烧 20+ 轮修复）。写入即打回，引导相对断言。
+        val traps = list.mapNotNull { sc ->
+            findMonotonicTrap(sc.expect)?.let { desc -> "「${sc.name}」的 ${sc.expect}（${desc}）" }
+        }
+        if (traps.isNotEmpty()) {
+            return false to "功能断言存在结构性不可满足陷阱：" + traps.joinToString("；") +
+                "。gold/score/kills/coins 等收入得分类字段在游戏进程中只增不减，配绝对值上界" +
+                "（s.gold < 200）会因收入累积而永不满足。请改写为与增长方向一致的行为断言" +
+                "（如建造后 s.towers 增加、击杀后 s.kills 增加），或相对断言：在 __wwDebugState" +
+                " 暴露初始值/最近花费字段后比较相对变化（s.gold < s.goldInitial）。"
+        }
         val summary = list.joinToString("；") { sc ->
             "${sc.system.ifBlank { "通用" }}/${sc.name}(${sc.steps.size}步:${sc.expect.take(60)})"
         }
@@ -120,6 +133,27 @@ object GameScenarios {
         Regex(""">=\s*0\s*(?![.\d])""").containsMatchIn(expect) ||
             Regex("""!==?\s*(?:undefined|null)\b""", RegexOption.IGNORE_CASE).containsMatchIn(expect) ||
             Regex("""typeof\s+\S{1,40}?\s*!==?\s*['"]undefined['"]""").containsMatchIn(expect)
+
+    /**
+     * 单调递增字段 × 绝对值上界的结构性不可满足检测：命中返回字段说明（用于回报）。
+     * 只拦"<"/"<="方向：递增字段要求小于某绝对数，收入累积后永不满足；">"方向
+     * （s.score > 0）与递减字段（s.lives < 3——生命只减）都是合法可满足断言，不拦。
+     */
+    private fun findMonotonicTrap(expect: String): String? {
+        val monotonicFields = setOf(
+            "gold", "coins", "coin", "money", "cash", "score", "points",
+            "kills", "kill", "killsTotal", "wave", "waveNum", "level",
+            "xp", "exp", "earned", "income", "gems", "diamonds"
+        )
+        val re = Regex("""s\.([A-Za-z_$][\w$]*)\s*<=?\s*(\d+)""")
+        re.findAll(expect).forEach { m ->
+            val field = m.groupValues[1]
+            if (monotonicFields.any { it.equals(field, ignoreCase = true) }) {
+                return "s.$field 为收入/得分类只增字段，绝对值上界 ${m.groupValues[0]} 会因累积而不可满足"
+            }
+        }
+        return null
+    }
 
     /** 容错提取 JSON 数组文本：支持裸数组或 {"scenarios":[...]} 包装。 */
     private fun extractArray(text: String): String? {

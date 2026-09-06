@@ -443,6 +443,20 @@ class GameAgent(
          * + 常规修复轮次后仍有余量。
          */
         const val LEGACY_MAX_ROUNDS = 30
+
+        /**
+         * 同一断言连败错位路由阈值：≥4 次未通过（期间有修改）判定"断言与设计错位"嫌疑，
+         * 注入三选一定向指令（调前置/改断言/改游戏）。与宣告空转熔断（3 次）互补：
+         * 那管零修改的空转，这管有修改但修不对的错位。
+         */
+        const val SCENARIO_STUCK_THRESHOLD = 4
+
+        /**
+         * 中途轻量冒烟的写入触发间隔：入口文件存在后每 8 次工作区写入跑一次
+         * 仅运行时错误的轻量检查——NaN/引用类灾难从"首次宣告才发现"（实测第 40 轮）
+         * 提前到写作期第 ~8 次写入。
+         */
+        const val LIGHT_SMOKE_TOUCH_INTERVAL = 8
     }
 
     /**
@@ -1482,6 +1496,9 @@ class GameAgent(
             failTurn("请先在「设置」中配置 API Key、地址和模型")
             return
         }
+        // 修复态客户端（关思考）：修复轮与失败反馈后的修复回合使用——定位+小编辑
+        // 为主，思考轮 3~4 倍时延在此性价比最低。创建失败时退回主客户端（行为不变）。
+        val llmQuiet = createClient(forceQuiet = true) ?: llm
 
         // Agent Loop 主路径为工具模式：模型通过 readfile/writefile/editfile 亲自读写游戏
         // 工作区，每次写入后宿主自动运行基础校验并把报告作为观察回传；静态校验通过后
@@ -1566,6 +1583,7 @@ class GameAgent(
 
         var outcome = runToolLoop(
             llm = llm,
+            llmQuiet = llmQuiet,
             workspace = workspace,
             executor = executor,
             instruction = instruction,
@@ -1578,7 +1596,7 @@ class GameAgent(
         )
         if (outcome is GenOutcome.LegacyFallback) {
             outcome = runLegacyRewriteLoop(
-                llm, instruction, plan, existingHtml, outcome.firstHtml,
+                llm, llmQuiet, instruction, plan, existingHtml, outcome.firstHtml,
                 seedHash = existingHtml?.let { GameFileWorkspace.sha256(it) },
                 startRound = outcome.roundsConsumed,
                 allowedEngines = allowedEngines,
@@ -1656,6 +1674,8 @@ class GameAgent(
      */
     private suspend fun runToolLoop(
         llm: LlmClient,
+        /** 修复态客户端（关思考）：修复轮与失败反馈后的修复回合使用。 */
+        llmQuiet: LlmClient,
         workspace: GameFileWorkspace,
         executor: GameToolExecutor,
         instruction: String,
@@ -1679,10 +1699,21 @@ class GameAgent(
         var mutatedOnce = false
         var lastReport: ValidationReport? = null
         var stubborn: Map<String, Int> = emptyMap()
+        // 修复态轮次标记：初值=修复轮全程关思考；失败反馈/自检轮消费处置 true，
+        // 每次调用后回落在 fixTurn 基线（效果=失败后的下一个回合用安静客户端）。
+        var quietRound = fixTurn
         // 失速跟踪器（唯一决策出口）：被驳回的完成宣告链 / 侦查空转 / 连续无工具轮，
         // 收编旧 idleRounds 与 toollessRounds 两个并行计数器。
         val stallTracker = LoopStallTracker()
         var nudgesLeft = 3
+        // 断言门相位（首代生成，2026-09）：false=运行时门阶段——验收不带 scenarios，
+        // 模型早期主动写的断言不与运行修复交错；首次运行全绿即翻转为 true，既有断言
+        // 在同一宣告内立即补验（不烧额外轮次）。迭代/修复轮恒为 true（回归保护不动）。
+        var assertionPhase = !firstGeneration || fixTurn
+        // 中途轻量冒烟记账：入口成型后每 8 次写入触发一次"仅运行时错误"检查；
+        // 同一错误连续两次复现才升级为正式修复反馈（施工中间态的合法报错只通知一次）。
+        var touchesSinceLightSmoke = 0
+        var lastLightErrorSig: String? = null
         // 可玩性自检轮随质量档位与回合类型分档：快速/轻量无自检、均衡一轮、精品两轮；
         // 修复轮除快速档外仅一轮回归自检。每轮自检后重新走校验+沙箱验收。
         val tier = QualityTier.normalize(_session.value.qualityTier)
@@ -1698,6 +1729,9 @@ class GameAgent(
         // 回合结构指标（跨游戏横向度量迭代健康度）：readfile 调用次数、断言失败累计、
         // 沙箱总尝试次数。
         var scenarioFailTotal = 0
+        // 同一断言连败记账（断言错位路由）：label -> 连续失败次数，通过即移除。
+        // 修复轮"修不对"分支的探测器——与宣告空转熔断互补（那管"不行动"，这管"行动但无效"）。
+        val scenarioLoseStreaks = mutableMapOf<String, Int>()
         // 方向断言连续失败计数：orientation-mismatch 是"模型无法修"的失败类别
         // （期望来自 Game Schema/用户确认，改游戏或旋转画布都不能满足错误期望），
         // 累计 3 次即判定方向期望与游戏形态错位，确定性逃生交回用户，不再回炉模型。
@@ -1726,8 +1760,11 @@ class GameAgent(
             }
             _session.update { it.copy(agentStage = genStage) }
 
+            // 修复态轮次选择：修复轮全程 + 失败反馈/自检轮之后的那个回合用关思考客户端
+            //（定位+小编辑为主，思考轮 3~4 倍时延在此性价比最低）；其余回合尊重用户思考开关。
+            if (quietRound && round > 1) alog("quiet round (thinking off)")
             val resp = try {
-                callLlm(llm, messages, GameTools.specs(), stageLabel = genStage)
+                callLlm(if (quietRound) llmQuiet else llm, messages, GameTools.specs(), stageLabel = genStage)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1735,6 +1772,7 @@ class GameAgent(
                 failTurn(LlmFailureClassifier.userMessage(e) ?: USER_MSG_NETWORK, internalDetail = "LLM 调用失败：${e.javaClass.simpleName}: ${e.message}")
                 return GenOutcome.Failed
             }
+            quietRound = fixTurn
             currentCoroutineContext().ensureActive()
             alog("round $round: textLen=${resp.text.length} toolCalls=[${resp.toolCalls.joinToString(",") { it.name }}]")
 
@@ -1825,10 +1863,24 @@ class GameAgent(
                             // 均衡/精品档携带工作区功能断言（scenarios.json）一并执行；
                             // 横板游戏以横屏视口运行（与真实游戏页一致）并断言主画布方向。
                             val expectLandscape = plan.screenOrientation == GameSchema.ORIENTATION_LANDSCAPE
-                            val scenariosJson = smokeScenariosJson(workspace, tier)
-                            val smoke = if (tier == QualityTier.FAST) null else
+                            // 断言门相位（首代生成）：运行时门阶段不带 scenarios 验收——
+                            // 模型早期主动写的断言不与运行修复交错。
+                            val scenariosJson = if (assertionPhase) smokeScenariosJson(workspace, tier) else null
+                            var smoke = if (tier == QualityTier.FAST) null else
                                 runSmokeTest(content, scenariosJson, expectLandscape, files = { rel -> workspaceRead(rel) })
                             sandboxAttempts += smoke?.attempts ?: 0
+                            // 两段式收口：运行时门首过 → 进入断言相位；既有断言在同一宣告内
+                            // 立即补验（不烧额外 LLM 轮次），失败落入下方同一失败反馈路径
+                            //（错位路由/连败记账/宣告熔断全部生效）。
+                            if (!assertionPhase && smoke != null && smoke.passed) {
+                                assertionPhase = true
+                                alog("assertion phase entered (runtime clean)")
+                                val scenNow = smokeScenariosJson(workspace, tier)
+                                if (scenNow != null) {
+                                    smoke = runSmokeTest(content, scenNow, expectLandscape, files = { rel -> workspaceRead(rel) })
+                                    sandboxAttempts += smoke?.attempts ?: 0
+                                }
+                            }
                             if (smoke != null && smoke.message?.startsWith("sandbox-infra") == true) {
                                 failTurn(
                                     USER_MSG_SANDBOX_ENV,
@@ -1857,8 +1909,16 @@ class GameAgent(
                                     // "字段不存在"独立成信号，无需按失败次数累积的对齐路由。
                                     val failedLabels = smokeErrors.mapNotNull { err ->
                                         Regex("""scenario-fail\[([^\]]+)]""").find(err)?.groupValues?.get(1)
-                                    }
+                                    }.distinct()
                                     scenarioFailTotal += failedLabels.size
+                                    // 连败记账：本轮未再失败的断言清零（修好即出狱），
+                                    // 连败达阈值的交给 scenarioHint 的错位定向指令。
+                                    val failedSet = failedLabels.toSet()
+                                    scenarioLoseStreaks.keys.removeAll(scenarioLoseStreaks.keys - failedSet)
+                                    val stuckScenarios = failedLabels.mapNotNull { label ->
+                                        val n = scenarioLoseStreaks.merge(label, 1, Int::plus) ?: return@mapNotNull null
+                                        if (n >= SCENARIO_STUCK_THRESHOLD) label to n else null
+                                    }
                                     // 方向错位逃生门：orientation-mismatch 累计 3 次 = 期望（来自
                                     // 确认门/Game Schema）与游戏实际形态错位，模型无法通过修改
                                     // 游戏满足错误期望（旋转画布被禁止、玩法形态由需求决定）——
@@ -1902,6 +1962,7 @@ class GameAgent(
                                                 declarationSteerMessage(stall.count, smokeErrors.firstOrNull()?.take(160))
                                             )
                                             smokeFailMsgIdx += messages.lastIndex
+                                            quietRound = true
                                             continue
                                         }
                                         StallAction.None -> {}
@@ -1937,11 +1998,23 @@ class GameAgent(
                                             .joinToString("、") { "${it.path}(v${it.version})" }
                                             .take(240)
                                     }.getOrDefault("")
-                                    val scenarioHint = if (smokeErrors.any { it.startsWith("scenario-fail") }) {
-                                        "\n其中 scenario-fail 为功能断言未通过，回报已自带定位信息：" +
-                                            "字段轨迹全程不变＝机制未发生（修游戏逻辑或断言字段）；提示字段不存在＝对齐 expect 字段名；" +
-                                            "断言在期限内任一帧为真即通过，不要为通过断言而弱化游戏逻辑。"
-                                    } else ""
+                                    val scenarioHint = when {
+                                        // 断言错位定向指令（连败 ≥ 阈值）：多次修改无效时大概率断言与
+                                        // 游戏设计错位而非实现 bug——把"盲调参数"压缩为一轮三选一决策
+                                        //（实测单条断言错位曾烧 20+ 轮：300 帧内击杀 vs 波次倒计时）。
+                                        stuckScenarios.isNotEmpty() ->
+                                            "\n其中断言「" + stuckScenarios.joinToString("、") { it.first } +
+                                                "」已连续 " + stuckScenarios.first().second + " 次验证未通过（期间多次修改无效）——" +
+                                                "大概率是断言与游戏设计错位而非实现 bug。请三选一立即执行：" +
+                                                "①核对断言前置条件与游戏节奏（波次倒计时/开局准备期）：调整 steps 先满足前置（如先点开始按钮）或加大 horizon；" +
+                                                "②改写该条 expect 为与游戏机制一致的可满足断言（改 scenarios.json 并在回复中用一行说明理由）；" +
+                                                "③若该行为确实应当实现，修改游戏使其可满足。"
+                                        smokeErrors.any { it.startsWith("scenario-fail") } ->
+                                            "\n其中 scenario-fail 为功能断言未通过，回报已自带定位信息：" +
+                                                "字段轨迹全程不变＝机制未发生（修游戏逻辑或断言字段）；提示字段不存在＝对齐 expect 字段名；" +
+                                                "断言在期限内任一帧为真即通过，不要为通过断言而弱化游戏逻辑。"
+                                        else -> ""
+                                    }
                                     // 数值污染溯源路由：NaN/undefined/纯色画布类错误指向数据结构错位，
                                     // 自由修复时模型易走"过滤坏值/默认值兜底"的掩盖式修法（实测把可检测的
                                     // 渲染故障修成不可检测的静默空几何），点名根因方向。
@@ -1973,12 +2046,15 @@ class GameAgent(
                                             "\n请用 editfile 修复；沙箱跑通前不要结束。"
                                     )
                                     smokeFailMsgIdx += messages.lastIndex
+                                    quietRound = true
                                     continue
                                 }
                             }
                             // 沙箱通过（或慢环境超时无错误按通过）：先补功能断言缺口
                             // （一次性），再消费可玩性自检轮（内容完整性→体验与平台合规），
                             // 每轮自检后重新走校验+沙箱验收。
+                            // FAST/无既有断言路径的相位收尾（插入点只在 smoke 首过时翻转）
+                            if (!assertionPhase) assertionPhase = true
                             if (smoke != null && smoke.scenarioTotal > 0) {
                                 scenarioEvidence = "沙箱功能断言已通过 ${smoke.scenarioPassed}/${smoke.scenarioTotal} 条：" +
                                     smoke.scenarioResults.joinToString("；") { it.take(80) } +
@@ -1992,13 +2068,15 @@ class GameAgent(
                             val visualEvidence = smoke?.takeIf { it.canvasColors > 0 }?.let {
                                 "沙箱画面检测：主画布实际渲染出 ${it.canvasColors} 种颜色（像素多样性门槛≥3，纯色/空白画布会被判回炉）。"
                             }
-                            if (!fixTurn && !scenarioNudged && scenariosJson == null &&
+                            // 相位翻转后 scenariosJson 局部值已过期，nudge 判定实时重读文件
+                            if (!fixTurn && !scenarioNudged && smokeScenariosJson(workspace, tier) == null &&
                                 GameScenarios.enabledForTier(tier)
                             ) {
                                 scenarioNudged = true
                                 alog("scenario nudge: scenarios.json missing (tier=$tier)")
                                 _session.update { it.copy(agentStage = "校验中：正在补写功能断言") }
                                 messages += ChatMessage("user", GamePrompt.scenarioNudgePrompt())
+                                quietRound = true
                                 continue
                             }
                             val review = selfReviews.removeFirstOrNull()
@@ -2009,6 +2087,7 @@ class GameAgent(
                                     .joinToString("\n\n")
                                     .let { if (it.isEmpty()) "" else it + "\n\n" }
                                 messages += ChatMessage("user", evidencePrefix + review.second)
+                                quietRound = true
                                 continue
                             }
                             // 精品档防敷衍：自检期间零修改直通时，一次性注入丰富度增强指令
@@ -2077,6 +2156,7 @@ class GameAgent(
                                     report.errors.firstOrNull()?.let { "${it.category}:${it.message}" }?.take(160)
                                 )
                             )
+                            quietRound = true
                             continue
                         }
                         StallAction.None -> {}
@@ -2088,6 +2168,7 @@ class GameAgent(
                             ErrorSignature.hash(ErrorSignature.normalize(report.errors.joinToString(";") { it.message }))
                         ) + "\n请继续用 editfile 修复上述问题；修复通过前不要结束。"
                     )
+                    quietRound = true
                     continue
                 }
 
@@ -2121,6 +2202,7 @@ class GameAgent(
                     mutatedThisRound = true
                     mutatedOnce = true
                     if (firstPassDone) mutatedSinceFirstPass = true
+                    if (outcome.ok) touchesSinceLightSmoke++
                 }
                 if (outcome.mutated) {
                     lastReport = outcome.report
@@ -2172,6 +2254,43 @@ class GameAgent(
                 }
                 StallAction.None -> {}
             }
+
+            // 中途轻量冒烟（2026-09）：写作期不盲写——NaN/引用类灾难从"首次宣告才发现"
+            //（实测第 40 轮）提前到第 ~8 次写入。仅运行时错误信号；咨询式升级：同一错误
+            // 连续两次复现才作为正式修复反馈，施工中间态（引用尚未写完的文件/函数）的
+            // 合法报错只做一次便宜的通知。快速档完全跳过（不测试哲学同交付门）。
+            val entryNow = workspace.read(GameFileWorkspaceEntryPoint.DEFAULT)
+            if (tier != QualityTier.FAST && entryNow != null &&
+                touchesSinceLightSmoke >= LIGHT_SMOKE_TOUCH_INTERVAL
+            ) {
+                touchesSinceLightSmoke = 0
+                val lightResult = runSmokeTest(
+                    entryNow, landscape = false,
+                    files = { rel -> workspaceRead(rel) }, light = true
+                )
+                if (lightResult != null && lightResult.message?.startsWith("sandbox-infra") != true) {
+                    val lightErrs = lightResult.errors
+                        .filter { it.isNotBlank() && it != "smoke-timeout" && it != "冒烟测试超时" }
+                    if (lightResult.framesRun > 0 && lightErrs.isNotEmpty()) {
+                        val sig = ErrorSignature.normalize(lightErrs.joinToString(";"))
+                        val escalated = sig == lastLightErrorSig
+                        lastLightErrorSig = sig
+                        alog("light smoke: escalated=$escalated frames=${lightResult.framesRun} err=${lightErrs.first().take(120)}")
+                        messages += ChatMessage(
+                            "user",
+                            if (escalated) {
+                                "中途运行检查连续两次发现同样错误，这已不是施工中间态，请立即用 editfile 修复该运行时错误：" +
+                                    lightErrs.take(2).joinToString("；").take(300)
+                            } else {
+                                "（中途运行检查发现报错，可能因部分文件尚未写完：「" + lightErrs.first().take(140) +
+                                    "」。若相关实现尚未完成，继续按计划写入即可；下次检查仍复现时需要修复。）"
+                            }
+                        )
+                    } else if (lightResult.framesRun > 0) {
+                        lastLightErrorSig = null // 干净运行清零升级链
+                    }
+                }
+            }
         }
     }
 
@@ -2184,6 +2303,8 @@ class GameAgent(
      */
     private suspend fun runLegacyRewriteLoop(
         llm: LlmClient,
+        /** 修复态客户端（关思考）：修复轮全程使用（全量重写的修复轮思考性价比同样最低）。 */
+        llmQuiet: LlmClient,
         instruction: String,
         plan: DesignPlan,
         existingHtml: String?,
@@ -2328,7 +2449,7 @@ class GameAgent(
 
             val reply = try {
                 callLlm(
-                    llm,
+                    if (fixTurn) llmQuiet else llm,
                     buildGenerationMessages(
                         instruction = instruction,
                         plan = plan,
@@ -2557,6 +2678,8 @@ class GameAgent(
         html: String,
         scenariosJson: String? = null,
         landscape: Boolean = false,
+        /** 轻量模式（中途冒烟）：仅运行时错误信号，跳过收尾检查组与断言。 */
+        light: Boolean = false,
         /**
          * 多文件游戏的辅助文件读取器（工作区相对路径 → 内容）：沙箱跑的是
          * "内联合并后的自包含页面"，与真实游戏页（GameViewModel 同经 GameBundle）
@@ -2579,9 +2702,10 @@ class GameAgent(
             // 精品档（deep 模式）：真实调用 restart() 完整重开后复跑半程帧。
             val result = runner.run(
                 prepared,
-                deep = QualityTier.normalize(_session.value.qualityTier) == QualityTier.PREMIUM,
+                deep = !light && QualityTier.normalize(_session.value.qualityTier) == QualityTier.PREMIUM,
                 scenariosJson = scenariosJson,
-                landscape = landscape
+                landscape = landscape,
+                light = light
             )
             if (!result.passed && result.errors.isEmpty() && result.message != "smoke-timeout") {
                 android.util.Log.w("GameAgent", "沙箱结果不可读：${result.message}")
@@ -2743,7 +2867,12 @@ class GameAgent(
 
     // ---------- LLM ----------
 
-    private fun createClient(): LlmClient? {
+    /**
+     * 创建本轮 LLM 客户端。[forceQuiet] 为 true 时强制关闭思考（修复轮/失败反馈后的
+     * 修复回合：定位+小编辑为主，深度思考性价比最低——实测思考轮均 25~30s vs 普通轮 8s，
+     * 单回合 10+ 个思考轮纯烧 5 分钟；用户显式开启的思考在生成/写作轮不受影响）。
+     */
+    private fun createClient(forceQuiet: Boolean = false): LlmClient? {
         val s: LlmSettings = settingsRepository.settings.value
         if (!settingsRepository.isConfigured()) return null
         val preset = ProviderPresets.byId(s.providerId) ?: ProviderPresets.DEFAULT
@@ -2754,7 +2883,7 @@ class GameAgent(
                 baseUrl = s.baseUrl,
                 model = s.model,
                 maxTokens = preset.maxTokens,
-                thinkingEnabled = s.thinkingEnabled
+                thinkingEnabled = !forceQuiet && s.thinkingEnabled
             )
         } else {
             // OpenAI 兼容协议不携带 max_tokens：输出长度由网关按模型上限裁定（不设限）
@@ -2763,7 +2892,7 @@ class GameAgent(
                 apiKey = s.apiKey,
                 baseUrl = s.baseUrl,
                 model = s.model,
-                disableThinking = preset.disableThinking || !s.thinkingEnabled
+                disableThinking = forceQuiet || preset.disableThinking || !s.thinkingEnabled
             )
         }
     }

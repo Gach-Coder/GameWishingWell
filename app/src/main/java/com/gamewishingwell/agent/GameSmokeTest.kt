@@ -36,7 +36,9 @@ interface SmokeTestRunner {
         html: String,
         deep: Boolean = false,
         scenariosJson: String? = null,
-        landscape: Boolean = false
+        landscape: Boolean = false,
+        /** 轻量模式（中途冒烟）：仅运行时错误信号，见 [SmokeTestProbe.inject]。 */
+        light: Boolean = false
     ): SmokeTestResult
 }
 
@@ -62,7 +64,7 @@ data class SmokeTestResult(
 )
 
 object NoopSmokeTestRunner : SmokeTestRunner {
-    override suspend fun run(html: String, deep: Boolean, scenariosJson: String?, landscape: Boolean): SmokeTestResult =
+    override suspend fun run(html: String, deep: Boolean, scenariosJson: String?, landscape: Boolean, light: Boolean): SmokeTestResult =
         SmokeTestResult(passed = true, message = "noop-smoke-runner")
 }
 
@@ -83,13 +85,28 @@ object NoopSmokeTestRunner : SmokeTestRunner {
 object SmokeTestProbe {
     /** 确定性 tick 帧数：每帧 50ms 游戏时间，共约 1.2s——覆盖出怪、数值变动、状态切换等早期玩法。 */
     const val MAX_FRAMES = 24
+
+    /** 轻量模式（中途冒烟）帧数：只够暴露加载/首帧运行时错误，追求最小开销。 */
+    const val LIGHT_FRAMES = 6
     /** 平台按钮悬浮区高度（px）：左上"返回"与右上"设置"按钮悬浮在游戏画面之上。 */
     const val RESERVED_TOP_PX = 110
     /** 平台按钮悬浮区宽度（px）：只执法两个角落——顶部其余区域可自由布局，无保留区留白。 */
     const val RESERVED_CORNER_W = 140
     private const val MARKER = "__wwSmokeInstalled"
 
-    fun inject(html: String, deep: Boolean = false, scenariosJson: String? = null, landscape: Boolean = false): String {
+    fun inject(
+        html: String,
+        deep: Boolean = false,
+        scenariosJson: String? = null,
+        landscape: Boolean = false,
+        /**
+         * 轻量模式（中途冒烟）：只推 [LIGHT_FRAMES] 帧并采集运行时错误（帧内异常/
+         * 全局 error/console error），跳过全部收尾检查（白屏/方向/角落/restart/
+         * 可观测性/场景断言）与交互注入——中途状态不完整是合法施工形态，画面与
+         * 行为断言只在交付门裁决。宿主据此把失败按"咨询式升级"处理而非阻断。
+         */
+        light: Boolean = false
+    ): String {
         if (html.contains(MARKER)) return html
         // 场景断言数据用 <script type="application/json"> 承载（放在探针脚本之前，
         // 解析时元素已可用）：避免把 JSON 内嵌进 JS 字符串字面量的转义问题；
@@ -148,12 +165,13 @@ object SmokeTestProbe {
               var __pokedInitial = false; // 首帧后的首轮交互只做一次
               // deep（精品档）：restart() 真实重开后复跑半程帧，验证"完整重开"契约。
               var __deep = ${if (deep) "true" else "false"};
+              var __light = ${if (light) "true" else "false"};
               // 画面方向期望（宿主按 Game Schema 注入）：横板断言主画布宽>高，
               // 竖版断言高>宽。getBoundingClientRect 反映 transform 后的视觉盒，
               // 旋转画布实现的横板游戏同样按宽>高判定。
               var __landscape = ${if (landscape) "true" else "false"};
               var phase = 1;   // 1=首次运行 2=restart 后复跑
-              var limit = ${MAX_FRAMES};
+              var limit = ${if (light) LIGHT_FRAMES else MAX_FRAMES};
               // 帧边界外（主阶段结束→场景/deep 阶段重置计数之间的空窗）的 rAF 注册
               // 暂存于此，阶段重置后复活——此前回调节链在此断裂（回落到离屏被冻结的
               // 真实定时器＝永久丢失），场景阶段游戏冻结、断言只能对 restart 后的
@@ -437,17 +455,20 @@ object SmokeTestProbe {
                     try { batch[i](now); }
                     catch (e) { window.__wwSmokeResult.errors.push(String(e && e.message || e)); }
                   }
-                  if (phase === 1 && !__pokedInitial) {
+                  if (!__light && phase === 1 && !__pokedInitial) {
                     __pokedInitial = true;
                     pokeTouch(); // 首帧后立即交互：触发"开始"类按钮让游戏真正进入运行态
-                  } else if (phase === 1 && ticked === ${MAX_FRAMES / 2}) {
+                  } else if (!__light && phase === 1 && ticked === ${MAX_FRAMES / 2}) {
                     pokeTouch(); // 中段再交互一轮：运行态后的处理器也得到执行
                   }
                   if (ticked < limit) return;
                   // 推满帧的本次调用直接落入收尾检查：宿主在 f==limit 的同一次轮询里
                   // 即可读到终态 passed，避免"帧已满但未 finalize"的空档被误判为设施异常。
                 }
-                if (phase === 1) {
+                if (__light) {
+                  // 轻量模式（中途冒烟）：只回答"运行时有没有报错"，收尾检查组
+                  //（白屏/方向/角落/restart/可观测性/断言）留给交付门裁决。
+                } else if (phase === 1) {
                   restartPresenceCheck();
                   blankCheck();
                   reservedAreaCheck();
@@ -713,10 +734,16 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         html: String,
         deep: Boolean,
         scenariosJson: String?,
-        landscape: Boolean
+        landscape: Boolean,
+        light: Boolean
     ): SmokeTestResult {
-        val prepared = HtmlEnhancer.inject(SmokeTestProbe.inject(html, deep, scenariosJson, landscape))
-        val timeoutMs = if (deep) DEEP_TIMEOUT_MS else TIMEOUT_MS
+        val prepared = HtmlEnhancer.inject(SmokeTestProbe.inject(html, deep, scenariosJson, landscape, light))
+        // 轻量模式帧数少，外层超时相应收紧（仍留设施慢启动余量）。
+        val timeoutMs = when {
+            light -> LIGHT_TIMEOUT_MS
+            deep -> DEEP_TIMEOUT_MS
+            else -> TIMEOUT_MS
+        }
         // 设施类失败（零帧冻结/结果不可读）重建 WebView 重试：实测该故障间歇性发作
         // （曾连续五回合在 LLM 工作全部完成后死在沙箱、之后自愈），新实例大概率落到
         // 健康 renderer 上；游戏自身错误（有错误文本/帧有推进）不属于此类，不重试。
@@ -1017,6 +1044,8 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
     private companion object {
         // 外层兜底超时：仅防挂起（宿主驱动下正常路径数秒完成）。
         const val TIMEOUT_MS = 80_000L
+        // 轻量模式（中途冒烟）外层超时：6 帧 + 探针定稿，正常数秒完成。
+        const val LIGHT_TIMEOUT_MS = 30_000L
         // deep（精品档）额外跑 restart() 复跑半程（合计约 36 批次）。
         const val DEEP_TIMEOUT_MS = 110_000L
         const val FIRST_POLL_DELAY_MS = 1_200L
