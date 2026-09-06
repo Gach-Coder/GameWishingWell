@@ -31,9 +31,12 @@
 		- 运行时 JS 报错会弹出覆盖层，可“让 AI 修复”；也可继续对话迭代（如“加连击计分”），修改基于上一个版本的游戏文件进行。
 		- 编辑区/运行区独立：Agent 工具沙箱写”编辑区”（filesDir/agent/workspace/<会话>），已保存游戏目录为”运行区”
 		  （filesDir/games/<id>）——编辑会话期间运行区文件不被写入（只同步会话簿记），
-		  “保存”按钮把编辑区全部游戏文件（index.html 版本化 + scenarios.json 等）整体覆盖到运行区，
+		  “保存”和“撤销”即编辑版与保存版两个版本的相互覆盖：
+		  “保存”＝编辑区全部游戏文件（index.html + js/css + scenarios.json）整体覆盖到运行区，
 		  同时把会话上下文冻结为保存点（games/<id>/.savepoint，撤销锚点）；
-		  “撤销”按钮（仅编辑已保存游戏的会话）为保存的逆操作：保存区文件覆盖编辑区、
+		  “撤销”（仅编辑已保存游戏的会话）＝逆操作：以 GameRepository.savedGameFilePaths 递归清单为准
+		  把保存区全部文件覆盖回编辑区（多文件形态含子目录，旧实现只取根级文件名——撤回曾误删
+		  js/css 全部子目录文件且不恢复），覆盖经工作区版本化写入（簿记不旁路），
 		  上下文回滚到保存点——未保存的修改与其后的对话记录被丢弃（二次确认，不可恢复）；
 		  旧版本保存的游戏无保存点：撤销时清空对话只留说明气泡（保存点缺失时上下文不可回放），
 		  可用 scripts/migrate-savepoint.py（adb run-as 直写 .savepoint）为旧游戏补建保存点恢复精确撤销；
@@ -441,14 +444,14 @@ GameWishingWell/
 	      │  │  │  ├─ GameEngines.kt        # 内置引擎条件注册表（ww-engine 解析/BUNDLED/allowedFor 条件矩阵）
 	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控/eventually 期限（horizon）
 	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试 + 功能断言执行 + 画面方向断言（横板按横屏视口运行）
-      │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入（归档滚动保留，delete 同步清理版本簿记）
+      │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入（归档统一根 .versions、嵌套路径 js__main.js 编码，归档滚动保留，init 清理散落目录，delete 同步清理版本簿记）
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
       │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
 	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入（视口修复/错误捕获/内置引擎注入）
 	      │  │  │  └─ GenerationForegroundService.kt # 生成期前台服务（dataSync）：后台保活/进度通知/停止入口/wakelock
       │  │  ├─ data/
       │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage
-      │  │  │  ├─ GameRepository.kt      # 游戏库与草稿文件存储
+      │  │  │  ├─ GameRepository.kt      # 游戏库与草稿文件存储（savedGameFilePaths 递归清单供撤销；保存区拒收任何 .versions 路径并清理存量嵌套归档）
       │  │  │  ├─ SecurePrefs.kt         # Keystore AES-GCM 加密偏好存储
       │  │  │  └─ SettingsRepository.kt  # LLM 配置 StateFlow 仓库
       │  │  ├─ llm/

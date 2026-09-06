@@ -25,6 +25,11 @@ data class FileManifest(
  * tool call 的读写文件沙箱：权限严格限制在该游戏文件夹内。
  * 写入采用版本化文件 + 指针切换；同会话由 [Mutex] 加锁，写入前做文件 hash
  * 校验，避免并发覆盖。
+ *
+ * 版本归档统一收在工作区根 [.versions] 下（"不得分开保存"）：子目录文件的
+ * 相对路径编码进归档名（js/main.js → 1-js__main.js），任何文件都不在自己
+ * 所在目录另建 .versions；归档为只写不读的历史簿记（无回读 API），统一后
+ * 保存/撤销链路只需排除根 .versions 一处。init 时清理历史散落的嵌套 .versions。
  */
 class GameFileWorkspace(private val rootDir: File) {
 
@@ -32,6 +37,23 @@ class GameFileWorkspace(private val rootDir: File) {
 
     init {
         rootDir.mkdirs()
+        cleanupScatteredVersions()
+    }
+
+    /** 版本归档名基：相对路径中的 / 编码为 __（归档与 marker 同名基，保证逐文件独立簿记）。 */
+    private fun archiveBase(relativePath: String): String = relativePath.trim().replace("/", "__")
+
+    /**
+     * 清理历史散落的嵌套 .versions 目录（旧实现按文件所在目录建归档，多文件后
+     * 散落在 js/.versions、css/.versions 等）：归档只写不读，删除即收敛，无需迁移。
+     */
+    private fun cleanupScatteredVersions() {
+        runCatching {
+            val root = rootDir.canonicalFile
+            rootDir.walkTopDown()
+                .filter { it.isDirectory && it.name == VERSIONS_DIR && it.parentFile?.canonicalFile != root }
+                .forEach { it.deleteRecursively() }
+        }
     }
 
     /** 路径解析：禁止 .. 逃逸、禁止绝对路径。解析失败返回 null。 */
@@ -81,11 +103,12 @@ class GameFileWorkspace(private val rootDir: File) {
         if (deleted) {
             // 版本簿记随文件一并清理：残留的旧 marker 会让"删除→重建"从旧版本号
             // 续数，新归档按 v1 覆盖上一款游戏的历史归档（跨游戏版本串台）；
-            // 归档文件同步移除，避免孤儿堆积。
-            val versionsDir = File(file.parentFile, ".versions")
-            File(versionsDir, "${file.name}.version").delete()
+            // 归档文件同步移除，避免孤儿堆积。归档统一在根 .versions 下。
+            val base = archiveBase(relativePath)
+            val versionsDir = File(rootDir, VERSIONS_DIR)
+            File(versionsDir, "$base.version").delete()
             versionsDir.listFiles()?.forEach { archived ->
-                if (archived.name.endsWith("-${file.name}")) archived.delete()
+                if (archived.name.endsWith("-$base")) archived.delete()
             }
         }
         deleted
@@ -127,16 +150,18 @@ class GameFileWorkspace(private val rootDir: File) {
         }
 
         val bytes = content.toByteArray(Charsets.UTF_8)
-        val versionsDir = File(file.parentFile, ".versions").apply { mkdirs() }
+        // 版本归档统一在根 .versions（嵌套路径编码进归档名），不在文件所在目录另建
+        val base = archiveBase(relativePath)
+        val versionsDir = File(rootDir, VERSIONS_DIR).apply { mkdirs() }
         val currentVersion = if (file.isFile) versionOf(relativePath) else 0
         val nextVersion = currentVersion + 1
         if (file.isFile) {
             // 指针切换：旧文件先入版本库，再写新文件；任何一步失败都不破坏旧指针内容。
-            File(versionsDir, "$currentVersion-${file.name}").writeBytes(file.readBytes())
+            File(versionsDir, "$currentVersion-$base").writeBytes(file.readBytes())
         }
         file.writeText(content, Charsets.UTF_8)
-        File(versionsDir, "${file.name}.version").writeText(nextVersion.toString(), Charsets.UTF_8)
-        pruneVersions(versionsDir, file.name, nextVersion)
+        File(versionsDir, "$base.version").writeText(nextVersion.toString(), Charsets.UTF_8)
+        pruneVersions(versionsDir, base, nextVersion)
         // 入口指针只随入口文件切换：写 scenarios.json 等辅助文件不得把"当前入口"
         // 指偏（listfiles 观察与回滚语义都以入口为准）。
         if (relativePath == GameFileWorkspaceEntryPoint.DEFAULT) {
@@ -148,15 +173,16 @@ class GameFileWorkspace(private val rootDir: File) {
     /**
      * 归档修剪：每个文件只保留最近 [KEEP_VERSIONS] 个历史版本（即 [v-KEEP, v-1]，
      * 当前文件本身不计入归档）。长修复轮上百次写入 × 每次归档旧全文（几十至几百
-     * KB），不修剪会让 .versions 无限膨胀。
+     * KB），不修剪会让 .versions 无限膨胀。按归档名基（编码后的相对路径）逐文件
+     * 独立修剪，多文件互不误删。
      */
-    private fun pruneVersions(versionsDir: File, fileName: String, currentVersion: Int) {
+    private fun pruneVersions(versionsDir: File, archiveBase: String, currentVersion: Int) {
         if (currentVersion <= KEEP_VERSIONS) return
         val minKeep = currentVersion - KEEP_VERSIONS
         versionsDir.listFiles()?.forEach { archived ->
             val prefix = archived.name.substringBefore('-', "")
             val v = prefix.toIntOrNull() ?: return@forEach
-            if (v < minKeep && archived.name.endsWith("-$fileName")) archived.delete()
+            if (v < minKeep && archived.name.endsWith("-$archiveBase")) archived.delete()
         }
     }
 
@@ -167,8 +193,7 @@ class GameFileWorkspace(private val rootDir: File) {
     }
 
     private fun versionOf(path: String): Int {
-        val f = File(rootDir, path)
-        val marker = File(f.parentFile, ".versions/${f.name}.version")
+        val marker = File(File(rootDir, VERSIONS_DIR), "${archiveBase(path)}.version")
         if (marker.isFile) return marker.readText().trim().toIntOrNull() ?: 0
         return 0
     }
@@ -178,6 +203,9 @@ class GameFileWorkspace(private val rootDir: File) {
 
     companion object {
         const val POINTER_FILE = "current.txt"
+
+        /** 版本归档目录（统一在工作区根，任何文件不再按所在目录分散保存）。 */
+        const val VERSIONS_DIR = ".versions"
 
         /** 每个文件保留的历史版本数（超出部分在写入时修剪）。 */
         const val KEEP_VERSIONS = 20

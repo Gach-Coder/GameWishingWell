@@ -134,4 +134,77 @@ class GameFileWorkspaceTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun `子目录文件的版本归档统一在根 versions 下`() {
+        runBlocking {
+            val dir = File(System.getProperty("java.io.tmpdir"), "ws-unified-${System.nanoTime()}")
+            val ws = GameFileWorkspace(dir)
+            ws.writeInitial("index.html", "<html>v1</html>")
+            ws.writeInitial("js/main.js", "var a = 1;")
+            ws.writeUpdated("js/main.js", "var a = 2;")
+            ws.writeInitial("css/style.css", "body{}")
+
+            // 嵌套路径编码为 js__main.js，归档与 marker 都在根 .versions 下
+            assertTrue(File(dir, ".versions/1-js__main.js").exists())
+            assertTrue(File(dir, ".versions/js__main.js.version").exists())
+            // 不在文件所在目录另建 .versions（不得分开保存）
+            assertFalse(File(dir, "js/.versions").exists())
+            assertFalse(File(dir, "css/.versions").exists())
+            // 只写一次的文件有版本 marker 但无历史归档（归档只存被覆盖的旧内容）
+            assertTrue(File(dir, ".versions/css__style.css.version").exists())
+            assertFalse(File(dir, ".versions/1-css__style.css").exists())
+            // 根级文件名不受影响（向后兼容）
+            assertTrue(File(dir, ".versions/index.html.version").exists())
+
+            // delete 同步清理统一归档（嵌套路径）
+            assertTrue(ws.delete("js/main.js"))
+            assertFalse(File(dir, ".versions/1-js__main.js").exists())
+            assertFalse(File(dir, ".versions/js__main.js.version").exists())
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `多文件归档各自独立修剪互不误删`() {
+        runBlocking {
+            val dir = File(System.getProperty("java.io.tmpdir"), "ws-prune2-${System.nanoTime()}")
+            val ws = GameFileWorkspace(dir)
+            val total = GameFileWorkspace.KEEP_VERSIONS + 4
+            ws.writeInitial("index.html", "h1")
+            ws.writeInitial("js/main.js", "j1")
+            for (v in 2..total) {
+                ws.writeUpdated("index.html", "h$v")
+                ws.writeUpdated("js/main.js", "j$v")
+            }
+            val archives = File(dir, ".versions").listFiles().orEmpty()
+                .mapNotNull { it.name.takeIf { n -> n.endsWith(".html") || n.endsWith(".js") } }
+            val htmlArchives = archives.filter { it.endsWith("-index.html") }
+            val jsArchives = archives.filter { it.endsWith("-js__main.js") }
+            // 两个文件各保留最近 KEEP_VERSIONS 个，互不吞噬
+            assertEquals(GameFileWorkspace.KEEP_VERSIONS, htmlArchives.size)
+            assertEquals(GameFileWorkspace.KEEP_VERSIONS, jsArchives.size)
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `init 清理历史散落的嵌套 versions 目录`() {
+        runBlocking {
+            val dir = File(System.getProperty("java.io.tmpdir"), "ws-legacy-${System.nanoTime()}")
+            // 模拟旧实现留下的散落归档（js/.versions、css/.versions）
+            File(dir, "js/.versions").mkdirs()
+            File(dir, "js/.versions/5-main.js").writeText("legacy")
+            File(dir, "js/main.js").writeText("current")
+            File(dir, "css/.versions").mkdirs()
+            File(dir, "css/.versions/1-style.css").writeText("legacy")
+
+            val ws = GameFileWorkspace(dir)
+            assertFalse(File(dir, "js/.versions").exists())
+            assertFalse(File(dir, "css/.versions").exists())
+            // 游戏文件本体不受清理影响
+            assertEquals("current", ws.read("js/main.js"))
+            dir.deleteRecursively()
+        }
+    }
 }

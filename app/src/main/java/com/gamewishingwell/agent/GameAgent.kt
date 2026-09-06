@@ -957,51 +957,46 @@ class GameAgent(
     }
 
     /**
-     * 保存区文件整体覆盖编辑区工作区：保存区不存在的编辑区文件（未保存修改新增的
-     * scenarios.json 等）一并清除，保证编辑区与保存区完全一致。
+     * 保存区文件整体覆盖编辑区工作区（"撤销"＝保存版→编辑版的相互覆盖，与"保存"
+     * 互为逆操作）：以 [GameRepository.savedGameFilePaths] 的递归清单为准（多文件
+     * 形态含 js/css 子目录）——保存区不存在的编辑区文件（未保存修改新增的
+     * scenarios.json 等）一并清除；所有文件经工作区版本化写入（归档统一根 .versions，
+     * 版本簿记不因覆盖路径旁路而失真）。旧实现只取根级文件名，撤回会误删全部
+     * 子目录文件且不恢复（单文件时代遗留）。
      */
     private suspend fun restoreWorkspaceFromSaved(gameId: Long) {
         val root = editingWorkspaceDir(gameId)
         val workspace = GameFileWorkspace(root)
-        val savedNames = repository.listGameFiles(gameId)
-            .filter { !it.isDirectory }
-            .map { it.name }
-            // 排除簿记与会话文件：current.txt/.sha256 是保存区平台的版本化簿记，
-            // session/agent_state 是实时上下文（不是游戏文件）。
-            .filter {
-                it != "session.json" && it != "agent_state.json" &&
-                    it != GameFileWorkspace.POINTER_FILE && !it.endsWith(".sha256")
-            }
-            .toSet()
+        val savedPaths = repository.savedGameFilePaths(gameId).toSet()
         root.walkTopDown()
             .filter { it.isFile }
             .map { it.relativeTo(root).invariantSeparatorsPath }
-            .filter { rel -> rel != GameFileWorkspace.POINTER_FILE && !rel.startsWith(".versions/") }
-            .forEach { rel -> if (rel !in savedNames) workspace.delete(rel) }
-        savedNames.forEach { name ->
-            val content = repository.loadGameFile(gameId, name) ?: return@forEach
-            if (name == GameFileWorkspaceEntryPoint.DEFAULT) {
-                val current = workspace.read(name)
-                when {
-                    current == null -> workspace.writeInitial(name, content)
-                    current != content -> workspace.writeUpdated(name, content)
-                }
-            } else {
-                val f = File(root, name)
-                f.parentFile?.mkdirs()
-                f.writeText(content, Charsets.UTF_8)
+            .filter { rel ->
+                rel != GameFileWorkspace.POINTER_FILE &&
+                    !rel.startsWith(".versions/") && !rel.contains("/.versions/")
+            }
+            .forEach { rel -> if (rel !in savedPaths) workspace.delete(rel) }
+        savedPaths.forEach { rel ->
+            val content = repository.loadGameFile(gameId, rel) ?: return@forEach
+            val current = workspace.read(rel)
+            when {
+                current == null -> workspace.writeInitial(rel, content)
+                current != content -> workspace.writeUpdated(rel, content)
             }
         }
     }
 
-    /** 编辑区（工作区）的全部游戏文件；排除平台簿记（.versions 归档与 current.txt 指针）。 */
+    /** 编辑区（工作区）的全部游戏文件；排除平台簿记（任何层级的 .versions 归档与 current.txt 指针）。 */
     private fun currentWorkspaceFiles(): Map<String, String> {
         val root = gameWorkspaceDir()
         val workspace = GameFileWorkspace(root)
         return root.walkTopDown()
             .filter { it.isFile }
             .map { it.relativeTo(root).invariantSeparatorsPath }
-            .filter { rel -> rel != GameFileWorkspace.POINTER_FILE && !rel.startsWith(".versions/") }
+            .filter { rel ->
+                rel != GameFileWorkspace.POINTER_FILE &&
+                    !rel.startsWith(".versions/") && !rel.contains("/.versions/")
+            }
             .associateWith { rel -> workspace.read(rel) ?: "" }
     }
 

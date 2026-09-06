@@ -3,6 +3,7 @@ package com.gamewishingwell.data
 import android.content.Context
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -254,6 +255,62 @@ class GameRepositoryTest {
             File(gameDir, "empty.txt").writeText("")
             val empty = repo.readGameFile(meta.id, "empty.txt")!!
             assertEquals("", empty.text)
+        }
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun `保存区拒收 versions 路径并清理存量嵌套归档`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-vers-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            // 模拟历史泄漏：files 混入子目录归档路径（旧 currentWorkspaceFiles 过滤缺陷）
+            val meta = repo.saveGame(
+                "塔防", "描述",
+                mapOf(
+                    "index.html" to "<html>v1</html>",
+                    "js/main.js" to "var a=1;",
+                    "js/.versions/1-main.js" to "legacy-archive",
+                    ".versions/9-index.html" to "root-leak",
+                    "current.txt" to "index.html"
+                ),
+                listOf(ChatMessage("user", "做一个游戏"))
+            )
+            val gameDir = File(dir, "games/${meta.id}")
+            // 游戏文件正常落盘，簿记路径一律拒收（current.txt 由平台簿记自管，不受传入值污染）
+            assertTrue(File(gameDir, "js/main.js").exists())
+            assertFalse(File(gameDir, "js/.versions").exists())
+            assertFalse(File(gameDir, ".versions/9-index.html").exists())
+            assertEquals("index.html", File(gameDir, "current.txt").readText().trim())
+
+            // 存量泄漏修复：预先手工放置嵌套归档，再次保存时被清理
+            File(gameDir, "js/.versions").mkdirs()
+            File(gameDir, "js/.versions/2-main.js").writeText("stale")
+            repo.overwriteGameFiles(
+                meta.id,
+                mapOf("index.html" to "<html>v2</html>", "js/main.js" to "var a=2;"),
+                listOf(ChatMessage("user", "做一个游戏"))
+            )
+            assertFalse(File(gameDir, "js/.versions").exists())
+            assertEquals("var a=2;", File(gameDir, "js/main.js").readText())
+        }
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun `保存区递归文件清单排除簿记与会话文件`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-paths-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            val meta = repo.saveGame(
+                "塔防", "描述",
+                mapOf("index.html" to "<html>v1</html>", "js/main.js" to "var a=1;", "css/style.css" to "body{}"),
+                listOf(ChatMessage("user", "做一个游戏"))
+            )
+            val paths = repo.savedGameFilePaths(meta.id)
+            assertEquals(listOf("css/style.css", "index.html", "js/main.js"), paths)
+            // 不存在的游戏返回空
+            assertTrue(repo.savedGameFilePaths(99999L).isEmpty())
         }
         dir.deleteRecursively()
     }

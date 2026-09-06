@@ -122,14 +122,34 @@ class GameRepository(private val context: Context) {
         }
     }
 
-    /** 游戏文件落盘：入口文件版本化，其余平写；子目录自动创建。 */
+    /**
+     * 游戏文件落盘：入口文件版本化（根 .versions），其余平写；子目录自动创建。
+     * 保存区是"保存版本"本体，只接受游戏文件——任何 .versions 路径段一律拒收
+     * （历史缺陷：编辑区子目录下的归档曾穿过过滤器混进保存区，文件夹浏览器
+     * 可见且体积随保存膨胀）；落盘后清理已存在的嵌套 .versions
+     * （修复存量泄漏，归档只写不读、删除即收敛）。
+     */
     private fun writeGameFilesLocked(dir: File, files: Map<String, String>) {
         files[ENTRY_HTML]?.let { versionedWrite(File(dir, ENTRY_HTML), it) }
         files.forEach { (name, content) ->
             if (name == ENTRY_HTML) return@forEach
+            if (name == POINTER_FILE || name.contains("/$VERSIONS_DIR/") || name.startsWith("$VERSIONS_DIR/")) {
+                return@forEach
+            }
             val f = File(dir, name)
             f.parentFile?.mkdirs()
             f.writeText(content, Charsets.UTF_8)
+        }
+        cleanupNestedVersionsLocked(dir)
+    }
+
+    /** 删除嵌套的 .versions 目录（归档统一在根；存量泄漏修复）。 */
+    private fun cleanupNestedVersionsLocked(dir: File) {
+        runCatching {
+            val root = dir.canonicalFile
+            dir.walkTopDown()
+                .filter { it.isDirectory && it.name == VERSIONS_DIR && it.parentFile?.canonicalFile != root }
+                .forEach { it.deleteRecursively() }
         }
     }
 
@@ -315,6 +335,27 @@ class GameRepository(private val context: Context) {
                 binary = binary
             )
         }
+
+    /**
+     * 保存区（games/<id>）的全部游戏文件相对路径（递归，多文件形态含 js/css 子目录）。
+     * 排除平台簿记与会话文件：.versions 归档（任何层级）、current.txt 指针、*.sha256、
+     * session.json/agent_state.json、.savepoint 保存点。撤销（保存版→编辑版覆盖）以此为准。
+     */
+    suspend fun savedGameFilePaths(gameId: Long): List<String> = withContext(Dispatchers.IO) {
+        val dir = File(gamesDir, gameId.toString())
+        if (!dir.isDirectory) return@withContext emptyList()
+        dir.walkTopDown()
+            .filter { it.isFile }
+            .map { it.relativeTo(dir).invariantSeparatorsPath }
+            .filter { rel ->
+                rel != POINTER_FILE && !rel.endsWith(".sha256") &&
+                    rel != "session.json" && rel != "agent_state.json" &&
+                    !rel.startsWith("$VERSIONS_DIR/") && !rel.contains("/$VERSIONS_DIR/") &&
+                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.contains("/$SAVEPOINT_DIR/")
+            }
+            .sorted()
+            .toList()
+    }
 
     /** 把游戏目录内相对路径解析为 File：规范化后必须仍位于 games/<id> 之下，防 ../ 逃逸。 */
     private fun resolveInGameDir(gameId: Long, relativePath: String): File? {
