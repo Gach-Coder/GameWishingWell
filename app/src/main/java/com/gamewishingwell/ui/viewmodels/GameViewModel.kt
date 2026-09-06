@@ -2,23 +2,39 @@ package com.gamewishingwell.ui.viewmodels
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.gamewishingwell.agent.AgentHub
 import com.gamewishingwell.agent.GameAgent
 import com.gamewishingwell.agent.GameBundle
 import com.gamewishingwell.agent.GameSchema
 import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.data.GameRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class GameViewModel(
     private val repository: GameRepository,
-    private val agent: GameAgent
+    private val hub: AgentHub
 ) : ViewModel() {
+
+    /** 本页绑定的会话实例（预览=对应游戏/草稿的编辑会话；运行区按 loadedGameId
+     *  在报障修复时解析）。多会话并发：不再读写全局单会话。 */
+    private var boundAgent: GameAgent? = null
+
+    private val _agentSessionFlow = MutableStateFlow<StateFlow<GameSession>?>(null)
+    val agentSession: StateFlow<GameSession?> = _agentSessionFlow
+        .flatMapLatest { it ?: flowOf(null) }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     private val _html = MutableStateFlow<String?>(null)
     val html: StateFlow<String?> = _html.asStateFlow()
@@ -42,6 +58,12 @@ class GameViewModel(
     fun load(source: String, gameId: Long) {
         viewModelScope.launch {
             playSource = source
+            // 预览绑定对应会话实例（草稿预览=草稿会话；游戏预览=该游戏的编辑会话，
+            // 冷启动时 hub 装载其持久化会话）；生成状态与保存栏位均来自该会话。
+            val agent = hub.agentFor(gameId.takeIf { source == "preview" && it > 0 })
+            boundAgent = agent
+            _agentSessionFlow.value = agent.session
+            agent.awaitReady()
             val (html, id, landscape) = withContext(Dispatchers.IO) {
                 when {
                     // 预览：直接播放当前编辑会话（编辑区）的最新版本。编辑区与运行区
@@ -107,11 +129,18 @@ class GameViewModel(
      *  错误提示保留不消失——此前静默早退会让用户误以为修复已提交）。 */
     fun fixErrorAndGo(): Boolean {
         val err = _jsError.value ?: return false
+        // 报障修复绑定到报错游戏的专属会话（hub 按需装载），不再切换全局会话——
+        // 其他会话正在运行的 Agent Loop 不受影响。按加载源解析：预览=已绑定的
+        // 编辑会话；运行区=报错游戏（loadedGameId）的会话；草稿播放=草稿会话。
+        val agent = when {
+            playSource == "preview" && boundAgent != null -> boundAgent!!
+            playSource == "game" && _loadedGameId.value != null -> hub.agentFor(_loadedGameId.value)
+            else -> hub.agentFor(null)
+        }
         if (agent.session.value.isGenerating) return false
         _jsError.value = null
         viewModelScope.launch {
-            val id = _loadedGameId.value
-            if (playSource == "game" && id != null) agent.loadGameSession(id)
+            agent.awaitReady()
             agent.fixWithError(err)
         }
         return true
@@ -119,6 +148,8 @@ class GameViewModel(
 
     fun saveDraft(title: String, onDone: (Boolean) -> Unit) {
         viewModelScope.launch {
+            val agent = boundAgent ?: hub.agentFor(null)
+            agent.awaitReady()
             val meta = agent.saveCurrentGame(title)
             onDone(meta != null)
         }

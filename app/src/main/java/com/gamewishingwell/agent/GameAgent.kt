@@ -15,6 +15,8 @@ import com.gamewishingwell.llm.Protocol
 import com.gamewishingwell.llm.ProviderPresets
 import com.gamewishingwell.llm.ToolSpec
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -308,8 +310,35 @@ class GameAgent(
     /** 测试注入点；为 null 时按 [LlmSettings] 创建真实厂商客户端。 */
     private val injectedClientFactory: ((LlmSettings) -> LlmClient?)? = null,
     /** 冒烟测试器注入点（测试/诊断用）；为 null 时按 [AndroidSmokeTestRunner] 创建真实实现。 */
-    private val injectedSmokeRunner: SmokeTestRunner? = null
+    private val injectedSmokeRunner: SmokeTestRunner? = null,
+    /**
+     * 会话身份（多会话并发架构）：null = 草稿会话（全局唯一，经 AgentHub 管理）；
+     * 非 null = 绑定该游戏的编辑会话——构造后即在自身协程内装载持久化会话
+     * （编辑区优先），且身份切换类入口（loadGameSession 到他 id / newSession /
+     * loadDraftSession）一律拒绝。实例即会话，互不顶替。
+     */
+    private val pinnedGameId: Long? = null
 ) {
+
+    /**
+     * 会话装载完成信号：pinned 游戏会话的持久化装载是异步的（构造协程内执行），
+     * 用户回合入口应先 [awaitReady]——冷启动立即发送会与装载竞态（会话被当作
+     * 空白新游戏处理）。草稿实例构造即就绪。
+     */
+    private val ready = CompletableDeferred<Unit>()
+
+    /** 等待会话装载完成（pinned 游戏会话的持久化装载；草稿立即返回）。 */
+    suspend fun awaitReady() = ready.await()
+
+    /** 会话是否已有内容（消息/确认门/已生成游戏）——创作页据此判断可否复用现有草稿会话。 */
+    fun hasConversation(): Boolean {
+        val s = _session.value
+        return s.messages.isNotEmpty() || s.gameGenerated || s.pendingConfirmation != null
+    }
+
+    /** 草稿入库后身份升级回调（AgentHub 重挂键位用）；仅 saveCurrentGame 草稿分支触发。 */
+    @Volatile
+    var onAdoptedGameId: ((Long) -> Unit)? = null
 
     private val _session = MutableStateFlow(GameSession())
     val session: StateFlow<GameSession> = _session.asStateFlow()
@@ -364,6 +393,27 @@ class GameAgent(
         ignoreUnknownKeys = true
         encodeDefaults = true
         explicitNulls = false
+    }
+
+    // 必须置于全部状态声明之后（Kotlin 按声明顺序初始化）：pinned 会话的异步装载
+    // 依赖 _session/editingGameId/agentScope 均已就绪。
+    init {
+        if (pinnedGameId != null) {
+            editingGameId = pinnedGameId
+            agentScope.launch {
+                runCatching { loadGameSession(pinnedGameId) }
+                    .onFailure { alog("pinned session load failed: ${it.message}") }
+                ready.complete(Unit)
+            }
+        } else {
+            ready.complete(Unit)
+        }
+    }
+
+    /** 会话实例退役（游戏删除/草稿重置）：停生成任务并释放协程（AgentHub 调用）。 */
+    fun shutdown() {
+        stopGeneration()
+        agentScope.cancel()
     }
 
     private companion object {
@@ -528,6 +578,7 @@ class GameAgent(
     }
 
     suspend fun loadDraftSession() {
+        if (pinnedGameId != null) { alog("ignore loadDraftSession: pinned to game-$pinnedGameId"); return }
         val before = _session.value
         if (before.isGenerating) return
         withContext(Dispatchers.IO) {
@@ -548,6 +599,12 @@ class GameAgent(
     }
 
     suspend fun loadGameSession(gameId: Long) {
+        // 多会话并发架构：实例身份固定——装载他游戏会话=顶掉本会话，一律拒绝
+        //（构造时的 pinned 装载 gameId==pinnedGameId，不受影响）。
+        if (pinnedGameId != null && gameId != pinnedGameId) {
+            alog("ignore loadGameSession($gameId): pinned to game-$pinnedGameId")
+            return
+        }
         val before = _session.value
         if (before.isGenerating) return
         withContext(Dispatchers.IO) {
@@ -577,6 +634,7 @@ class GameAgent(
      * 跨会话的错误签名库会保留，只用于错误历史记录；Agent Loop 不设重试上限。
      */
     suspend fun newSession(clearDraft: Boolean = true) {
+        if (pinnedGameId != null) { alog("ignore newSession: pinned to game-$pinnedGameId"); return }
         val before = _session.value
         if (before.isGenerating) return
         if (clearDraft) repository.clearDraft()
@@ -849,7 +907,12 @@ class GameAgent(
      * 其余工作区文件（scenarios.json 等回归断言）随保存一并入库。
      * 同时把当前会话上下文冻结为保存点（.savepoint），供"撤销"恢复。
      */
-    suspend fun saveCurrentGame(title: String): GameMeta? {
+    /**
+     * 保存当前编辑区版本到运行区。
+     * [title] 为空且当前是已入库游戏的编辑会话时保持原名直接覆盖（"已有旧版本
+     * 直接保存不必重命名"）；草稿入库仍需名字，留空回退会话派生默认标题。
+     */
+    suspend fun saveCurrentGame(title: String?): GameMeta? {
         val s = _session.value
         // 生成中拒绝保存：此刻的 currentHtml 是未验收的中间版本，会话上下文也在
         // 流转中——存进运行区等于把半成品固化为"已保存版本"（撤销锚点同样失真）。
@@ -857,11 +920,18 @@ class GameAgent(
         if (s.isGenerating) return null
         val html = s.currentHtml ?: return null
         val editingId = editingGameId
-        val cleanTitle = title.trim().ifBlank { defaultTitle(s) }
+        val cleanTitle: String? = when {
+            // 已有游戏的旧版本（已命名）：标题留空 = 保持原名（null 传入
+            // overwriteGameFiles 即不改名），保存不再弹重命名对话框。
+            editingId != null && title.isNullOrBlank() -> null
+            else -> (title ?: "").trim().ifBlank { defaultTitle(s) }
+        }
         // 先取编辑区文件（必须在切换 editingGameId 之前：草稿入库后工作区路径随 id 变化）
         val files = withContext(Dispatchers.IO) { currentWorkspaceFiles() } +
             (GameFileWorkspaceEntryPoint.DEFAULT to html)
-        val savedState = s.copy(designPlan = s.designPlan?.copy(title = cleanTitle))
+        val savedState = s.copy(designPlan = s.designPlan?.let { plan ->
+            plan.copy(title = cleanTitle ?: plan.title)
+        })
         if (editingId != null) {
             repository.overwriteGameFiles(editingId, files, s.messages, cleanTitle)
             persistAgentState(editingId, savedState)
@@ -871,8 +941,11 @@ class GameAgent(
         val description = s.messages.firstOrNull {
             it.isUser && !it.content.contains("推荐的游戏框架")
         }?.content?.trim()?.replace(Regex("\\s+"), " ")?.take(60) ?: ""
-        val meta = repository.saveGame(cleanTitle, description, files, s.messages)
+        // 草稿分支 cleanTitle 必非空（空标题已回退 defaultTitle），?: 仅满足类型
+        val meta = repository.saveGame(cleanTitle ?: defaultTitle(s), description, files, s.messages)
         editingGameId = meta.id
+        // 身份升级通知（AgentHub 重挂键位）：同一实例以 game-<id> 续作，草稿键位让位。
+        onAdoptedGameId?.invoke(meta.id)
         repository.clearDraft()
         persistAgentState(meta.id, savedState)
         repository.writeSavepoint(meta.id, s.messages, sessionJson.encodeToString(savedState))

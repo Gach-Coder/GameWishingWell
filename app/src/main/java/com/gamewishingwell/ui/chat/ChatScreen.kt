@@ -81,7 +81,7 @@ fun ChatScreen(
     val mode = gameId?.let { "game-$it" } ?: if (resumeDraft) "draft" else "new"
     val vm: ChatViewModel = viewModel(
         key = "chat-$mode",
-        factory = viewModelFactory { initializer { ChatViewModel(container.gameAgent, gameId, resumeDraft) } }
+        factory = viewModelFactory { initializer { ChatViewModel(container.agentHub, gameId, resumeDraft) } }
     )
     val session by vm.session.collectAsState()
     val context = LocalContext.current

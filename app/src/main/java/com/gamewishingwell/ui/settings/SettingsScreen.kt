@@ -58,7 +58,7 @@ import com.gamewishingwell.ui.viewmodels.SettingsViewModel
 fun SettingsScreen() {
     val container = rememberContainer()
     val vm: SettingsViewModel = viewModel(
-        factory = viewModelFactory { initializer { SettingsViewModel(container.settingsRepository, container.gameAgent) } }
+        factory = viewModelFactory { initializer { SettingsViewModel(container.settingsRepository, container.agentHub) } }
     )
     val settings by vm.settings.collectAsState()
     val testing by vm.testing.collectAsState()

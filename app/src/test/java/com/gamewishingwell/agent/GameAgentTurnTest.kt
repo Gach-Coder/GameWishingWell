@@ -16,7 +16,9 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.mockito.ArgumentMatchers.anyString
@@ -77,7 +79,8 @@ function restart(){}
         client: LlmClient?,
         smoke: SmokeTestRunner = StubSmokeRunner(
             SmokeTestResult(passed = true, framesRun = 24, message = "smoke-ok")
-        )
+        ),
+        pinnedGameId: Long? = null
     ): GameAgent {
         val context = mock(Context::class.java)
         `when`(context.filesDir).thenReturn(dir)
@@ -95,7 +98,8 @@ function restart(){}
             repository = GameRepository(context),
             settingsRepository = settings,
             injectedClientFactory = { client },
-            injectedSmokeRunner = smoke
+            injectedSmokeRunner = smoke,
+            pinnedGameId = pinnedGameId
         )
     }
 
@@ -218,6 +222,111 @@ function restart(){}
         )
         // 1 次识别 + 4 轮循环即收束（旧机制下同类空转实测 6+ 轮）
         assertEquals(5, script.calls.size)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `已入库游戏空标题保存保持原名而草稿空标题回退默认名`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-savekeep-${System.nanoTime()}")
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-write", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+
+        // 首次保存（草稿入库）：显式命名
+        val m1 = agent.saveCurrentGame("星域塔防")
+        assertEquals("星域塔防", m1?.title)
+
+        // 已有游戏的旧版本（已命名）：空标题直接保存 = 保持原名，不弹重命名
+        val m2 = agent.saveCurrentGame("")
+        assertEquals(m1?.id, m2?.id)
+        assertEquals("星域塔防", m2?.title)
+        dir.deleteRecursively()
+
+        // 草稿空标题仍回退会话派生默认名（首条用户消息前 20 字）
+        val dir2 = File(System.getProperty("java.io.tmpdir"), "agent-turn-savedft-${System.nanoTime()}")
+        val script2 = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c2-write", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                LlmResponse("完成")
+            )
+        )
+        val agent2 = newAgent(dir2, client = script2)
+        agent2.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        val m3 = agent2.saveCurrentGame("")
+        // 草稿空标题回退会话派生默认名（designPlan.title，缺失时取首条用户消息前 20 字）
+        assertTrue("草稿空标题应回退非空默认名", !m3?.title.isNullOrBlank())
+        dir2.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `会话身份固定拒绝跨会话切换与重置`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-pinned-${System.nanoTime()}")
+        val script = ScriptedLlmClient(emptyList())
+        val agent = newAgent(dir, client = script, pinnedGameId = 7)
+        agent.awaitReady()
+        // pinned 会话拒绝一切身份切换入口（多会话并发的前提：实例即会话，互不顶替）
+        agent.loadGameSession(9)
+        agent.loadDraftSession()
+        agent.newSession()
+        val log = File(dir, "logs/agent.log").readText()
+        assertTrue("拒绝装载他游戏会话", log.contains("ignore loadGameSession(9): pinned to game-7"))
+        assertTrue("拒绝退回草稿装载", log.contains("ignore loadDraftSession: pinned to game-7"))
+        assertTrue("拒绝清空重置", log.contains("ignore newSession: pinned to game-7"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `草稿入库后AgentHub重挂键位且原实例续作`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-hub-${System.nanoTime()}")
+        val context = mock(android.content.Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        val assets = mock(android.content.res.AssetManager::class.java)
+        `when`(assets.open(anyString())).thenReturn(ByteArrayInputStream("<html>template</html>".toByteArray()))
+        `when`(context.assets).thenReturn(assets)
+        val settings = mock(com.gamewishingwell.data.SettingsRepository::class.java)
+        `when`(settings.settings).thenReturn(
+            MutableStateFlow(com.gamewishingwell.data.LlmSettings(apiKey = "k", baseUrl = "http://localhost/v1", model = "m"))
+        )
+        `when`(settings.isConfigured()).thenReturn(true)
+        AgentLog.initDir(File(dir, "logs"))
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-write", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                LlmResponse("完成")
+            )
+        )
+        val hub = AgentHub(context, GameRepository(context), settings, injectedClientFactory = { script })
+        val draftAgent = hub.agentFor(null)
+        draftAgent.awaitReady()
+        draftAgent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+
+        val meta = draftAgent.saveCurrentGame("会话一") ?: throw AssertionError("保存失败")
+        // 同一实例以 game-<id> 续作（编辑上下文不中断）；草稿键位让位给新会话
+        assertSame(draftAgent, hub.agentFor(meta.id))
+        assertNotSame(draftAgent, hub.agentFor(null))
         dir.deleteRecursively()
         Unit
     }

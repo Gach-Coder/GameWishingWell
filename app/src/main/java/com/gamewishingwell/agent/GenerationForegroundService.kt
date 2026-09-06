@@ -64,13 +64,13 @@ class GenerationForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            runCatching { container().gameAgent.stopGeneration() }
-            // stopGeneration 已同步翻转 isGenerating=false，最终复查会放行收尾
+            runCatching { container().agentHub.stopAll() }
+            // stopAll 已同步翻转全部会话的 isGenerating=false，最终复查会放行收尾
             stopForegroundAndSelf()
             return START_NOT_STICKY
         }
-        startInForeground(container().gameAgent.session.value.agentStage)
-        observeSession()
+        startInForeground(container().agentHub.generating.value.displayStage())
+        observeGenerating()
         return START_NOT_STICKY
     }
 
@@ -91,7 +91,7 @@ class GenerationForegroundService : Service() {
         acquireWakeLock()
     }
 
-    private fun observeSession() {
+    private fun observeGenerating() {
         // 实例复用（上一回合 stopSelf 尚未销毁时新回合的 start 先到达）会让本方法在
         // 同一实例上再次进入：旧观察协程已随上回合收尾取消，必须重新启动观察——
         // 曾用一次性 observing 标志判重，导致复用实例永远不再观察会话（通知冻结、
@@ -105,29 +105,29 @@ class GenerationForegroundService : Service() {
             launch {
                 while (true) {
                     delay(WAKELOCK_RENEW_INTERVAL_MS)
-                    if (wakeLock?.isHeld != true && container().gameAgent.session.value.isGenerating) {
+                    if (wakeLock?.isHeld != true && container().agentHub.generating.value.count > 0) {
                         acquireWakeLock()
                     }
                 }
             }
             var lastStage: String? = null
             var lastUpdateAt = 0L
-            container().gameAgent.session.collect { s ->
-                if (!s.isGenerating) {
-                    // 用最新状态复核后再收尾：回合间隙的 false 快照可能已被新一轮
-                    // 生成（true）覆盖——若按旧快照停服务，新一轮会在后台失去前台
+            container().agentHub.generating.collect { g ->
+                if (g.count <= 0) {
+                    // 用最新状态复核后再收尾：回合间隙的清零快照可能已被新一轮
+                    // 生成覆盖——若按旧快照停服务，新一轮会在后台失去前台
                     // 服务与 wakelock/WifiLock，表现为后台网络异常。
-                    if (container().gameAgent.session.value.isGenerating) return@collect
+                    if (container().agentHub.generating.value.count > 0) return@collect
                     stopForegroundAndSelf()
                     cancel()
                     return@collect
                 }
                 val now = SystemClock.elapsedRealtime()
-                if (s.agentStage != lastStage && now - lastUpdateAt >= MIN_STAGE_INTERVAL_MS) {
-                    lastStage = s.agentStage
+                if (g.displayStage() != lastStage && now - lastUpdateAt >= MIN_STAGE_INTERVAL_MS) {
+                    lastStage = g.displayStage()
                     lastUpdateAt = now
                     runCatching {
-                        notificationManager().notify(NOTIFICATION_ID, buildNotification(s.agentStage))
+                        notificationManager().notify(NOTIFICATION_ID, buildNotification(g.displayStage()))
                     }
                 }
                 // wakelock 续约：事件路径（每次 stage 更新顺手检查）。
@@ -189,7 +189,7 @@ class GenerationForegroundService : Service() {
      */
     private fun stopForegroundAndSelf(force: Boolean = false) {
         if (!force) {
-            val generating = runCatching { container().gameAgent.session.value.isGenerating }.getOrDefault(false)
+            val generating = runCatching { container().agentHub.generating.value.count > 0 }.getOrDefault(false)
             if (generating) return
         }
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }

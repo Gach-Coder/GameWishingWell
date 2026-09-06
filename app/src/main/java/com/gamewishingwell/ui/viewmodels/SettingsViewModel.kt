@@ -2,7 +2,7 @@ package com.gamewishingwell.ui.viewmodels
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.gamewishingwell.agent.GameAgent
+import com.gamewishingwell.agent.AgentHub
 import com.gamewishingwell.data.LlmSettings
 import com.gamewishingwell.data.SettingsRepository
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -12,7 +12,7 @@ import kotlinx.coroutines.launch
 
 class SettingsViewModel(
     private val repository: SettingsRepository,
-    private val agent: GameAgent
+    private val hub: AgentHub
 ) : ViewModel() {
 
     val settings: StateFlow<LlmSettings> = repository.settings
@@ -46,7 +46,7 @@ class SettingsViewModel(
             _testResult.value = null
             repository.save(s)
             _testResult.value = try {
-                agent.testConnection()
+                hub.agentFor(null).testConnection()
                 TEST_OK_MESSAGE
             } catch (e: Exception) {
                 "连接失败：" + (e.message?.take(160) ?: "未知错误")

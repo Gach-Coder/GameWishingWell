@@ -76,7 +76,7 @@ fun HomeScreen(
 ) {
     val container = rememberContainer()
     val vm: HomeViewModel = viewModel(
-        factory = viewModelFactory { initializer { HomeViewModel(container.gameRepository, container.gameAgent) } }
+        factory = viewModelFactory { initializer { HomeViewModel(container.gameRepository, container.agentHub) } }
     )
     val games by vm.games.collectAsState()
     val hasDraft by vm.hasDraft.collectAsState()

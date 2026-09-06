@@ -56,6 +56,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.agent.HtmlEnhancer
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.GameViewModel
@@ -78,7 +79,7 @@ fun GameScreen(
 ) {
     val container = rememberContainer()
     val vm: GameViewModel = viewModel(
-        factory = viewModelFactory { initializer { GameViewModel(container.gameRepository, container.gameAgent) } }
+        factory = viewModelFactory { initializer { GameViewModel(container.gameRepository, container.agentHub) } }
     )
     val html by vm.html.collectAsState()
     val jsError by vm.jsError.collectAsState()
@@ -86,7 +87,8 @@ fun GameScreen(
     val context = LocalContext.current
     // 保存护栏的 UI 侧：生成中 currentHtml 是未验收的中间版本，此刻入库会把半成品
     // 固化为"已保存版本"（agent 侧 saveCurrentGame 为最终闸门，此处先禁用入口）。
-    val agentGenerating by container.gameAgent.session.collectAsState()
+    val agentSession by vm.agentSession.collectAsState()
+    val agentGenerating = agentSession ?: GameSession()
 
     var webView by remember { mutableStateOf<WebView?>(null) }
     var loadedHtml by remember { mutableStateOf<String?>(null) }
@@ -295,7 +297,7 @@ fun GameScreen(
                     )
                     Spacer(Modifier.size(4.dp))
                     Text(
-                        "重新游戏会重置本局进度；保存仅对未入库的草稿开放。",
+                        "重新游戏会重置本局进度；未入库草稿保存时命名入库，已入库游戏直接覆盖保存（保持原名）。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -312,7 +314,20 @@ fun GameScreen(
                                     Toast.makeText(context, "正在生成中，请等本轮完成后再保存", Toast.LENGTH_SHORT).show()
                                 } else {
                                     closeSettings()
-                                    showSaveDialog = true
+                                    if (loadedGameId != null) {
+                                        // 已有游戏的旧版本（已命名）：直接覆盖保存不必重命名；
+                                        // 空标题经 saveCurrentGame 语义化为"保持原名"。
+                                        vm.saveDraft("") { ok ->
+                                            Toast.makeText(
+                                                context,
+                                                if (ok) "已保存" else "保存失败",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                            if (ok) onHome()
+                                        }
+                                    } else {
+                                        showSaveDialog = true
+                                    }
                                 }
                             }
                         ) { Text("保存游戏") }
@@ -331,8 +346,8 @@ fun GameScreen(
 
     if (showSaveDialog) {
         val defaultTitle = remember {
-            container.gameAgent.session.value.messages
-                .firstOrNull { it.isUser }?.content?.take(20) ?: ""
+            vm.agentSession.value?.messages
+                ?.firstOrNull { it.isUser }?.content?.take(20) ?: ""
         }
         var title by remember { mutableStateOf(defaultTitle) }
         AlertDialog(

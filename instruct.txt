@@ -27,7 +27,13 @@
 		- 用户点击发送输入的文本后，发送键改为停止键，可随时中断Agent Loop接着追加输入文本；
 		  停止键动态显示本轮已运行时长（「停止 X分Y秒」每秒刷新；发送/确认/修复/再试一次起算，确认门等待不计入）
 	- 用户随时中断生成后，玩家可选择直接尝试游玩(正常现象：可能运行错误)
-	- 切换页面/对话时生成任务在 ViewModel 协程与全局 GameAgent 中继续运行，制作完成后可在 WebView 中立刻游玩。
+	- 多会话并发（对标 Zai/DSH 的独立会话模型，2026-09 落地）：AgentHub 按对话键位（draft / game-<id>）
+	  各持一个 GameAgent 实例——实例即会话，身份经 pinnedGameId 构造固定（loadGameSession 到他 id /
+	  newSession / loadDraftSession 一律拒绝）；进入"继续编辑"不再切换/打断其他会话正在运行的 Agent Loop，
+	  多个游戏可同时编辑与生成。草稿入库后实例身份升级（onAdoptedGameId 回调重挂键位：同一实例以
+	  game-<id> 续作，草稿键位让位）；底部"创作"入口不再清掉进行中的草稿对话（仅空会话才装载/新建）。
+	  生成任务运行在各会话自身的 agentScope：切页不取消；前台服务观察 AgentHub.generating 聚合计数
+	  （多会话并发生成时通知前缀"正在生成 N 个游戏"，停止动作 stopAll 一网打尽），制作完成后可在 WebView 中立刻游玩。
 		- 运行时 JS 报错会弹出覆盖层，可“让 AI 修复”；也可继续对话迭代（如“加连击计分”），修改基于上一个版本的游戏文件进行。
 		- 编辑区/运行区独立：Agent 工具沙箱写”编辑区”（filesDir/agent/workspace/<会话>），已保存游戏目录为”运行区”
 		  （filesDir/games/<id>）——编辑会话期间运行区文件不被写入（只同步会话簿记），
@@ -454,7 +460,8 @@ GameWishingWell/
       │  │  ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
 	      │  │  ├─ agent/
-	      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / 工具模式 Agent Loop（含无工具降级回环与修复快车道）；回合整体运行于全局 agentScope——策划+生成是同一个可取消任务
+	      │  │  │  ├─ AgentHub.kt            # 多会话 Agent 注册表：每对话（draft/game-<id>）一个 GameAgent 实例；草稿入库 rekey、聚合计数（前台服务观察）、release/resetDraft 生命周期
+	      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / 工具模式 Agent Loop（含无工具降级回环与修复快车道）；单会话引擎（pinnedGameId 构造固定身份），回合整体运行于实例 agentScope——策划+生成是同一个可取消任务
 		      │  │  │  ├─ GameTools.kt           # 工具定义(listfiles/readfile/writefile/editfile) + 沙箱执行器（写后自动校验回传；辅助文件按类型轻量校验、不作入口发布）
 	      │  │  │  ├─ GameIntent.kt          # 意图层：dev/chat 二分类（正则优先+Lite LLM 复核）；修复快车道由会话状态推导
       │  │  │  ├─ GameRecognition.kt     # 识别层：会话级 Game Schema JSON、白名单校验、确认门；IntentEngine 纯文本特征正则
@@ -560,7 +567,10 @@ VIEWPORT_PRELUDE（视口修复 + 平台设置桥接）：
   window.__wwSetVolume(v)（0–1）与 window.__wwSetPaused(bool)。
   原生“游戏设置”面板（AlertDialog）内容：音量滑条（实时 __wwSetVolume）、
   “重新游戏”（evaluateJavascript 调全局 restart()，失败转 console.error
-  “[游戏错误] 重新游戏失败: …”）、“保存游戏”（仅草稿模式显示，转原有的标题确认保存流程）、
+  “[游戏错误] 重新游戏失败: …”）、“保存游戏”（草稿/预览显示；草稿走标题命名对话框，
+  已入库游戏的编辑预览跳过对话框直接覆盖保存且保持原名——saveCurrentGame 空标题在
+  editingId 非空时语义化为“不改名”，顺带修复旧流程按会话首条消息前 20 字默认值
+  改名已命名游戏的问题；草稿空标题仍回退会话派生默认名）、
   “继续游戏”（关闭面板）；
 - 暂停机制：包装 window.requestAnimationFrame/cancelAnimationFrame，
   __wwPaused=true 时持续重排下一帧而不回调游戏逻辑；原生设置面板打开即

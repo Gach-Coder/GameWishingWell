@@ -2,7 +2,7 @@ package com.gamewishingwell.ui.viewmodels
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.gamewishingwell.agent.GameAgent
+import com.gamewishingwell.agent.AgentHub
 import com.gamewishingwell.data.GameMeta
 import com.gamewishingwell.data.GameRepository
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -12,7 +12,7 @@ import kotlinx.coroutines.launch
 
 class HomeViewModel(
     private val repository: GameRepository,
-    private val agent: GameAgent
+    private val hub: AgentHub
 ) : ViewModel() {
 
     private val _games = MutableStateFlow<List<GameMeta>>(emptyList())
@@ -33,8 +33,10 @@ class HomeViewModel(
     fun deleteGame(id: Long) {
         viewModelScope.launch {
             repository.deleteGame(id)
-            // 编辑区（工作区）与运行区独立：游戏删除后同步清理其编辑文件夹，避免孤儿残留
-            agent.deleteWorkspace(id)
+            // 会话实例退役（停其生成）+ 编辑区（工作区）与运行区独立：游戏删除后同步
+            // 清理其编辑文件夹，避免孤儿残留（deleteWorkspace 是纯文件操作，经草稿实例执行）。
+            hub.release(id)
+            hub.agentFor(null).deleteWorkspace(id)
             refresh()
         }
     }
@@ -52,7 +54,7 @@ class HomeViewModel(
      */
     fun startNew(onDone: () -> Unit) {
         viewModelScope.launch {
-            agent.newSession()
+            hub.resetDraft()
             onDone()
         }
     }

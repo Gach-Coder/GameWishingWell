@@ -2,6 +2,7 @@ package com.gamewishingwell.ui.viewmodels
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.gamewishingwell.agent.AgentHub
 import com.gamewishingwell.agent.GameAgent
 import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.agent.QualityTier
@@ -9,22 +10,30 @@ import com.gamewishingwell.data.GameMeta
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
+/**
+ * 单个对话页的 ViewModel（多会话并发架构）：经 [AgentHub] 绑定本对话专属的
+ * GameAgent 实例——进入"继续编辑"不再切换/打断其他会话正在运行的 Agent Loop。
+ */
 class ChatViewModel(
-    private val agent: GameAgent,
+    hub: AgentHub,
     val gameId: Long?,
     private val resumeDraft: Boolean = false
 ) : ViewModel() {
 
+    private val agent: GameAgent = hub.agentFor(gameId)
     val session: StateFlow<GameSession> = agent.session
     private var lastInstruction: String? = null
 
     init {
         viewModelScope.launch {
+            agent.awaitReady()
             when {
-                gameId != null -> agent.loadGameSession(gameId)
-                resumeDraft -> agent.loadDraftSession()
-                // 底部"创作"入口：永远从空会话开始，但暂不删除草稿文件
-                else -> agent.newSession(clearDraft = false)
+                // 游戏会话：hub 构造时已装载（编辑区优先），此处无事可做。
+                gameId != null -> {}
+                // 草稿已有内容（含正在运行的生成）则直接续用——底部"创作"入口
+                // 不再清掉进行中的草稿对话；仅真正空会话才装载/新建。
+                resumeDraft -> if (!agent.hasConversation()) agent.loadDraftSession()
+                else -> if (!agent.hasConversation()) agent.newSession(clearDraft = false)
             }
         }
     }
@@ -35,12 +44,12 @@ class ChatViewModel(
         val trimmed = text.trim()
         if (trimmed.isBlank()) return
         lastInstruction = trimmed
-        viewModelScope.launch { agent.sendUserMessage(trimmed, qualityTier, dimension, orientation) }
+        viewModelScope.launch { agent.awaitReady(); agent.sendUserMessage(trimmed, qualityTier, dimension, orientation) }
     }
 
     fun regenerate() {
         lastInstruction?.let { instr ->
-            viewModelScope.launch { agent.regenerate(instr) }
+            viewModelScope.launch { agent.awaitReady(); agent.regenerate(instr) }
         }
     }
 
@@ -52,7 +61,7 @@ class ChatViewModel(
     fun turnElapsedMs(): Long = agent.currentTurnElapsedMs()
 
     fun fixError(error: String) {
-        viewModelScope.launch { agent.fixWithError(error) }
+        viewModelScope.launch { agent.awaitReady(); agent.fixWithError(error) }
     }
 
     /**
@@ -72,7 +81,7 @@ class ChatViewModel(
         orientation: String? = null,
         dimension: String? = null
     ) {
-        viewModelScope.launch { agent.confirmIntent(uncheckedModules, qualityTier, orientation, dimension) }
+        viewModelScope.launch { agent.awaitReady(); agent.confirmIntent(uncheckedModules, qualityTier, orientation, dimension) }
     }
 
     fun saveAs(title: String, onDone: (GameMeta?) -> Unit) {
