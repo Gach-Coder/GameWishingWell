@@ -514,7 +514,7 @@ GameWishingWell/
       │  │     ├─ Container.kt              # 从 Application 获取容器
       │  │     ├─ home/HomeScreen.kt        # 我的游戏页
       │  │     ├─ chat/ChatScreen.kt        # 创作/编辑对话页
-      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复）
+      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复；沉浸式全屏见下）
       │  │     ├─ files/FileBrowserScreen.kt # 文件可视系统：文件夹逐级浏览 + 文件只读查看器（可选中复制、不可编辑）
       │  │     ├─ settings/SettingsScreen.kt # 设置页
       │  │     └─ viewmodels/
@@ -583,6 +583,12 @@ VIEWPORT_PRELUDE（视口修复 + 平台设置桥接）：
   <html>/<body> 的 height/minHeight 固定为像素高度；创建 <style id="__ww_vh_fix__">，
   遍历 document.styleSheets 中 type=1 的规则，把含 vh 的声明换算成 px 并以
   !important 追加；再遍历所有元素内联样式做同样的 vh→px 替换；
+- 沉浸式全屏（横竖屏统一的零留白顶边）：MainActivity 已 enableEdgeToEdge；GameScreen 进入时经
+  WindowInsetsControllerCompat 隐藏状态栏（BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE，上滑仅临时
+  浮现半透明状态栏），API 28+ 设 LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES 让画面绘入刘海区，
+  onDispose 恢复状态栏显示。顶栏（返回/⚙）Row 无竖向内边距（仅 horizontal 4.dp），
+  windowInsetsPadding(statusBars) 作为兜底保留——状态栏隐藏时该 inset 报 0（无贡献），
+  个别机型隐藏失效时按钮仍不会与状态栏图标重叠。实测横竖屏画面均从第 0 行像素渲染。
 - 设置面板已上移平台顶栏：顶栏右侧“⚙ 设置”入口（替代原“保存”按钮）由原生 GameScreen 渲染，
   游戏页内不再注入任何设置按钮/面板；页面侧仅暴露两个接口供原生面板经 evaluateJavascript 调用：
   window.__wwSetVolume(v)（0–1）与 window.__wwSetPaused(bool)。

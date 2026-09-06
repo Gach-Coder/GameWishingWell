@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -14,6 +15,10 @@ import com.gamewishingwell.ui.WishwellTheme
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 全局 edge-to-edge：内容绘制到透明系统栏之后（API 35+ 系统强制；低版本
+        // 显式对齐同一行为）——游戏页因此能真正铺到屏幕绝对顶端，各页 TopAppBar/
+        // Scaffold 自带 inset 处理不受影响。
+        enableEdgeToEdge()
         requestNotificationPermissionIfNeeded()
         setContent {
             WishwellTheme {

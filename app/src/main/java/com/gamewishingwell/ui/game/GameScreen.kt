@@ -52,6 +52,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import android.os.Build
+import android.view.WindowManager
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -127,6 +132,27 @@ fun GameScreen(
         } else {
             onDispose { }
         }
+    }
+
+    // 沉浸式全屏（横竖屏一致）：游戏页隐藏状态栏——（返回/设置）顶部区域贴屏幕
+    // 最顶端无任何留白，游戏画面延伸到绝对顶部（原先状态栏图标区与按钮之间
+    // 有一条约 50px 的间隔带）。横划短暂唤出状态栏（transient），离开页面恢复。
+    DisposableEffect(Unit) {
+        val window = context.findActivity()?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+        if (window != null && controller != null) {
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.statusBars())
+            // 刘海屏：允许内容延伸进 cutout 区（SHORT_EDGES），横屏两端不留黑/白带。
+            if (Build.VERSION.SDK_INT >= 28) {
+                window.attributes = window.attributes.apply {
+                    layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+        }
+        onDispose { controller?.show(WindowInsetsCompat.Type.statusBars()) }
     }
 
     val loadHtml: (WebView, String) -> Unit = { view, h ->
@@ -210,7 +236,9 @@ fun GameScreen(
         ) {
             Row(
                 Modifier
-                    .padding(horizontal = 4.dp, vertical = 4.dp)
+                    .padding(horizontal = 4.dp)
+                    // 状态栏已由沉浸式隐藏（inset=0）；保留 padding 作为控制器
+                    // 失效设备的防御，正常情况下按钮贴屏幕最顶端无留白。
                     .windowInsetsPadding(WindowInsets.statusBars),
                 verticalAlignment = Alignment.CenterVertically
             ) {
