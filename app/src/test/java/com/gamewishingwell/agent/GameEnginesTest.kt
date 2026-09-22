@@ -37,6 +37,13 @@ class GameEnginesTest {
             setOf(GameEngines.THREE, GameEngines.MATTER, GameEngines.CANNON),
             GameEngines.allowedFor("3D", listOf("物理", "关卡场景"))
         )
+        // 2.5D：three 同样必须（等距正交相机框架，2026-09-07 起与 3D 同等待遇）；
+        // 2.5D+物理：three + matter（matter 是 2D 物理，等距世界坐标可直接用）
+        assertEquals(setOf(GameEngines.THREE), GameEngines.allowedFor("2.5D", listOf("人物实体")))
+        assertEquals(
+            setOf(GameEngines.THREE, GameEngines.MATTER),
+            GameEngines.allowedFor("2.5D", listOf("物理"))
+        )
         // 2D+物理：matter；弹幕：可选 pixi；2D 无物理：无引擎
         assertEquals(setOf(GameEngines.MATTER), GameEngines.allowedFor("2D", listOf("物理")))
         assertEquals(setOf(GameEngines.PIXI), GameEngines.allowedFor("2D", listOf("弹幕射击")))
@@ -113,5 +120,95 @@ class GameEnginesTest {
         // 弹幕：pixi 可选段（措辞为可选而非必须）
         val bullet = GamePrompt.engineContract("2D", listOf("弹幕射击"), "balanced")
         assertTrue(bullet.contains("pixi.js（可选"))
+        // 2.5D：等距框架范式（正交相机/固定斜角/Raycaster 拾取），不带 3D 的
+        // 相机旋转硬性契约与视角旋转断言（2.5D 相机锁定固定等距角）；
+        // 移动操控必须四方向（▲▼◀▶/全向摇杆），禁止只实现左右（实测反例：类DNF 仅 ◀▶）
+        val iso = GamePrompt.engineContract("2.5D", listOf("人物实体", "战斗"), "balanced")
+        assertTrue(iso.contains("2.5D 等距引擎 three.js（本游戏必须使用）"))
+        assertTrue(iso.contains("OrthographicCamera"))
+        assertTrue(iso.contains("Raycaster"))
+        assertTrue(iso.contains("严禁手写 y-sort/画家算法"))
+        assertTrue(iso.contains("▲▼◀▶"))
+        assertTrue(iso.contains("只实现左右两向=2.5D 场景不可玩"))
+        // 方向一致性契约（实测反例：摇杆轴 1:1 绑世界轴，角落相机下按上走成屏幕斜下方）
+        assertTrue(iso.contains("方向语义＝屏幕视觉方向"))
+        assertTrue(iso.contains("严禁把摇杆/方向键的输入轴 1:1 绑到世界或网格轴"))
+        assertTrue(iso.contains("normalize(1,0,-1)"))
+        // 可观测性：player 暴露屏幕坐标 sx/sy（方向一致性断言的依据）
+        assertTrue(iso.contains("sx/sy"))
+        assertFalse(iso.contains("scenarios.json 必含一条视角旋转断言"))
+        assertFalse(iso.contains("右半屏单指滑动旋转相机"))
+        // 3D 范式不受影响（视角旋转契约仍是硬性要求）；摇杆同样要求屏幕方向对齐
+        val full3d = GamePrompt.engineContract("3D", listOf("人物实体"), "balanced")
+        assertTrue(full3d.contains("【3D 引擎 three.js（本游戏必须使用）】"))
+        assertTrue(full3d.contains("scenarios.json 必含一条视角旋转断言"))
+        assertTrue(full3d.contains("摇杆方向＝屏幕视觉方向"))
+        // 待机静止与 touch 绑定（实测事故：旋转只绑 mouse 沙箱拖不动；待机闲步骗断言）
+        assertTrue(full3d.contains("都必须绑 touchstart/touchmove/touchend"))
+        assertTrue(full3d.contains("严禁加\"待机自动转向\"让 yaw 自己漂移"))
+        assertFalse(full3d.contains("OrthographicCamera"))
+    }
+
+    @Test
+    fun `系统提示词的方向语义与屏幕坐标可观测性契约`() {
+        val sys = GamePrompt.systemPrompt(custom = null, toolMode = true)
+        // 通用方向语义：方向控件＝屏幕视觉移动方向（一切维度）；待机静止硬性禁令
+        assertTrue(sys.contains("方向控件的方向＝人物在【屏幕上的视觉移动方向】"))
+        assertTrue(sys.contains("待机静止"))
+        assertTrue(sys.contains("无输入时画面必须完全静止"))
+        // 可观测性：player 暴露 sx/sy 视口像素坐标
+        assertTrue(sys.contains("sx: 0, sy: 0"))
+        assertTrue(sys.contains("方向一致性断言的依据"))
+    }
+
+    @Test
+    fun `用户限定只要左右时四向契约让位且纵深断言豁免`() {
+        // 正常例："（2.5D）制作DNF"——四向硬性契约照常
+        val normal = GamePrompt.engineContract("2.5D", listOf("人物实体", "战斗"))
+        assertTrue(normal.contains("只实现左右两向=2.5D 场景不可玩，禁止"))
+        assertFalse(normal.contains("玩家主权"))
+
+        // 反例（玩家主权）："（2.5D）制作DNF，人物控制只要左右就行"——两向合法、纵深断言豁免
+        val locked = GamePrompt.engineContract(
+            "2.5D", listOf("人物实体", "战斗"),
+            controlsLockedHorizontal = GamePrompt.movementLockedByUser("（2.5D）制作DNF，人物控制只要左右就行")
+        )
+        assertTrue(locked.contains("【用户操控约束（玩家主权"))
+        assertTrue(locked.contains("纵深轴断言豁免"))
+        assertTrue(locked.contains("用户主权优先于四向默认契约"))
+        assertFalse("限定后不得再出现四向硬性禁令", locked.contains("只实现左右两向=2.5D 场景不可玩"))
+        // 引擎本体契约不受影响（three 必须/正交相机照常）
+        assertTrue(locked.contains("OrthographicCamera"))
+
+        // 2D 游戏的限定不注入主权段（2D 默认本就是 ◀▶，无需豁免）
+        val locked2d = GamePrompt.engineContract(
+            "2D", listOf("战斗"),
+            controlsLockedHorizontal = GamePrompt.movementLockedByUser("制作跑酷，只要左右")
+        )
+        assertFalse(locked2d.contains("玩家主权"))
+    }
+
+    @Test
+    fun `移动操控限定的判定含历史延续与显式解锁`() {
+        val lock = GamePrompt.movementLockedByUser("（2.5D）制作DNF，人物控制只要左右就行")
+        assertTrue("用户原话命中限定", lock)
+        // 无关措辞不误伤
+        assertFalse(GamePrompt.movementLockedByUser("（2.5D）制作DNF"))
+        assertFalse(GamePrompt.movementLockedByUser("做一个上下左右都能动的游戏"))
+        assertFalse(GamePrompt.movementLockedByUser("画面不要上下留黑边"))
+        // 历史延续：限定之后的"加个技能"回合仍锁定
+        assertTrue(
+            GamePrompt.movementLockedByUser(
+                "加个技能",
+                listOf("（2.5D）制作DNF，人物控制只要左右就行")
+            )
+        )
+        // 显式解锁：用户要求加回上下移动时恢复四向契约
+        assertFalse(
+            GamePrompt.movementLockedByUser(
+                "把上下移动也加上",
+                listOf("（2.5D）制作DNF，人物控制只要左右就行")
+            )
+        )
     }
 }

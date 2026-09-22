@@ -4,6 +4,9 @@ import com.gamewishingwell.data.ToolCallData
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -71,10 +74,10 @@ class GameToolsTest {
         val out2 = executor.execute(call(GameTools.LIST_FILES, "{}"))
         assertTrue(out2.observation.contains("未变化"))
         assertFalse(out2.observation.contains("sha256="))
-        // 写入使版本变化，去重失效，重新全量返回（覆盖写入已被禁止，用局部 editfile 更新）
+        // 写入使清单变化，去重失效，重新全量返回（覆盖写入已被禁止，用局部 editfile 更新）
         executor.execute(call(GameTools.EDIT_FILE, """{"old_string":"body v1","new_string":"body v2"}"""))
         val out3 = executor.execute(call(GameTools.LIST_FILES, "{}"))
-        assertTrue(out3.observation.contains("v2"))
+        assertTrue(out3.observation.contains("index.html"))
         assertTrue(out3.observation.contains("sha256="))
         dir.deleteRecursively()
         Unit
@@ -346,6 +349,11 @@ class GameToolsTest {
         val empty = executor.execute(call(GameTools.LIST_FILES, "{}"))
         assertTrue(empty.ok)
         assertTrue(empty.observation.contains("工作区为空"))
+        // 空工作区指引与多文件契约同向：先写被引用的辅助文件、最后写入口
+        // （历史缺陷：文案喊"先写 index.html"，与"先 js/css 后入口"的契约打架，
+        //  实测 round 1 先写入口触发引用缺失报错白费一轮）
+        assertTrue(empty.observation.contains("先写被引用的 js/css"))
+        assertTrue(empty.observation.contains("最后写入口 index.html"))
         ws.writeInitial("index.html", "hello")
         val listed = executor.execute(call(GameTools.LIST_FILES, "{}"))
         assertTrue(listed.observation.contains("index.html"))
@@ -386,11 +394,55 @@ class GameToolsTest {
     fun `writefile 参数中途截断时引导改用 editfile`() = runBlocking {
         val (ws, dir) = newWorkspace()
         val executor = GameToolExecutor(ws)
-        // 未闭合的 JSON 字符串 → Unexpected EOF（模拟输出在参数中途被截断）
+        // 未闭合的 JSON 字符串 → Unexpected EOF（模拟输出在参数中途被截断）；
+        // 截断不可修复（内容不完整），仍走截断指引
         val out = executor.execute(call(GameTools.WRITE_FILE, """{"content":"v2"""))
         assertFalse(out.ok)
         assertTrue(out.observation.contains("截断"))
         assertTrue(out.observation.contains("editfile"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `writefile 参数字符串内未转义换行制表被宽容修复后照常写入`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 模型/网关高发损坏（2026-09-07 真机实测，大文件参数高频）：代码换行/制表符按
+        // 原始字符进 JSON 字符串（未转义 \n/\t），严格解析必失败而内容本身完好
+        val args = "{\"path\":\"js/main.js\",\"content\":\"line1\nline2\tline3\"}"
+        val out = executor.execute(call(GameTools.WRITE_FILE, args))
+        assertTrue("宽容修复后应写入成功：${out.observation}", out.ok)
+        assertEquals("line1\nline2\tline3", ws.read("js/main.js"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `控制字符转义只作用于字符串字面量内`() {
+        // 字符串外的原始换行是合法空白（保留）；字符串内才转义；合法转义序列不被二次转义
+        val src = "{\n  \"a\": \"x\\\"y\nz\",\n  \"b\": 1\n}"
+        val fixed = escapeRawControlCharsInStrings(src)
+        assertNotNull(fixed)
+        val obj = Json.parseToJsonElement(fixed!!).jsonObject
+        assertEquals("x\"y\nz", (obj["a"] as JsonPrimitive).content)
+        assertEquals(1, (obj["b"] as JsonPrimitive).int)
+        // 没有任何可修内容（参数本就合法）返回 null，不产生等价副本
+        assertNull(escapeRawControlCharsInStrings("""{"a":"b"}"""))
+    }
+
+    @Test
+    fun `参数 token 间的全角空格被归一为半角空白后照常写入`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 另一族高频损坏（真机实测签名 Expected quotation mark '"', but had ' '）：
+        // 全角空格/不换行空格落在 JSON token 之间——严格 JSON 只认半角空白
+        val fullWidthSpace = "\u3000"
+        val nbsp = "\u00A0"
+        val args = "{\"path\": \"js/iso.js\",$fullWidthSpace\"content\":$nbsp\"line1\nline2\"}"
+        val out = executor.execute(call(GameTools.WRITE_FILE, args))
+        assertTrue("归一后应写入成功：${out.observation}", out.ok)
+        assertEquals("line1\nline2", ws.read("js/iso.js"))
         dir.deleteRecursively()
         Unit
     }

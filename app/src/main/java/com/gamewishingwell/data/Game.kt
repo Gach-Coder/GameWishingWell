@@ -8,13 +8,24 @@ data class GameMeta(
     val title: String,
     val description: String = "",
     val createdAt: Long,
-    val updatedAt: Long,
-    val playCount: Int = 0
+    val updatedAt: Long
 )
 
 @Serializable
 data class GameIndex(
     val games: List<GameMeta> = emptyList()
+)
+
+/**
+ * 游戏包清单（zip 根 ww_game.json）：游戏卡「导出zip」时随包写入、首页「导入」时读取——
+ * games/<id> 文件夹本身不含元数据（标题/描述只存于 games.json 索引），
+ * 跨设备/重装的命名还原全凭这份清单。
+ */
+@Serializable
+data class GamePackageManifest(
+    val version: Int = 1,
+    val title: String = "",
+    val description: String = ""
 )
 
 /** 文件可视系统条目：游戏存储文件夹内一个文件/子目录的概要信息。 */

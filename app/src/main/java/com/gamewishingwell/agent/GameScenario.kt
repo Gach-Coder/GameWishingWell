@@ -1,8 +1,13 @@
 package com.gamewishingwell.agent
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.doubleOrNull
 
 /**
  * 功能断言（场景回归测试）：把策划验收边界固化为可执行断言，由沙箱确定性裁决。
@@ -25,6 +30,9 @@ import kotlinx.serialization.json.Json
 data class ScenarioStep(
     /** 视口百分比点按 [xPct, yPct]（0-100）。 */
     val tap: List<Double>? = null,
+    /** CSS 选择器点按（如 "#pickBody .card[data-id='archer2']"）：执行器命中元素取中心派发——
+     *  模型不再猜测百分比坐标（实测合成触控按坐标猜卡片位置屡屡落空，模型被逼造坐标兜底区）。 */
+    @SerialName("tapSel") val tapSelector: String? = null,
     /** 视口百分比拖动 [x0Pct, y0Pct, x1Pct, y1Pct]。 */
     val drag: List<Double>? = null,
     /** 可选：派发下一步输入前先确定性推进 N 帧（每帧 50ms 游戏时间）——只控制输入节奏，与断言判定无关。 */
@@ -92,13 +100,29 @@ object GameScenarios {
      * ok=false 表示内容不可用（非法 JSON / 无可执行断言 / 含恒真式），模型需重写；
      * ok=true 附断言清单摘要，让模型确认覆盖面。
      */
-    fun checkObservation(raw: String): Pair<Boolean, String> {
+    fun checkObservation(raw: String, requireViewAssertion: Boolean = false): Pair<Boolean, String> {
         val list = parse(raw)
         if (list.isEmpty()) {
             return false to "scenarios.json 未解析出可执行断言。必须输出合法 JSON：" +
                 "{\"scenarios\":[{\"id\":\"...\",\"system\":\"...\",\"name\":\"...\",\"steps\":[{\"tap\":[50,80]}],\"expect\":\"s.score > 0\"}]}；" +
                 "expect 为针对 __wwDebugState() 快照 s 的布尔表达式（期限内任一帧为真即通过），" +
                 "且不得为空或超过 $MAX_EXPECT_LEN 字符。"
+        }
+        // 视角断言防伪（2026-09-07，3D 游戏硬性契约）：scenarios 必须包含一条与 s0
+        // 相对比较的朝向断言（引用 cam/camera/yaw/pitch）。实测事故：视角断言连败 16 次
+        // 后，模型先加"待机闲步/环视"自动漂移试图骗断言、最后把断言改写成与视角无关的
+        // 近恒真式（state/坐标边界）过关——交付的 3D 游戏视角旋转实际是坏的。
+        if (requireViewAssertion) {
+            val hasViewAssertion = list.any { sc ->
+                val e = sc.expect
+                (e.contains("cam") || e.contains("yaw") || e.contains("pitch")) && e.contains("s0")
+            }
+            if (!hasViewAssertion) {
+                return false to "3D 游戏的功能断言缺少视角旋转断言（写入校验打回）：必须保留一条" +
+                    "与 s0 相对比较的朝向断言（如 Math.abs(s.cam.yaw - s0.cam.yaw) > 0.05，steps 含右半屏 drag）。" +
+                    "断言失败时修复游戏（相机旋转的 touch 事件绑定），不得删除或改写为与视角无关的断言——" +
+                    "改弱断言不能让视角真的可旋转，交付的仍是残缺游戏。"
+            }
         }
         val weak = list.filter { containsTautology(it.expect) }
         if (weak.isNotEmpty()) {
@@ -119,6 +143,21 @@ object GameScenarios {
                 "（s.gold < 200）会因收入累积而永不满足。请改写为与增长方向一致的行为断言" +
                 "（如建造后 s.towers 增加、击杀后 s.kills 增加），或相对断言：在 __wwDebugState" +
                 " 暴露初始值/最近花费字段后比较相对变化（s.gold < s.goldInitial）。"
+        }
+        // 基线锚点陷阱：姿态/配置类字段（相机角度等）配绝对小数锚点——断言把"当前
+        // 初始值"锁定为预期，实现性错误（如相机俯仰角符号写反）从此修不动：任何把
+        // 初始姿态改正确的修改都会被自己的断言打回（历史事故：pitch=-0.3 相机钻到
+        // 地下，断言却以 s.camera.pitch + 0.3 为基准）。执行器提供 s0（场景起点快照
+        // 深拷贝），姿态类断言必须写相对变化。
+        val anchors = list.mapNotNull { sc ->
+            findBaselineAnchor(sc.expect)?.let { desc -> "「${sc.name}」的 ${sc.expect}（${desc}）" }
+        }
+        if (anchors.isNotEmpty()) {
+            return false to "功能断言存在基线锚点陷阱：" + anchors.joinToString("；") +
+                "。camera/yaw/pitch/dist/fov 等姿态配置字段的绝对数值锚点会把当前初始值" +
+                "锁定为预期——初始姿态本身写错时（如俯仰角符号反了），任何修正修改都会被断言打回。" +
+                "执行器为每条断言提供 s0（场景起点时 __wwDebugState 的深拷贝快照），" +
+                "姿态类断言请改写为相对变化：Math.abs(s.camera.yaw - s0.camera.yaw) > 0.05。"
         }
         val summary = list.joinToString("；") { sc ->
             "${sc.system.ifBlank { "通用" }}/${sc.name}(${sc.steps.size}步:${sc.expect.take(60)})"
@@ -155,6 +194,25 @@ object GameScenarios {
         return null
     }
 
+    /**
+     * 姿态/配置字段的绝对数值锚点检测（命中返回说明）：形如 `s.camera.pitch + 0.3`、
+     * `s.yaw - 0.6`——在姿态字段上做加减绝对小数，等价于把当前初始值写死为预期基准。
+     * 只拦已知姿态字段集（camera/cam 及其子字段、yaw/pitch/roll/dist/fov/zoom/
+     * angle/rotation），血量/得分等阈值比较不受影响。
+     */
+    private fun findBaselineAnchor(expect: String): String? {
+        val poseFields = setOf("yaw", "pitch", "roll", "dist", "fov", "zoom", "angle", "rotation", "camera", "cam")
+        val re = Regex("""s\.([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*([+\-])\s*(\d+(?:\.\d+)?)""")
+        re.findAll(expect).forEach { m ->
+            val path = m.groupValues[1]
+            val hit = path.split('.').any { p -> poseFields.any { f -> f.equals(p, ignoreCase = true) } }
+            if (hit) {
+                return "${m.groupValues[0]} 把姿态字段的当前初始值锚定为预期基准"
+            }
+        }
+        return null
+    }
+
     /** 容错提取 JSON 数组文本：支持裸数组或 {"scenarios":[...]} 包装。 */
     private fun extractArray(text: String): String? {
         val arrStart = text.indexOf('[')
@@ -170,9 +228,17 @@ object GameScenarios {
         val label = raw.name?.trim().orEmpty().ifEmpty { raw.id?.trim().orEmpty() }
         if (label.isEmpty()) return null
         val steps = raw.steps.orEmpty().mapNotNull { step ->
-            val tap = step.tap?.take(2)?.map { it.coerceIn(0.0, 100.0) }
+            // tap 支持两种形态：数值数组 [xPct,yPct] 或 CSS 选择器字符串 "#id / .class"——
+            // 选择器由执行器命中元素取中心派发，消除"模型猜坐标猜不中"的整类失败
+            // （实测合成触控猜不中卡片坐标，模型被逼造坐标兜底区绕过，反噬真实手感）。
+            val tapNum = (step.tap as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.doubleOrNull }
+                ?.take(2)?.map { it.coerceIn(0.0, 100.0) }
+            val tapSel = (step.tap as? JsonPrimitive)?.takeIf { it.isString }
+                ?.content?.trim()?.takeIf { it.isNotEmpty() && it.length <= 200 }
             when {
-                tap != null && tap.size == 2 -> ScenarioStep(tap = tap)
+                tapNum != null && tapNum.size == 2 -> ScenarioStep(tap = tapNum)
+                tapSel != null -> ScenarioStep(tapSelector = tapSel)
                 step.drag != null && step.drag.size >= 4 ->
                     ScenarioStep(drag = step.drag.take(4).map { it.coerceIn(0.0, 100.0) })
                 step.frames != null ->
@@ -202,7 +268,7 @@ object GameScenarios {
 
     @Serializable
     private data class RawStep(
-        val tap: List<Double>? = null,
+        val tap: JsonElement? = null,
         val drag: List<Double>? = null,
         val frames: Int? = null
     )

@@ -94,6 +94,7 @@ fun ChatScreen(
     }
 
     var input by remember { mutableStateOf("") }
+    // 首次保存（未命名草稿）的命名框；已命名游戏的保存不经此框直接覆盖。
     var showSaveDialog by remember { mutableStateOf(false) }
     // 撤销确认：丢弃未保存的修改不可恢复，须二次确认。
     var showUndoDialog by remember { mutableStateOf(false) }
@@ -199,7 +200,20 @@ fun ChatScreen(
                     // 撤销＝保存的逆操作（保存区覆盖编辑区+上下文回滚），只对已保存游戏的编辑会话有意义
                     canUndo = gameId != null,
                     onPlay = onPlay,
-                    onSave = { showSaveDialog = true },
+                    // 仅首次保存询问命名（未命名草稿）；已命名游戏直接覆盖保持原名，改名在首页。
+                    onSave = {
+                        vm.saveGame(
+                            onNeedName = { showSaveDialog = true },
+                            onDone = { ok ->
+                                if (ok) {
+                                    Toast.makeText(context, "已保存", Toast.LENGTH_SHORT).show()
+                                    onSaved()
+                                } else {
+                                    Toast.makeText(context, "保存失败，请先生成一个游戏", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        )
+                    },
                     onUndo = { showUndoDialog = true }
                 )
             }
@@ -739,6 +753,7 @@ private fun formatElapsedCompact(ms: Long): String {
     return "${totalSec / 60}分${totalSec % 60}秒"
 }
 
+/** 首次保存（未命名草稿）命名框：默认名取会话首条用户消息前 20 字。 */
 @Composable
 private fun SaveGameDialog(
     defaultTitle: String,

@@ -75,5 +75,8 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.mockwebserver)
     testImplementation(libs.mockito)
+    // 探针 JS 的语法守护：Rhino 编译探针脚本（只编译不执行），拦"字符串模板里
+    // 的语法错误"——此类错误会让整个沙箱瘫痪且纯 contains 断言永远发现不了。
+    testImplementation("org.mozilla:rhino:1.7.15")
     debugImplementation(libs.androidx.ui.tooling)
 }

@@ -3,7 +3,6 @@ package com.gamewishingwell
 import android.app.Application
 import android.content.Context
 import com.gamewishingwell.agent.AgentHub
-import com.gamewishingwell.agent.AgentLog
 import com.gamewishingwell.agent.GameAgent
 import com.gamewishingwell.agent.GameEngines
 import com.gamewishingwell.agent.HtmlEnhancer
@@ -19,8 +18,8 @@ class AppContainer(app: Application) {
     val agentHub = AgentHub(app, gameRepository, settingsRepository)
 
     init {
-        // Agent Loop 运行细节日志（仅本地文件调试材料，前端不展示）
-        AgentLog.init(app)
+        // Agent Loop 日志已改为"每回合一文件"落在各游戏文件夹 log/ 下（GameAgent 实例自持），
+        // 应用启动不再初始化全局日志目录。
         // 内置引擎源码提供器：HtmlEnhancer 注入 ww-engine 声明的引擎（真机/沙箱同管道）。
         // 引擎源码惰性读取并缓存（three.min.js 约 600KB，只在首个 3D 游戏加载时读一次）。
         HtmlEnhancer.engineSourceProvider = assetEngineProvider(app)

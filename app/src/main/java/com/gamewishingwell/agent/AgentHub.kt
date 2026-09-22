@@ -45,6 +45,12 @@ class AgentHub(
     private val _generating = MutableStateFlow(GenerationSummary(0, null))
     val generating: StateFlow<GenerationSummary> = _generating.asStateFlow()
 
+    private val _runState = MutableStateFlow(SessionRunState())
+    /** 按键位的会话运行视图（首页卡片动态标识观察）：draftStage 非空 = 草稿 Agent Loop
+     *  进行中；gameStages 为正在运行的游戏会话（id → 阶段文案，如"代码生成中"）。
+     *  与 [generating] 同源同时重算——会话翻转 isGenerating 或阶段推进即刷新。 */
+    val runState: StateFlow<SessionRunState> = _runState.asStateFlow()
+
     /** 取（必要时创建）会话实例。[gameId] null = 草稿；游戏会话首次创建即在自身
      *  协程内装载持久化会话（编辑区优先），调用方经 GameAgent.awaitReady 等待完成。 */
     fun agentFor(gameId: Long?): GameAgent {
@@ -72,11 +78,16 @@ class AgentHub(
         agents.remove(keyOf(gameId))?.let { retire(it) }
     }
 
-    /** 草稿重置（"删除草稿后新建"）：驱逐草稿实例；下次 agentFor(null) 得到全新会话。
-     *  新实例异步装载跨会话错误签名库（newSession 语义），不碰已删除的草稿文件。 */
-    fun resetDraft() {
+    /** 草稿重置（首页"新创作"入口）：驱逐草稿实例（停其生成）并以 clearDraft 语义
+     *  新建——草稿文件同步删除。语义：点创作即弃旧草稿、打开新的空对话，单一
+     *  草稿槽位由新对话持有，首条消息发送后覆盖落盘。挂起直到文件删除与会话
+     *  重建完成才放行导航（历史缺陷：clearDraft=false 旧文件残留，ChatViewModel
+     *  在空会话时装载旧草稿，"新的空对话"实际回显旧内容）。 */
+    suspend fun resetDraft() {
         agents.remove(KEY_DRAFT)?.let { retire(it) }
-        scope.launch { agentFor(null).newSession(clearDraft = false) }
+        val fresh = agentFor(null)
+        fresh.awaitReady()
+        fresh.newSession(clearDraft = true)
     }
 
     /** 停止全部会话的生成（前台服务通知的"停止"动作，多会话并发生成时一网打尽）。 */
@@ -114,10 +125,23 @@ class AgentHub(
     }
 
     private fun recompute() {
-        val active = agents.values.filter { it.session.value.isGenerating }
+        val active = agents.entries.filter { it.value.session.value.isGenerating }
         _generating.value = GenerationSummary(
             count = active.size,
-            stage = active.firstOrNull()?.session?.value?.agentStage
+            stage = active.firstOrNull()?.value?.session?.value?.agentStage
+        )
+        // "draft" 键 removePrefix 后不是数字，toLongOrNull 为 null 被过滤——两条键位一趟分拣。
+        _runState.value = SessionRunState(
+            draftStage = agents[KEY_DRAFT]
+                ?.takeIf { it.session.value.isGenerating }?.session?.value?.agentStage,
+            gameStages = active.mapNotNull { (key, agent) ->
+                key.removePrefix("game-").toLongOrNull()?.let { it to agent.session.value.agentStage }
+            }.toMap(),
+            draftUnsaved = agents[KEY_DRAFT]?.session?.value?.unsavedVersion == true,
+            gameUnsaved = agents.entries.mapNotNull { (key, agent) ->
+                if (!agent.session.value.unsavedVersion) return@mapNotNull null
+                key.removePrefix("game-").toLongOrNull()
+            }.toSet()
         )
     }
 
@@ -137,3 +161,13 @@ data class GenerationSummary(val count: Int, val stage: String?) {
         else -> "正在生成 $count 个游戏 · ${stage ?: ""}".trimEnd(' ', '·', ' ')
     }
 }
+
+/** 按键位的会话运行视图（首页卡片动态标识用）：draftStage=草稿阶段（null=未运行），
+ *  gameStages=正在运行的游戏会话（gameId → 阶段文案）；unsaved 维度=Agent Loop
+ *  已交付但未保存到运行区的新版本（保存/撤销后消失，随会话持久化）。 */
+data class SessionRunState(
+    val draftStage: String? = null,
+    val gameStages: Map<Long, String> = emptyMap(),
+    val draftUnsaved: Boolean = false,
+    val gameUnsaved: Set<Long> = emptySet()
+)

@@ -34,7 +34,7 @@ object GameEngines {
         val condition: String
     )
 
-    private val THREE_SPEC = EngineSpec(THREE, "THREE", "three.min.js", "3D 游戏")
+    private val THREE_SPEC = EngineSpec(THREE, "THREE", "three.min.js", "3D 游戏与 2.5D 等距视角")
     private val MATTER_SPEC = EngineSpec(MATTER, "Matter", "matter.min.js", "含物理系统的游戏")
     private val PIXI_SPEC = EngineSpec(PIXI, "PIXI", "pixi.min.js", "弹幕类同屏数百活动实体（可选）")
     private val CANNON_SPEC = EngineSpec(CANNON, "CANNON", "cannon.min.js", "3D 且需真刚体物理（可选）")
@@ -49,7 +49,8 @@ object GameEngines {
 
     /**
      * 本轮生成允许使用的引擎集合（条件引入机制的裁决点）：
-     * - three：3D 必须；
+     * - three：3D 必须；2.5D 必须（等距正交相机框架——手写等距投影/深度排序是实测
+     *   bug 重灾区，2.5D 重型游戏代码量随手搓投影暴涨，2026-09-07 起与 3D 同等待遇）；
      * - matter：物理系统必须（手写碰撞是实测 bug 重灾区）；
      * - pixi：弹幕射击系统时可选（默认仍 Canvas 2D 自绘）；
      * - cannon：3D+物理时可选（体素 AABB 手写更简，真刚体才需要）；
@@ -62,8 +63,9 @@ object GameEngines {
     ): Set<String> {
         val allowed = linkedSetOf<String>()
         val is3D = visualDimension == GameSchema.DIMENSION_3D
+        val usesThree = is3D || visualDimension == GameSchema.DIMENSION_2_5D
         val hasPhysics = systems.contains("物理")
-        if (is3D) allowed += THREE
+        if (usesThree) allowed += THREE
         if (hasPhysics) allowed += MATTER
         if (systems.contains("弹幕射击")) allowed += PIXI
         if (is3D && hasPhysics) allowed += CANNON

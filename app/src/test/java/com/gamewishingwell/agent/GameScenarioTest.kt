@@ -190,6 +190,37 @@ class GameScenarioTest {
     }
 
     @Test
+    fun `checkObservation rejects pose field absolute baseline anchors`() {
+        // 我的世界事故形态：断言以相机初始角为绝对基准（pitch=-0.3 相机钻到地下，
+        // 断言却锁定 s.camera.pitch + 0.3 为预期——修正修改永远被自己的断言打回）。
+        val (ok1, text1) = GameScenarios.checkObservation(
+            """{"scenarios":[{"id":"c","name":"转动视角","steps":[{"drag":[80,35,90,65]}],"expect":"Math.abs(s.camera.pitch + 0.3) > 0.06"}]}"""
+        )
+        assertFalse(ok1)
+        assertTrue(text1.contains("基线锚点"))
+        assertTrue(text1.contains("s0"))
+
+        // 一级姿态字段变体同样拦截
+        for (trap in listOf(
+            """{"scenarios":[{"id":"x","name":"X","expect":"s.yaw - 0.6 > 0.1"}]}""",
+            """{"scenarios":[{"id":"x","name":"X","expect":"Math.abs(s.cam.yaw + 0.5) > 0.05"}]}""",
+            """{"scenarios":[{"id":"x","name":"X","expect":"s.dist - 16 < 3"}]}"""
+        )) {
+            assertFalse("应拦截: $trap", GameScenarios.checkObservation(trap).first)
+        }
+
+        // 合法形态不拦：s0 相对断言、数值阈值比较、非姿态字段算术
+        for (fine in listOf(
+            """{"scenarios":[{"id":"a","name":"A","expect":"Math.abs(s.camera.yaw - s0.camera.yaw) > 0.05"}]}""",
+            """{"scenarios":[{"id":"a","name":"A","expect":"s.score - s.combo > 0"}]}""",
+            """{"scenarios":[{"id":"a","name":"A","expect":"s.player.hp > 30 && s.player.hp - 10 < 90"}]}""",
+            """{"scenarios":[{"id":"a","name":"A","expect":"s.wave >= 2"}]}"""
+        )) {
+            assertTrue("不应拦截: $fine", GameScenarios.checkObservation(fine).first)
+        }
+    }
+
+    @Test
     fun `scenario tier gating is balanced and premium only`() {
         assertFalse(GameScenarios.enabledForTier(QualityTier.FAST))
         assertFalse(GameScenarios.enabledForTier(QualityTier.LIGHT))
@@ -271,8 +302,33 @@ class GameScenarioTest {
         assertFalse(overwriteOutcome.ok)
         assertTrue(overwriteOutcome.observation.contains("合法 JSON"))
 
-        // 入口指针不被 scenarios.json 写入带偏。
-        assertEquals("index.html", workspace.manifest().pointer)
+        // 入口固定为 index.html（两区模型无指针簿记）。
+        assertEquals("index.html", GameFileWorkspaceEntryPoint.DEFAULT)
+    }
+
+    @Test
+    fun `3D 视角断言防伪-缺失或改弱时写入打回`() {
+        // 无视角断言的套件（实测事故形态：被改写成与视角无关的近恒真式）
+        val gamed = """{"scenarios":[
+            {"id":"flow","system":"主流程","name":"点击开始进入游玩","steps":[{"tap":[50,62]}],"expect":"s.state==='playing'"},
+            {"id":"stand","system":"视角","name":"第一人称站立且视野有效","steps":[{"tap":[50,62]}],"expect":"s.player.y > -3 && s.player.y < 16"}
+        ]}"""
+        val (ok, msg) = GameScenarios.checkObservation(gamed, requireViewAssertion = true)
+        assertFalse("改弱后的套件必须打回", ok)
+        assertTrue(msg.contains("视角旋转断言"))
+        assertTrue(msg.contains("不得删除或改写"))
+
+        // 含与 s0 相对的朝向断言 → 放行
+        val proper = """{"scenarios":[
+            {"id":"flow","system":"主流程","name":"开局","steps":[{"tap":[50,62]}],"expect":"s.state==='playing'"},
+            {"id":"view","system":"视角","name":"右半屏拖动旋转视角","steps":[{"tap":[50,62]},{"drag":[70,50,92,50]}],"expect":"Math.abs(s.cam.yaw - s0.cam.yaw) > 0.05"}
+        ]}"""
+        val (ok2, _) = GameScenarios.checkObservation(proper, requireViewAssertion = true)
+        assertTrue(ok2)
+
+        // 非 3D 游戏不受此门禁约束
+        val (ok3, _) = GameScenarios.checkObservation(gamed, requireViewAssertion = false)
+        assertTrue(ok3)
     }
 
     @Test

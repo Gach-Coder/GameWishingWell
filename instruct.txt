@@ -1,6 +1,6 @@
 ============================================================
  许愿井 GameWishingWell — 安卓 AI 游戏 Agent 平台 · 工程说明
- 更新日期：2026-09-05
+ 更新日期：2026-09-15
 ============================================================
 
 一、项目简介
@@ -9,15 +9,25 @@
 
 1. “我的游戏（首页）”展示用户已经制作好的游戏，点击即可立即游玩；
    每张游戏卡片显示：游戏名、用户描述、更新时间，支持：重命名、继续对话编辑、删除、文件夹，
-   有未保存草稿时显示“继续上次创作”入口。
-   文件可视系统（全程只读浏览）：游戏卡菜单“文件夹”进入 FileBrowserScreen，
-   像资源管理器一样逐级浏览该游戏存储文件夹（filesDir/games/<id>）——
-   点击文件夹进入子目录（.versions 版本归档、.savepoint 保存点同样可进），系统返回键/返回箭头逐级退回；
-   点击文件以只读查看器打开：等宽字体展示文本内容，长按可选中复制（顶栏另有“复制全部”），
-   无任何编辑/修改/保存入口；大文件超 256KB 截断预览、含 NUL 字节判二进制不做文本预览。
-   条目信息：名称、类型（文件夹/HTML 网页/JSON 数据/SHA-256 校验/版本标记/文本，.versions 标为版本归档文件夹）、
+   有未保存草稿时显示“继续上次创作”入口（卡片菜单与成品游戏同款：文件夹（进入草稿文件夹 drafts/）/删除）。
+   文件可视系统（全程只读浏览）：游戏卡菜单“文件夹”进入 FileBrowserScreen（草稿卡同理进入 drafts/），
+   像资源管理器一样逐级浏览该游戏存储文件夹（filesDir/games/<id>，草稿为 filesDir/drafts）——
+   点击文件夹进入子目录（.savepoint 保存点、log 回合日志、js/css 等游戏子目录同样可进；
+   旧版本应用遗留的 .versions 归档目录在保存/装载时被清理，正常不再出现），
+   系统返回键/返回箭头逐级退回；
+   点击文件以只读查看器打开：等宽字体展示文本内容，长按可选中复制（顶栏“导出文件”经系统 SAF
+   ACTION_CREATE_DOCUMENT 把完整文件另存到任意位置——不截断、二进制原样，非复制预览文本），
+   无任何编辑/修改/保存入口；大文件超 256KB 截断预览、含 NUL 字节判二进制不做文本预览；
+   读取层全程防御并发删除/更名（归档修剪、草稿清空、游戏删除竞态）——IO 异常收敛为失败态不崩进程。
+   条目信息：名称、类型（文件夹/HTML 网页/JSON 数据/Agent 日志/SHA-256 校验/版本标记/文本，
+log 标为 Agent 日志文件夹）、
    大小（目录显示子项数）、修改日期（yyyy-MM-dd HH:mm）；子目录在前、其余按名称排序；
-   数据来自 GameRepository.listGameFiles/readGameFile（GameFileEntry/GameFileContent），
+   数据来自 GameRepository.listGameFiles/readGameFile/readGameFileBytes（GameFileEntry/GameFileContent，
+   gameId=DRAFT_ID 时根目录为 drafts；readGameFile 对目录/不存在/逃逸目标抛 FileNotFoundException
+   （携带根目录与目标判定上下文，查看器失败页小字展示 + Log.e tag=GameRepository；IO 异常 250ms 重试一次，
+   打开失败自动刷新列表消除幽灵条目）；有界读取用 read(byte[]) 循环实现——readNBytes(Int) 是 Java 11 API，
+   Android API 33- 真机直接 NoSuchMethodError（实测低版本手机全部文件"无法打开"的唯一根因；
+   模拟器 API 36 掩盖了该问题，minSdk 26 的 API 兼容只能靠 lint NewApi 与真机验证），
    相对路径经 canonical 规范化校验不得逃出游戏目录（防 ../ 逃逸），页面无底部导航、根目录返回即回首页。
 2. “创作”页面可以用自然语言描述游戏（如“做一个打地鼠小游戏”），
    AI 即时生成 Android WebView 平台运行的单人游戏(HTML+CSS+JavaScript)，LLM SSE 流式输出（打字机效果）。
@@ -34,23 +44,57 @@
 	  game-<id> 续作，草稿键位让位）；底部"创作"入口不再清掉进行中的草稿对话（仅空会话才装载/新建）。
 	  生成任务运行在各会话自身的 agentScope：切页不取消；前台服务观察 AgentHub.generating 聚合计数
 	  （多会话并发生成时通知前缀"正在生成 N 个游戏"，停止动作 stopAll 一网打尽），制作完成后可在 WebView 中立刻游玩。
+	- 首页卡片运行标识（AgentHub.runState / SessionRunState）：与聚合计数同源重算的按键位运行视图
+	  （draftStage / gameStages[id] = 会话 agentStage 文案）。首页"继续上次创作"与各游戏卡片观察它：
+	  该会话 Agent Loop 运行中即显示动效 logo（循环箭头匀速旋转 + 透明度呼吸，rememberInfiniteTransition），
+	  草稿卡片与游戏卡片的状态标识三态：Agent Loop 运行中=小动态 logo（18dp 旋转+呼吸，
+	  不展示阶段文案——围观细节留给对话页/通知）；结束后有未保存新版本=同色 "!"（tertiary/
+	  onPrimaryContainer，提示保存同步）；保存（或撤销到保存点）后消失。
+	  unsaved 维度双源：GameSession.unsavedVersion（交付置位、saveCurrentGame 清零，
+	  随 agent_state.json 持久化——重启不丢）经 AgentHub.runState 实时暴露；
+	  冷启动首页不实例化会话，由 GameRepository.hasDraftUnsaved/listUnsavedGameIds
+	  直接扫 agent_state.json 的 unsavedVersion 字段（正则容忍空白）补充。
+	  草稿存在性（hasDraft 磁盘检查）与回合落盘时序（2026-09-07 修复）：落盘点不再只有
+	  回合结束态（确认卡/失败/交付）——sendUserMessage 发送即落盘会话簿记、stopGeneration
+	  停止即落盘中断态：全新草稿首个回合运行期间 drafts/ 即有 session.json（首页卡片可见，
+	  历史缺陷：首回合运行中/被停止后 hasDraft=false 卡片消失，重启丢对话）；
+	  进程中途被杀遗留的"生成中"持久化态由 decodeSession 装载时复位（isGenerating 闸门
+	  防锁死：sendUserMessage 见 isGenerating=true 会直接拒绝新回合）。
+		草稿重置（首页"新创作"与草稿卡"删除"共用入口，AgentHub.resetDraft 挂起式）：驱逐草稿实例（停其生成）+
+			删除草稿文件（含草稿日志 drafts/log）+ 重建空会话，完成前不放行导航——点创作即弃旧草稿、打开新的空对话，
+	  单一草稿槽位由新对话持有，首条消息发送后覆盖落盘（历史缺陷：旧文件残留被
+	  ChatViewModel 装载回显，"新空对话"显示旧内容）。
 		- 运行时 JS 报错会弹出覆盖层，可“让 AI 修复”；也可继续对话迭代（如“加连击计分”），修改基于上一个版本的游戏文件进行。
 		- 编辑区/运行区独立：Agent 工具沙箱写”编辑区”（filesDir/agent/workspace/<会话>），已保存游戏目录为”运行区”
 		  （filesDir/games/<id>）——编辑会话期间运行区文件不被写入（只同步会话簿记），
 		  “保存”和“撤销”即编辑版与保存版两个版本的相互覆盖：
+		  两区模型（2026-09-07 简化定型）：整个文件系统只有编辑区与保存区，相互独立、随时相互整体覆盖
+		  （保存＝编辑区清单 → 保存区全量平写+镜像删除不在清单的游戏文件；撤销＝逆操作整体覆盖回来；
+		  Agent 日志 log/ 与会话簿记 session.json/agent_state.json/.savepoint 豁免于覆盖与删除）——
+		  不保留任何历史版本归档（旧 .versions/标记/current.txt/sha256 存量随写入清理），“最后写入胜出”。
 		  “保存”＝编辑区全部游戏文件（index.html + js/css + scenarios.json）整体覆盖到运行区，
 		  同时把会话上下文冻结为保存点（games/<id>/.savepoint，撤销锚点）；
 		  “撤销”（仅编辑已保存游戏的会话）＝逆操作：以 GameRepository.savedGameFilePaths 递归清单为准
 		  把保存区全部文件覆盖回编辑区（多文件形态含子目录，旧实现只取根级文件名——撤回曾误删
-		  js/css 全部子目录文件且不恢复），覆盖经工作区版本化写入（簿记不旁路），
+		  js/css 全部子目录文件且不恢复），覆盖为平写（两区模型：无版本簿记），
 		  上下文回滚到保存点——未保存的修改与其后的对话记录被丢弃（二次确认，不可恢复）；
 		  旧版本保存的游戏无保存点：撤销时清空对话只留说明气泡（保存点缺失时上下文不可回放），
 		  可用 scripts/migrate-savepoint.py（adb run-as 直写 .savepoint）为旧游戏补建保存点恢复精确撤销；
 		  编辑对话的”立即游玩”预览编辑区最新版本（不入运行区）；重新进入编辑对话从编辑区续作（未保存修改不丢）。
+		  保存入口有两个（编辑对话页 ActionBar 与游戏页设置面板“保存游戏”），共用同一裁决
+		  （GameAgent.boundGameId）：仅首次保存（未命名草稿）弹命名对话框（默认名=会话首条
+		  用户消息前 20 字）；会话已绑定已命名游戏则直接覆盖保持原名。改名入口只在首页
+		  卡片菜单（此前对话页保存无条件弹命名框，改进已命名游戏也被要求重命名）。
 		- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
    DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 小米 MiMo / MiniMax / OpenRouter / 自定义，
-   支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”；模型名称可自由编辑并带服务商下拉（可选清单=ProviderPreset.models，首位即默认，手输清单外模型同样有效）；测试连接成功时前端提示固定为「✅连接成功」（不回显模型返回内容），失败显示原因摘要。
+   支持修改 Base URL、模型名、系统提示词、模型思考能力开关（默认关闭），并可“测试连接”；
+   Base URL 可编辑+服务商下拉备选（2026-09-22：清单来自 ProviderPreset.baseUrls、首位即默认，随服务商联动——
+   小米=余额计费 api.xiaomimimo.com/v1 + Token Plan 套餐额度专用 token-plan-cn.xiaomimimo.com/v1；
+   智谱=国内 open.bigmodel.cn/api/paas/v4 + 国内 Coding Plan 专用 /api/coding/paas/v4 + 国际 api.z.ai/api/paas/v4；
+   Kimi=国内 api.moonshot.cn/v1 + 国际 api.moonshot.ai/v1；MiniMax=国内 api.minimaxi.com/v1 + 国际 api.minimax.io/v1；
+   DeepSeek/OpenAI/Anthropic/OpenRouter 无第二官方端点不提供下拉——套餐专用/国际端点的 Key 与默认端点不通用，切换需换对应平台 Key）；
+   模型名称可自由编辑并带服务商下拉（可选清单=ProviderPreset.models，首位即默认，手输清单外模型同样有效）；测试连接成功时前端提示固定为「✅连接成功」（不回显模型返回内容），失败显示原因摘要。
    页面最下方显示 版本号 + 软件编译时间（BUILD_TIME，构建时写入 BuildConfig）——
    用于确认设备上运行的构建版本（Android Studio Apply Changes 热更新不刷新系统安装时间，
    不能靠"应用信息"的安装时间判断版本新旧）。
@@ -73,7 +117,10 @@
   HtmlEnhancer 检测声明后在 <head> 注入引擎源码（置于视口修复/游戏脚本之前，幂等）——
   真实游戏页（GameScreen）与沙箱（AndroidSmokeTestRunner）共用同一 inject 管道，天然一致；
 - 条件引入机制（GameEngines.allowedFor：维度×系统×档位裁决，提示词/校验/执行器三处同源）：
-  three=3D 必须；matter=含物理系统必须；pixi=弹幕射击可选（同屏数百实体性能不足时）；
+  three=3D 必须、2.5D 必须（等距正交相机框架——手写斜45°投影/深度排序是实测 bug 重灾区，
+  2.5D 重型游戏代码量随手搓投影暴涨，2026-09-07 起与 3D 同等待遇；three 范式按维度分支：
+  3D=可旋转相机+视角断言，2.5D=OrthographicCamera 固定等距角+Raycaster 拾取+禁止手写 y-sort，
+  2.5D 不写视角旋转断言）；matter=含物理系统必须；pixi=弹幕射击可选（同屏数百实体性能不足时）；
   cannon=3D+物理可选（真刚体需求；体素 AABB 手写更简）；tween=精品档可选（表现层补间）。
   提示词只"教"满足条件的引擎（GamePrompt.engineContract 按条件组装范式段：必选/可选措辞），
   GameValidator.validate(html, allowedEngines) 打回条件不符的声明（如贪吃蛇声明 matter）；
@@ -95,10 +142,8 @@
 	用户可见文案只有三种：阶段进度（含轮次与术语）、成功结果（+试玩建议）、失败结果（进度已保留+重试/换模型建议，零细节）。
 Agent处理message流程如下：
 	**默认契约：一个对话框只制作一个游戏，不处理单对话框的多游戏需求。 Game Schema JSON 对话框级别全局唯一，后续修改即以此为基础。
-	game_generated == false时(dev默认创建游戏)：
-		message → 意图层 → 识别层 → 策划层 → 确认门 → prompt → Agent Loop → HTML+CSS+JS game
-	game_generated == True时(dev默认修复或改进游戏)
-		message → 意图层 → prompt → Agent Loop → HTML+CSS+JS game
+	首次创建游戏时：message → 意图层 → 识别层 → 策划层 → 确认门 → prompt → Agent Loop → HTML+CSS+JS game
+	后续优化游戏时：message → 意图层 → prompt → Agent Loop → HTML+CSS+JS game
 	→ 意图层：(dev/chat 二分类；本地正则优先，置信度<0.8 时 Lite LLM 复核，LLM 自报置信度<0.6 视为不可联回落本地默认)
 		分类器只回答一个问题：用户是否想让游戏发生变化
 		dev:	创建/追加/改进/调整/修复游戏的一切诉求	file权限：read/write，可调用工具开发游戏文件, game_lock=true
@@ -126,6 +171,10 @@ Agent处理message流程如下：
 			游戏系统：人物实体，道具，战斗，技能，属性等级，关卡场景，AI策略，商店经济等。
 				(识别层事先定义较完整的游戏系统列表)
 			参考对标游戏：市场内的某著名游戏或无，可辅助补全游戏特性。（映射到内部模板库template_id + 相似度，映射不上返回 template:null）
+			复刻忠实度强化（2026-09-07，用户明确说"复刻"时）：①核心玩法循环逐项对齐原作（沙盒类=挖掘/
+			放置/合成/生存），未实现核心循环前不得把轮次花在原作没有的发明上；②规模量级对齐——原作是可自由
+			探索的大世界就不是一座小岛（沙盒体素用 chunk 分块生成+视野内加载，单文件只写生成器逻辑而非全图数据，
+			实测反例：35×35 小岛交付）；③操作手感以原作为准（第一人称/视角可转/挖掘有反馈）。
         例如"做一个2D版竖切面的我的世界游戏"：
 			第一步检测对标游戏<我的世界> -> ["3D","竖版",[人物实体,道具,战斗]]
 			第二步抽取游戏特性 -> ["2D","",[]] -> 键值修正 + 列表元素追加或删除
@@ -145,7 +194,9 @@ Agent处理message流程如下：
 		  全部不勾选=裸需求模式——不套用预设系统清单，等价于用户原话直接交给 Agent，
 		  需要哪些玩法系统由模型按需求自行判断（类型标配完整可玩），照常进入 Agent Loop 不影响生成）
 		系统清单末尾提供"全选"开关（TriStateCheckbox，一键全选/全不选，半选=部分勾选；全不选时显示裸需求模式提示）；
-		其后为"质量档位"四挡单选（RadioButton 列表，默认 均衡）：快速（最快速度直出产品，不做任何测试）/
+		其后为“质量档位”四挡单选（RadioButton 列表，默认对齐会话档位——首次发送即输入区上方的
+		档位预设值（sendUserMessage 随消息写入会话，2026-09-16 对齐；此前固定默认均衡、预设选了精品卡上仍回均衡），未设置时均衡）：
+		快速（最快速度直出产品，不做任何测试）/
 		轻量（一轮测试保证能运行成功）/均衡（保证运行成功＋检查基本功能正确）/精品（保证运行成功＋检查基本功能正确＋功能更丰富）；
 		确认后写入会话 GameSession.qualityTier（fast/light/balanced/premium）并锁定进卡片；
 		待确认期间输入文本修正时，当前档位随消息带回（sendUserMessage 携带 qualityTier）并继承到重组卡，选择不重置；
@@ -156,6 +207,18 @@ Agent处理message流程如下：
 		按 template_class（画面维度×画面方向×主类型）选取特征矩阵（系统×默认参数），只做"选系统+覆盖参数"，不自由发明
 	→ Prompt：根据用户最后确认的完整信息组成游戏内容提示文本加入system 提示词（工具模式：文件内容一律经工具写入，回复正文不出现代码）+ 上下文最小化：
 		首次生成放参考模板；迭代放 rolling summary（"最新内容请通过 readfile 获取"），其余靠工具按需取
+		+ 指令窗口（RecentInstructionWindow，2026-09-20）：最近 10 条"有效用户指令"逐字注入上下文——
+		  局部连续性通道（"改回去/刚才那个"类指代与改口冲突在窗口内可解），与 rolling summary 分工：
+		  窗口记"用户说过什么"（意图史），rolling summary 记"现在是什么"（交付现状）。轮划分：两条
+		  assistant 消息之间的连续 user 消息为同一轮（确认门文本修正属同轮，以最后一条为有效指令），
+		  末段未闭合 user 消息是本轮指令不进窗口（四种回合入口均以 user 消息收尾，规则全覆盖）；
+		  纯确定性（无 LLM）：窗口是会话消息的运行时视图，随 messages 持久化/撤销截断/多会话隔离天然成立；
+		  交付标记只标可确证的（该轮后首条 assistant 消息含成功回执"本次 Agent Loop 共"标"（已交付）"，
+		  与交付结算共用常量；失败/中断/聊天轮不标——宁缺毋假）；头部携带覆盖声明（较早指令可能已被
+		  推翻或已体现在代码中，以最新指令与 readfile 现状为准，防被推翻/未交付旧指令误导）；
+		  单条截 500 字单行化、超窗显示省略计数；工具模式与兼容回环两个注入点同源；已知边界：失败/中断
+		  轮指令会被后续 user 消息吸收（failTurn 不追加 assistant 消息），该轮意图不进窗口（遗留问题
+		  注入通道已覆盖失败上下文）。
 	→ Agent Loop：（bug 修复轮数不设上限，多轮属正常；仅无进展与运行验证环境异常两类非修复性退出；
 	  输出零截断：不携带 max_tokens、工具观察与消息全量透传；网络层超时（连接30s/读静默12min/写60s）是死连接探测器
 	  而非 LLM 时长限制——只要流上有字节就永不触发，触发后走自动重试不截断输出；整体时长不设限，停止键是用户侧唯一主动中断）
@@ -171,6 +234,13 @@ Agent处理message流程如下：
 		  __wwDebugState 与 eval 禁令可能落在被引用的 js 文件里，只看原始入口会误报"缺少契约"回炉；
 		  入口纯内联超 600 行时校验附"建议拆分"warning（非错误，修复回合忽略）
 		  反无用功加固（2026-09 深扫落地，与断言根治同族缺陷的系统性清除）：
+		  - 工具参数宽容修复（2026-09-07 真机实测落地）：模型/网关（免费/长输出端点高发）
+		    流式输出大 writefile 参数时，把代码换行/制表符按原始字符塞进 JSON 字符串
+		    （未转义 \n/\t）——严格解析必失败而内容本身完好；2.5D 重型游戏（MOBA/骑士团类）
+		    单文件代码量大，参数随内容增长，中招概率陡增，每个损坏参数浪费一整轮 LLM 往返
+		    （实测 14~34KB tokens，回合拉长至 23+ 轮）。GameTools.execute 对解析失败的参数先经
+		    escapeRawControlCharsInStrings（只转义字符串字面量内的控制字符，不改结构）重试一次，
+		    修复成功透明落盘；流截断（EOF）不可修复，仍走"改用 editfile/appendfile/拆小文件"指引；
 		  - 正文 HTML 守卫：工具已正常工作（mutatedOnce）后，正文出现完整 HTML 一律忽略并纠正
 		    （"文件内容一律通过工具写入"），不再隐式覆写已验证的工作区——隐式写入仅保留给
 		    "工具从未成功"的降级模型（其唯一产出通路）；
@@ -186,21 +256,30 @@ Agent处理message流程如下：
 			写入护栏全部按"写入结果 vs 回合起点快照"的状态差分度量，与写入机制（哪个工具/分几步）无关
 			——操作层语法门（writefile 覆盖禁令、old_string≥90% 判重写）已废弃：它们冤杀合法编辑
 			（JSON 的自然编辑是整体重写，实测连续 4 次致命拒绝的教育税）又漏过多步掏空（20 个小 editfile
-			逐函数替换可绕过 90% 门）。状态层两把尺：
+			逐函数替换可绕过 90% 门）。状态层尺子与写入时刻契约：
 			- 未授权整体重写：任何写入使该文件与回合起点行相似度（非空行 Dice）< 0.35 → 致命拒绝且不落盘
 			  （一次 writefile 达成与多次 editfile 逐步掏空等价；新文件不受限；起点 <8 非空行的小文件不判）；
 			  仅用户指令明确授权重做/重构（重构/重写/重做/推倒/从头关键词）放行；
+			- 跨文件模块导出契约（GameStaticCheck，写 js/入口时）：以写入后工作区全量视图核对
+			  window.X=(function.. 模块的 return 导出表 vs 全工作区 X.fn( 调用点——调用存在而导出缺失
+			  即致命拒绝并点名（历史事故：touch.js 重写丢 setUI，main.js 的 Input.setUI 调用让游戏
+			  一启动即崩）；导出表解析失败/plain 对象/引擎全局不参与（宁可漏报不误伤）；
+			- 全量重写咨询信号（非硬门）：一个回合累计整体覆盖既有文件 ≥3 次时，观察附
+			  "回归风险高，优先 editfile"提示一次——护栏按"单次写入 vs 起点"度量，逐步小改
+			  永不触发，累计面在这里补盲（历史：加跳跃功能轮逐步重写全部 8 文件，每步都合规）；
 			- 回归断言只增不减：修改回合以起点断言 id 快照为基准，删 id/改 id 致命拒绝；
 			  修内容保 id、追加放行（scenarios.json 可整体重写落盘——JSON 的自然编辑方式）；
 			- 解析失败/空套件由写入后的 checkObservation 反馈（不误报"断言被删除"）；
 			正文完整 HTML 隐式写入仅限"入口尚不存在且工具从未成功"的首次创建，其余一律忽略并纠正。
-			修改范围契约（提示词层）：修复/改进轮注入 SCOPE_FENCE_RULE——只改用户点名的游戏特征；
+			修改范围契约（提示词层）：已存在游戏的任何后续回合（修复/改进/加功能）注入 SCOPE_FENCE_RULE——
+			只改用户点名的游戏特征，默认 editfile 最小修改，重写模块必须保留既有导出成员，
+			多文件全量重写仅用户明确要求重做时允许；
 			兼容回环（无 function calling 模型）保留整文件输出通道：不经工具执行器，自有 seedHash 防假修改闸。
 		无截断机制（彻底贯彻）：不捕获/不处理 finish_reason 截断信号；请求不携带 max_tokens（Anthropic 协议因 API 强制要求发送模型上限值），
 		  工具观察（tool_result）与消息不做任何长度裁切——截断输出/裁切上下文只会制造非法工具参数与残缺代码；
 		  模型输出体量由任务自然约束（多文件组织分而治之：单次 writefile 体量小不易截断；
 		    大文件仍可 writefile 骨架 + appendfile 分段拼装）
-			→ 模型发起 tool call → 宿主经 GameFileWorkspace 执行（版本化文件+指针切换+同会话加锁+hash防并发覆盖；
+			→ 模型发起 tool call → 宿主经 GameFileWorkspace 执行（平写覆盖+同会话加锁+hash防并发覆盖；两区模型无版本归档；
 			  修改用 old_string 逐字符精确替换且要求唯一（或 replace_all），全量重写仅限首次生成或 overwrite=true 结构性重构）
 			→ 每次写入后宿主自动检查产品契约（外部资源/eval 禁令，无解析器代差），报告作为"观察"附在 tool_result 回传
 			→ 模型不再发起工具调用即自然终止；验收 = 产品契约通过 + 工作区整体指纹≠种子指纹（防"空口完成"——
@@ -289,10 +368,18 @@ Agent处理message流程如下：
 			  全部通过才放行——裁决权在确定性执行而非 LLM Critic（"LLM 提出，确定门裁决"）；
 			  写 scenarios.json 时执行器即时做解析校验反馈（不发布 currentHtml、不跑 HTML 契约、不切入口指针）；
 			  恒真式静态拒绝：expect 含 >=0（计数/长度天然非负）、!== undefined/null、typeof 判存在等近恒真子式时写入即打回（实测出现过 entities.length>=0 这类"写了等于没测"的断言）；
+			  移动操控断言（2026-09-07，防"方向键残缺"与"方向不一致"交付）：有玩家移动的游戏必含方向输入断言——
+			    expect 断玩家屏幕坐标 sx/sy 沿输入方向相对 s0 变化（方向校验，非仅"动了"）；2D 断横轴，
+			    2.5D/3D 必另含纵深轴（缺纵深=只实现了左右，回炉补全）；用户显式限定两向时只断横轴（豁免纵深）；
 			  结构性不可满足陷阱（2026-09）：gold/score/kills/coins 等只增字段配绝对值上界（s.gold < 200）
 			  写入即打回——收入累积后永不满足（实测该类断言曾烧 20+ 轮修复），引导改写为增长方向一致
 			  的行为断言或相对断言（s.gold < s.goldInitial，需在快照暴露初始值字段）；只拦 < 方向，
 			  递减字段（lives）配上界与 > 方向均合法不拦；
+			  s0 相对断言 + 基线锚点陷阱（2026-09-07 我的世界事故）：求值上下文同时提供 s0
+			  （本场景起点 __wwDebugState 深拷贝，防原地修改别名）——相机/姿态类断言写相对变化
+			  （Math.abs(s.camera.yaw - s0.camera.yaw) > 0.05）；姿态字段（camera/cam/yaw/pitch/
+			  dist/fov 等）配绝对小数锚点（s.camera.pitch + 0.3）写入即打回——绝对锚点把当前初始值
+			  锁定为预期，初始姿态写错时（pitch=-0.3 相机钻地下）任何修正修改都会被自己的断言打回；
 			  断言门相位/两段门（2026-09，仅首代生成）：运行时门阶段验收不带 scenarios——模型早期主动
 			  写的断言不与运行修复交错；首次运行全绿即进入断言相位，既有断言在同一宣告内立即补验
 			  （两次沙箱调用、不烧额外 LLM 轮次，失败走同一反馈路径含错位路由/连败记账）；
@@ -303,6 +390,11 @@ Agent处理message流程如下：
 			  NaN/引用类灾难从首次宣告才发现（实测第 40 轮）提前到第 ~8 次写入；咨询式升级：同一错误
 			  连续两次轻量冒烟复现才升级为正式修复反馈，施工中间态（引用尚未写完的文件/函数）的
 			  合法报错只做一次通知；设施类结果无信号跳过；快速档完全跳过；
+			  视角断言防伪（2026-09-07，3D 游戏，写入即打回）：scenarios 必含一条与 s0 相对比较的朝向断言
+			    （引用 cam/yaw/pitch）——缺失或被改写为与视角无关的近恒真式时打回（实测事故：视角断言连败 16 次，
+			    模型先加"待机闲步/环视"自动漂移骗断言、最终改弱断言过关，交付视角旋转残缺+静止时画面自转的游戏）；
+			    3D 契约同步补硬性条款：摇杆/相机旋转必须绑 touch 事件（只绑 mouse=沙箱拖动无效）；
+			    待机静止为一切维度通用硬性禁令（无输入时画面完全静止，禁闲步/自动环视/自动漂移）；
 			  断言错位路由（连败 ≥4 次，与宣告空转熔断互补——那管零修改空转，这管有修改但修不对）：
 			  同一 scenario 连续 4 次失败（期间有修改）→ 反馈升级为三选一定向指令（①调整 steps/horizon
 			  先满足前置节奏 ②改写 expect 并附一行理由 ③修游戏使其可满足），把"盲调参数"压缩为一轮决策；
@@ -334,12 +426,24 @@ Agent处理message流程如下：
 			  不得提前收单（历史竞态：读到 passed=false/errors=[] 中间态被判"结果不可读(smoke-failed)"设施异常，
 			  精品档主阶段干净的运行必现，表现为 5 秒内失败且仅 1 次尝试）；
 			  SmokeTestResult.attempts 记录总尝试次数（进 AgentLog 与决策日志结构指标）；
-			画面空白检测 v2（像素多样性裁决）：跑满帧后对每个非零尺寸 canvas 降采样（48x48）统计量化颜色数（4bit/通道）——
-	  少于 3 种颜色判"playability-blank-canvas"失败回炉（附最多色 hex 与占比、以及顶点索引/渲染循环/相机/preserveDrawingBuffer
-	  四步排查指引）；无 canvas 的 DOM 游戏按旧文本规则（可读文本<30 字符判 playability-blank-screen）。
-	  历史盲区：旧实现"PNG 体积>3KB 或页面文本≥30 字"双豁免——WebGL 零三角形交付（顶点全 NaN 被 GPU 裁剪，
-	  只剩天空清除色）凭 HUD 文本带病通过（实测"我的世界"青屏事故）；颜色数同时写入 SmokeTestResult.canvasColors
-	  供自检轮注入与决策日志。
+			画面证据 v3（测量与裁决分离）：探针只测量——逐 canvas 记录 {w,h,colors,note}
+	  （48x48 降采样、4bit/通道量化；colors=0=采样失败"像素不可读"）、0 尺寸画布计数、
+	  DOM 文本长度、restart 存在性、平台角落可交互元素、主画布几何（方向/铺满）、
+	  __wwDebugState 不变量问题清单、场景断言条目，收尾打包为 window.__wwEvidence；
+	  判定集中在 Kotlin 侧 DeliveryGate（声明式检查表，每行可表驱动单测）：
+	  - canvas-alive：html 声明 <canvas> 或 ww-engine=three/pixi 的游戏，收尾必须存在
+	    非零尺寸画布——废除这类游戏的 DOM 文本豁免（历史事故两连放行：初始化崩溃后
+	    无存活画布，凭帮助文案≥30字钻过 v2 的豁免缝，colors=0 被当合法值）；
+	  - pixel-diversity：canvas 游戏最大色数<3 判 playability-blank-canvas（colors=0
+	    =证据缺失=preserveDrawingBuffer 指引）；纯 DOM 游戏（html 未声明 canvas）保留
+	    文本规则（可读文本<30 判 playability-blank-screen）；
+	  - 未捕获错误捕获：探针挂 window error + unhandledrejection（'uncaught:' 前缀），
+	    与 console.error/帧内异常同权重入 errors——setTimeout 回调里抛的 TypeError
+	    此前是盲区（真机页看得到、沙箱看不到）；
+	  - light 模式（中途冒烟）= 只评估运行时错误行（裁决侧重叠语义，JS 里不再有
+	    __light 检查分支）；方向期望（横/竖）在 DeliveryGate.Context，不在 JS；
+	  - Verdict 是唯一事实来源：日志行/反馈/canvasColors 全从它派生（历史缺陷：
+	    报错文案说"仅 1 种颜色"而上报字段 colors=0 各说各话）。
 			可玩性自检轮（对标 DSH/ZaiAgent 的自检-增强流程）：沙箱通过后不立即交付，逐轮注入"对照【可玩性要求】自查修复"再验收——
 			自检为有据自查：沙箱功能断言结果（X/Y 通过+清单）作为证据前缀注入自检提示，模型基于运行证据自查，不重复已被断言验证的内容（替代无执行依据的纯自我感觉）；
 			轮数随质量档位（确认门四挡 qualityTier）与回合类型分档：
@@ -379,9 +483,43 @@ Agent处理message流程如下：
 		  ① 方向：主画布宽高比与 orientation 一致（横板≠横向卷轴玩法+竖版/窄幅画面）；
 		  ② 铺满：以窗口实际尺寸为逻辑分辨率全屏自适应，禁止固定逻辑分辨率等比缩放留黑边；
 		  ③ 禁自旋转：平台已保证横屏视口，游戏自行 rotate 会二次旋转；
-		  ④ 触控布局标准：横板动作类=左下并排 ◀▶ 方向键（可见半透明、各≥64px）+右下跳跃大键（≥80px），
-		    方向语义=触点横向位置（严禁用触点纵向位置决定左右），多点触控按 identifier 跟踪、方向与跳跃可同按，
-		    支持拇指不离屏滑动切换方向；竖版游戏控件置底部一排或两角。
+		  ④ 触控布局标准（2026-09-07 起维度化）：2D 平面动作/跑酷类（横板）=左下并排 ◀▶ 方向键
+		    （可见半透明、各≥64px）+右下跳跃大键（≥80px），方向语义=触点横向位置（严禁用触点纵向位置
+		    决定左右），多点触控按 identifier 跟踪、方向与跳跃可同按，支持拇指不离屏滑动切换方向；
+		    2.5D/3D 场景类（世界含纵深）=移动必须覆盖上下左右全四向——左下/左半屏全向摇杆（首选）或
+		    ▲▼◀▶ 四方向键组（上下=纵深进/出），只实现左右两向判不可玩禁止；竖版游戏控件置底部一排或两角。
+		    玩家主权豁免（2026-09-07）：用户显式限定操控（如"（2.5D）制作DNF，人物控制只要左右就行"）时
+		    四向契约让位——按用户要求只实现 ◀▶ 两向，纵深轴断言豁免，不得自行把上下移动"修"回来；
+		    裁决 GamePrompt.movementLockedByUser（锁定/解锁正则；约束从会话历史延续——后续"加个技能"
+		    回合不丢，用户显式要求加回上下时恢复四向），经 gameContractBlock 注入 engineContract。
+		    验收联动（移动操控断言，均衡/精品档生成轮必含）：scenarios.json 必含方向输入断言——
+		    expect 断玩家【屏幕坐标】沿输入方向变化（s.player.sx/sy 相对 s0：向左 drag 后 s0.sx - s.sx > 5）；
+		    2D 断横轴、2.5D/3D 必另含纵深轴；只断 |Δ坐标|>0 不够（实测反例：等距相机下摇杆轴 1:1 绑世界轴，
+		    按上走成屏幕斜下方，坐标变化全绿但方向错）；用户限定两向时只断横轴（豁免纵深）。
+	            方向语义（一切维度通用，2026-09-07）：方向控件方向＝人物在【屏幕上的视觉移动方向】，严格一致——
+	            等距/斜俯视角严禁输入轴 1:1 绑世界/网格轴（世界轴在屏幕上是斜线）；正确做法＝屏幕方向经相机基反投影
+	            到地面（角落等距相机 (d,h,d)：屏幕右=normalize(1,0,-1)、屏幕上=normalize(-1,0,-1)）或 Raycaster
+	            双射线打地面取差向量；可观测性契约同步要求 player 暴露 sx/sy 视口像素坐标（方向断言依据）。
+		进度存档（2026-09-15 落地、2026-09-16 强化对局续玩，游戏侧 localStorage 自动存读档）：
+		  生成契约第 9 条【进度存档契约（硬性）】要求游戏用固定键 ww:save 存档，值为单一 JSON 字符串且含 v 版本号；
+		  存档必须包含【进行中对局】的恢复要素（当前波次/关卡、金币、生命、分数、已建单位等，如 {v:1,best,run:{wave,gold,hp,...}}），
+		  只存最高分/最高波次等"记录类"数据而不存对局状态＝违约（2026-09-16 实测缺口：首版契约措辞下模型
+		  只存了 best/waves 记录，玩家 3/5 波退出重进仍从第 1 波开始）；每波/每关开始与关键资源变化时写档
+		  （debounce≤2s），对局结束清对局部分只留记录、下次全新开局；初始化防御性恢复（try/catch，失败删键
+		  走全新开局），恢复成功且对局未结束 → 跳过开始界面直接从存档波次继续（3/5 波退出重进从第 3 波继续）；
+		  restart() 把存档对局部分归零、记录保留；所有 localStorage 读写必须 try/catch。
+		  参考模板 game_template.html 已内置 ww:save 对局状态连续落盘＋重进续玩示范。
+		  平台侧配套：真机页按 source+gameId 独立子域假 origin（https://<source><gameId>.ww.local/）加载——
+		  null baseURL（about:blank）下 localStorage 跨进程重启持久化无契约保证；且 localStorage 的 origin
+		  只由 scheme+host+port 构成、路径不参与（2026-09-15 实测事故：https://ww.local/game/<id> 形式的
+		  path 键控让全部游戏折叠成同一 origin 共享同一份 localStorage，两局游戏 ww:save schema 不同，
+		  交叉读取触发契约的防御性删除互相清档），host 内嵌 source+gameId 才真正隔离键空间；
+		  存档跨重启/覆盖安装新 APK 存活、预览与运行区互不污染（编辑版试玩不覆盖正式存档；
+		  草稿入库换 origin，草稿期存档不随迁，属可接受语义）。
+		  沙箱 localStorage 内存 stub 改为无条件安装：直载后真实 localStorage 跨尝试共享同一 origin，
+		  存档契约会把上一次冒烟留下的 ww:save 恢复进下一次尝试，污染"全新开局"假定的场景断言。
+		  设置面板新增"清除存档并重开"（平台通用：删 ww:save 后整页重载——比 restart() 彻底，
+		  内存中的最高分等跨局状态一并归零；restart 只重置本局保留存档）。
 		→ 运行时报错（格式化回传：file:line + stack + console 片段）再回到Agent Loop 修复
 		→ 运行无报错，用户可选择输入文本改进游戏或报告缺陷，则回到Agent Loop 修复
 		→ 更新 GameSession 并持久化（代码 + rolling summary：
@@ -415,7 +553,8 @@ Agent处理message流程如下：
 
 （模型下拉可选清单——ProviderPreset.models：DeepSeek=deepseek-v4-flash/v4-pro；Kimi=moonshot-v1-8k/32k/128k/kimi-k2-turbo-preview；
   OpenAI=gpt-4o-mini/gpt-4o/gpt-4.1-mini/gpt-4.1/o4-mini；Claude=claude-sonnet-4-6/claude-opus-4-6/claude-haiku-4-5；
-  智谱=glm-5.3-flash/glm-5.3/glm-4.6/glm-4-flash；小米=mimo-v2.5/mimo-v2.5-pro；MiniMax=MiniMax-M3/M2.7/M2.5；
+  智谱=glm-5.3-flash/glm-5.3/glm-4.6/glm-4-flash；小米=mimo-v2.5/mimo-v2.5-pro/mimo-v2.6-flash/mimo-v2.6-pro（2026-09-22 增）；
+  MiniMax=MiniMax-M3/M2.7/M2.5；
   OpenRouter=全部免费端点对话模型（快照 2026-09-05，同步自 openrouter.ai/models?variant=free，已排除
   音频输出的 lyria 系与无工具调用的 content-safety 分类器，仅保留 text-out 且支持 tools 的 19 个）；自定义=纯手输。）
 
@@ -481,7 +620,7 @@ GameWishingWell/
       │  │  ├─ MainActivity.kt           # 唯一 Activity / Compose 入口
       │  │  ├─ WishwellApplication.kt    # Application + AppContainer 手动 DI
 	      │  │  ├─ agent/
-	      │  │  │  ├─ AgentHub.kt            # 多会话 Agent 注册表：每对话（draft/game-<id>）一个 GameAgent 实例；草稿入库 rekey、聚合计数（前台服务观察）、release/resetDraft 生命周期
+	      │  │  │  ├─ AgentHub.kt            # 多会话 Agent 注册表：每对话（draft/game-<id>）一个 GameAgent 实例；草稿入库 rekey、聚合计数（前台服务观察）与按键位运行视图 runState（首页卡片标识）、release/resetDraft 生命周期
 	      │  │  │  ├─ GameAgent.kt           # 创作 Agent 核心状态机 / 工具模式 Agent Loop（含无工具降级回环与修复快车道）；单会话引擎（pinnedGameId 构造固定身份），回合整体运行于实例 agentScope——策划+生成是同一个可取消任务
 		      │  │  │  ├─ GameTools.kt           # 工具定义(listfiles/readfile/writefile/editfile) + 沙箱执行器（写后自动校验回传；辅助文件按类型轻量校验、不作入口发布）
 	      │  │  │  ├─ GameIntent.kt          # 意图层：dev/chat 二分类（正则优先+Lite LLM 复核）；修复快车道由会话状态推导
@@ -491,16 +630,19 @@ GameWishingWell/
 	      │  │  │  ├─ GameBundle.kt          # 多文件运行前合并：入口 index.html + 工作区 js/css 相对引用 → 内联为自包含页面（真机/沙箱同管道）
 		      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单/辅助文件轻量校验/超大内联拆分建议）；运行校验由沙箱承担
 	      │  │  │  ├─ GameEngines.kt        # 内置引擎条件注册表（ww-engine 解析/BUNDLED/allowedFor 条件矩阵）
-	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控/eventually 期限（horizon）
-	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试 + 功能断言执行 + 画面方向断言（横板按横屏视口运行）
-      │  │  │  ├─ GameFileWorkspace.kt   # 游戏文件夹沙箱 / 版本化写入（归档统一根 .versions、嵌套路径 js__main.js 编码，归档滚动保留，init 清理散落目录，delete 同步清理版本簿记）
+	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控/eventually 期限（horizon）；写入陷阱三连（恒真/单调上界/姿态基线锚点）
+	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试：探针纯测量（EvidenceCollector）+ 轮询驱动/证据解码/引擎注入（裁决在 DeliveryGate）
+	      │  │  │  ├─ DeliveryGate.kt        # 交付门（声明式裁决表）：Evidence → Verdict 纯函数检查表（运行时错误/canvas-alive/像素多样性/方向/角落/可观测性/断言），light=错误行子集；真机事故洞逐行固化回归
+	      │  │  │  ├─ GameStaticCheck.kt     # 跨文件模块导出契约静态预检（写入时刻）：window.X=(function.. 模块的 return 导出表 vs 全工作区 X.fn( 调用点，缺失即拒（丢导出=init 即崩）
+	      │  │  │  ├─ RecentInstructionWindow.kt # 最近用户指令窗口：最近 N 条有效指令逐字注入 Agent 上下文（纯确定性轮划分+已交付标记+覆盖声明），工具模式与兼容回环共用
+      │  │  │  ├─ GameFileWorkspace.kt   # 编辑区文件沙箱 / 平写覆盖（两区模型：无版本归档；同会话加锁+hash 防并发覆盖；init 清理旧版本应用遗留的 .versions/指针/sha256 簿记）
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
       │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
 	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入（视口修复/错误捕获/内置引擎注入）
 	      │  │  │  └─ GenerationForegroundService.kt # 生成期前台服务（dataSync）：后台保活/进度通知/停止入口/wakelock
       │  │  ├─ data/
       │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage
-      │  │  │  ├─ GameRepository.kt      # 游戏库与草稿文件存储（savedGameFilePaths 递归清单供撤销；保存区拒收任何 .versions 路径并清理存量嵌套归档）
+      │  │  │  ├─ GameRepository.kt      # 保存区与草稿存储（两区模型：保存=编辑区清单整体平写+镜像删除，撤销=保存区清单整体覆盖回编辑区；会话簿记/.savepoint/log 豁免；存量版本簿记随写入清理）
       │  │  │  ├─ SecurePrefs.kt         # Keystore AES-GCM 加密偏好存储
       │  │  │  └─ SettingsRepository.kt  # LLM 配置 StateFlow 仓库
       │  │  ├─ llm/
@@ -512,10 +654,10 @@ GameWishingWell/
       │  │     ├─ WishwellApp.kt            # NavHost / 底部导航 / 路由表
       │  │     ├─ Theme.kt                  # 亮色/暗色 Material3 主题
       │  │     ├─ Container.kt              # 从 Application 获取容器
-      │  │     ├─ home/HomeScreen.kt        # 我的游戏页
+		      │  │     ├─ home/HomeScreen.kt        # 我的游戏页（卡片动效运行标识：会话 Agent Loop 运行中显示旋转 logo + 阶段）；草稿卡菜单：文件夹/删除（与成品游戏卡同款）
       │  │     ├─ chat/ChatScreen.kt        # 创作/编辑对话页
-      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复；沉浸式全屏见下）
-      │  │     ├─ files/FileBrowserScreen.kt # 文件可视系统：文件夹逐级浏览 + 文件只读查看器（可选中复制、不可编辑）
+      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复；沉浸式全屏见下；每游戏独立子域假 origin 加载——ww:save 进度存档的隔离与跨重启持久化）
+      │  │     ├─ files/FileBrowserScreen.kt # 文件可视系统：文件夹逐级浏览（games/<id> 与草稿 drafts/）+ 文件只读查看器（长按选中复制、顶栏“导出文件”SAF 另存完整内容）
       │  │     ├─ settings/SettingsScreen.kt # 设置页
       │  │     └─ viewmodels/
       │  │        ├─ HomeViewModel.kt
@@ -538,19 +680,31 @@ GameWishingWell/
          └─ llm/OpenAiClientTest.kt
       （另有 GameTools/GameValidator/GameScenario/GameEngines/GameFileWorkspace/RetryPolicy/
         SmokeProbe/SmokeRetryPolicy/LlmFailureClassifier/AgentLog/GameIntent/GamePlan/
-        GameRepository/LlmSettings/ProviderPreset/AnthropicClient 等单测，覆盖各纯逻辑模块）
+        RecentInstructionWindow/GameRepository/LlmSettings/ProviderPreset/AnthropicClient 等单测，覆盖各纯逻辑模块）
 
 六、模块与关键文件说明
 ------------------------------------------------------------
 
 Agent 日志（辅助调试材料，前端不展示）：
-- AgentLog（agent/AgentLog.kt）把 Agent Loop 运行细节写入应用私有目录
-  filesDir/agent/logs/agent.log（单文件 2MB 轮转，保留 agent.log.1~3），WishwellApplication 启动时 init；
+- AgentLog（agent/AgentLog.kt，实例级——每个 GameAgent 各持一个，多会话并发互不串台）
+  按“每回合一文件”写入游戏文件夹的 log/ 子目录：已保存游戏 filesDir/games/<id>/log/、
+  草稿 filesDir/drafts/log/（文件夹可视系统逐级浏览即可见）；
+  文件名 = 回合开始时间（yyyyMMdd_HHmmss.log，如 20260907_115400.log）；
+- 生命周期契约：日志文件只能由回合入口创建与修改——四类用户回合（发送消息/确认门确认/
+  报障修复/再试一次）统一在 markTurnStart（AgentLog.beginTurn）开新文件，生成任务收尾
+  （trackGenerationJob 的 invokeOnCompletion）关闭；回合外的零散日志一律丢弃，
+  不再有全局 agent.log 与轮转；只能随游戏删除（deleteGame/clearDraft 递归删除游戏文件夹）
+  顺带删除，无任何独立清理路径；草稿入库不是删除——saveCurrentGame 草稿分支经
+  GameRepository.adoptDraftLogs 把 drafts/log 整体迁入 games/<id>/log（历史回合日志
+  随会话延续，不随 clearDraft 消失；修复历史缺陷：入库后游戏文件夹"找不到 log"）；
+  保存/撤销/运行合并链路（writeGameFilesLocked/savedGameFilePaths/loadGameTextFiles）一律
+  排除 log/ 目录——日志不是游戏文件，不入撤销清单与内联素材；
 - 记录内容：回合开始/意图结果/路由决策、每轮 LLM 响应（文本长度+工具调用列表）、
   每个工具调用的执行结果与观察头部（300字）、契约错误全文、沙箱结果（passed/帧数/错误全文）、
   升级提示、交付成功（轮数/字节数）、失败原因（含 UI 纪律禁止展示的错误原文——仅限本地文件）、
   用户停止；scope 区分 draft / game-N 会话；
-- 获取方式：adb pull /data/data/com.gamewishingwell/files/agent/logs/（debug 包可直读）；
+- 获取方式：游戏卡/草稿卡菜单“文件夹”→ log/ 直接查看与导出，
+  或 adb pull /data/data/com.gamewishingwell/files/games/<id>/log/；
   写入 best-effort，任何日志异常不影响 Agent Loop。
 
 5.1 根工程配置
@@ -594,10 +748,12 @@ VIEWPORT_PRELUDE（视口修复 + 平台设置桥接）：
   window.__wwSetVolume(v)（0–1）与 window.__wwSetPaused(bool)。
   原生“游戏设置”面板（AlertDialog）内容：音量滑条（实时 __wwSetVolume）、
   “重新游戏”（evaluateJavascript 调全局 restart()，失败转 console.error
-  “[游戏错误] 重新游戏失败: …”）、“保存游戏”（草稿/预览显示；草稿走标题命名对话框，
-  已入库游戏的编辑预览跳过对话框直接覆盖保存且保持原名——saveCurrentGame 空标题在
-  editingId 非空时语义化为“不改名”，顺带修复旧流程按会话首条消息前 20 字默认值
-  改名已命名游戏的问题；草稿空标题仍回退会话派生默认名）、
+  “[游戏错误] 重新游戏失败: …”）、“清除存档并重开”（2026-09-15：删 ww:save 契约键后整页重载，
+  跨局最高分等记录一并归零——与“重新游戏”只重置本局保留存档相区分）、
+  “保存游戏”（草稿/预览显示；仅首次保存询问命名——
+  未命名草稿弹命名框（默认名=会话首条用户消息前 20 字），会话已绑定已命名游戏
+  （boundGameId 非空）则直接覆盖入库保持原名——saveCurrentGame 空标题在 editingId
+  非空时语义化为“不改名”。改名入口只在首页卡片菜单）、
   “继续游戏”（关闭面板）；
 - 暂停机制：包装 window.requestAnimationFrame/cancelAnimationFrame，
   __wwPaused=true 时持续重排下一帧而不回调游戏逻辑；原生设置面板打开即

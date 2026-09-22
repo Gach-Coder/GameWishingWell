@@ -90,6 +90,15 @@ class ChatViewModel(
         }
     }
 
+    /** 保存入口统一裁决：会话已绑定已命名游戏 → 直接覆盖保持原名（onDone）；
+     *  未命名草稿 → 首次保存需命名（onNeedName，UI 弹框后经 saveAs(title) 提交）。 */
+    fun saveGame(onNeedName: () -> Unit, onDone: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            agent.awaitReady()
+            if (agent.boundGameId == null) onNeedName() else onDone(agent.saveCurrentGame("") != null)
+        }
+    }
+
     fun startNew() {
         viewModelScope.launch { agent.newSession() }
     }

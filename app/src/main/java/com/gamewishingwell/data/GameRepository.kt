@@ -1,15 +1,25 @@
 package com.gamewishingwell.data
 
 import android.content.Context
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
+import java.io.FileNotFoundException
+import java.io.InputStream
+import java.io.OutputStream
 import java.security.MessageDigest
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 /**
  * 游戏库存储：
@@ -19,10 +29,11 @@ import java.security.MessageDigest
  *   编辑会话期间本仓库的游戏文件不被写入，保存按钮（overwriteGameFiles/saveGame）才把
  *   编辑区文件整体覆盖到运行区。
  *
- * HTML 写入采用“版本化文件 + 指针切换”：
- * 每次更新先把旧 index.html 归档到 .versions/<v>-index.html，再写新文件并更新
- * current.txt 指针与 .sha256 哈希；同会话由 [writeMutex] 加锁，写入前校验 hash，
- * 避免并发覆盖。对外仍然保留 index.html 作为最新可运行副本，兼容旧数据。
+ * 两区模型（2026-09-07 简化）：整个文件系统只有编辑区与保存区，相互独立、
+ * 保存/撤销即两区之间的【整体文件覆盖】（编辑区清单 → 保存区全量平写+镜像删除；
+ * 保存区清单 → 编辑区全量覆盖+多余清理；Agent 日志与会话簿记豁免）——
+ * 不保留任何历史版本归档（旧 .versions/标记/指针/sha256 存量随写入清理）。
+ * 同会话写入由 [writeMutex] 加锁串行化。
  */
 class GameRepository(private val context: Context) {
 
@@ -39,12 +50,31 @@ class GameRepository(private val context: Context) {
         /** 入口指针文件名（与 GameFileWorkspace 的 current.txt 约定一致）。 */
         const val POINTER_FILE = "current.txt"
 
-        /** 每个文件保留的历史版本数（超出部分在写入时修剪）。 */
-        const val KEEP_VERSIONS = 20
+        /**
+         * Agent 回合日志目录名（games/<id>/log 或 drafts/log）：只能由回合入口
+         * （AgentLog.beginTurn）创建写入，只随游戏/草稿删除顺带删除；
+         * 保存、撤销、运行合并等一切"游戏文件"链路一律排除该目录。
+         */
+        const val LOG_DIR = "log"
+
+        /** 文件可视系统的草稿键位：gameId 传此值时浏览/读取草稿文件夹（drafts/）。 */
+        const val DRAFT_ID = -1L
 
         /** 文件可视系统只读预览的字节上限（超出截断展示，避免超大归档拖垮渲染）。 */
         const val FILE_PREVIEW_LIMIT_BYTES = 256 * 1024
-    }    private val json = Json {
+
+        /** logcat 标签与瞬态重试间隔（文件可视系统读取失败的现场诊断）。 */
+        const val LOG_TAG = "GameRepository"
+        const val READ_RETRY_MS = 250L
+
+        /** 游戏包清单文件名（zip 根）：导出侧写入、导入侧读取标题/描述（见 [GamePackageManifest]）。 */
+        const val PACKAGE_MANIFEST = "ww_game.json"
+
+        /** 导入游戏包的解包总量上限：游戏文件夹全为文本，超限即判包异常，防超大 zip 拖垮内存。 */
+        const val IMPORT_SIZE_LIMIT_BYTES = 256L * 1024 * 1024
+    }
+
+    private val json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true
     }
@@ -54,6 +84,23 @@ class GameRepository(private val context: Context) {
     private val gamesDir: File by lazy { File(context.filesDir, "games").apply { mkdirs() } }
     private val draftsDir: File by lazy { File(context.filesDir, "drafts").apply { mkdirs() } }
     private val indexFile: File by lazy { File(context.filesDir, "games.json") }
+
+    init {
+        // 一次性迁移（幂等）：清理旧版本应用遗留的版本簿记——两区模型不再产生
+        // .versions 归档/current.txt 指针/旧版 sha256；归档只写不读，删除即收敛。
+        runCatching {
+            val roots = mutableListOf(gamesDir, draftsDir)
+            gamesDir.listFiles()?.filter { it.isDirectory }?.let { roots += it }
+            roots.forEach { dir ->
+                dir.walkTopDown().forEach { f ->
+                    when {
+                        f.isDirectory && f.name == VERSIONS_DIR -> f.deleteRecursively()
+                        f.isFile && (f.name == POINTER_FILE || f.name.endsWith(".sha256")) -> f.delete()
+                    }
+                }
+            }
+        }
+    }
 
     // ---------- 游戏库 ----------
 
@@ -123,33 +170,55 @@ class GameRepository(private val context: Context) {
     }
 
     /**
-     * 游戏文件落盘：入口文件版本化（根 .versions），其余平写；子目录自动创建。
-     * 保存区是"保存版本"本体，只接受游戏文件——任何 .versions 路径段一律拒收
-     * （历史缺陷：编辑区子目录下的归档曾穿过过滤器混进保存区，文件夹浏览器
-     * 可见且体积随保存膨胀）；落盘后清理已存在的嵌套 .versions
-     * （修复存量泄漏，归档只写不读、删除即收敛）。
+     * 游戏文件落盘（两区模型·保存区镜像写入）：编辑区清单【整体】覆盖保存区——
+     * - 清单内文件全部平写（子目录自动创建；HTML/CSS/JS 一视同仁，无任何版本化）；
+     * - 镜像删除：保存区内不在清单中的游戏文件一并移除（模型删掉 js/old.js 后保存，
+     *   保存区的 js/old.js 同步消失——整体覆盖的完整语义；会话簿记/保存点/日志豁免）；
+     * - 存量版本簿记清理：旧版本应用的 .versions 归档、current.txt 指针、*.sha256
+     *   随每次保存删除（归档只写不读，删除即收敛）。
      */
     private fun writeGameFilesLocked(dir: File, files: Map<String, String>) {
-        files[ENTRY_HTML]?.let { versionedWrite(File(dir, ENTRY_HTML), it) }
         files.forEach { (name, content) ->
-            if (name == ENTRY_HTML) return@forEach
-            if (name == POINTER_FILE || name.contains("/$VERSIONS_DIR/") || name.startsWith("$VERSIONS_DIR/")) {
+            if (name == POINTER_FILE || name.contains("/$VERSIONS_DIR/") || name.startsWith("$VERSIONS_DIR/") ||
+                name.startsWith("$LOG_DIR/") || name.contains("/$LOG_DIR/")
+            ) {
                 return@forEach
             }
             val f = File(dir, name)
             f.parentFile?.mkdirs()
             f.writeText(content, Charsets.UTF_8)
         }
-        cleanupNestedVersionsLocked(dir)
+        cleanupLegacyVersionArtifactsLocked(dir)
+        mirrorDeleteLocked(dir, files)
     }
 
-    /** 删除嵌套的 .versions 目录（归档统一在根；存量泄漏修复）。 */
-    private fun cleanupNestedVersionsLocked(dir: File) {
+    /** 镜像删除：移除保存区内不在编辑区清单中的游戏文件（簿记/保存点/日志豁免）。 */
+    private fun mirrorDeleteLocked(dir: File, files: Map<String, String>) {
         runCatching {
-            val root = dir.canonicalFile
             dir.walkTopDown()
-                .filter { it.isDirectory && it.name == VERSIONS_DIR && it.parentFile?.canonicalFile != root }
-                .forEach { it.deleteRecursively() }
+                .filter { it.isFile }
+                .forEach { f ->
+                    val rel = f.relativeTo(dir).invariantSeparatorsPath
+                    val exempt = rel == "session.json" || rel == "agent_state.json" ||
+                        rel.startsWith("$SAVEPOINT_DIR/") || rel.startsWith("$LOG_DIR/")
+                    if (!exempt && rel !in files) f.delete()
+                }
+            // 清空后的孤儿目录（如 js/ 被整个删光）一并移除
+            dir.walkTopDown().filter { it.isDirectory && it != dir }.forEach { d ->
+                if (d.listFiles().isNullOrEmpty()) d.delete()
+            }
+        }
+    }
+
+    /** 清理历史版本簿记（旧版本应用遗留；不再产生新簿记）。 */
+    private fun cleanupLegacyVersionArtifactsLocked(dir: File) {
+        runCatching {
+            dir.walkTopDown().forEach { f ->
+                when {
+                    f.isDirectory && f.name == VERSIONS_DIR -> f.deleteRecursively()
+                    f.isFile && (f.name == POINTER_FILE || f.name.endsWith(".sha256")) -> f.delete()
+                }
+            }
         }
     }
 
@@ -211,7 +280,8 @@ class GameRepository(private val context: Context) {
             .filter { rel ->
                 rel != "session.json" && rel != "agent_state.json" &&
                     rel != POINTER_FILE && !rel.endsWith(".sha256") &&
-                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$VERSIONS_DIR/")
+                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$VERSIONS_DIR/") &&
+                    !rel.startsWith("$LOG_DIR/")
             }
             .associateWith { rel -> File(dir, rel).readText(Charsets.UTF_8) }
     }
@@ -273,67 +343,226 @@ class GameRepository(private val context: Context) {
         }
     }
 
-    suspend fun touchPlay(gameId: Long) {
+    // ---------- 游戏包导出 / 导入（zip 互导自洽） ----------
+
+    /**
+     * 游戏卡菜单「导出zip」：把保存区 games/<id> 文件夹【整体】打包写入 [out]
+     * （SAF 目标 Uri 的输出流）。zip 条目相对游戏根目录——index.html / js/css 多文件 /
+     * session.json / agent_state.json / .savepoint / log 全量；根另附 [PACKAGE_MANIFEST]
+     * 清单（标题/描述来自索引）。写入失败或游戏不存在返回 false。
+     */
+    suspend fun exportGameZip(gameId: Long, out: OutputStream): Boolean =
         withContext(Dispatchers.IO) {
-            writeMutex.withLock {
-                val idx = readIndex()
-                writeIndex(
-                    GameIndex(
-                        idx.games.map {
-                            if (it.id == gameId) it.copy(playCount = it.playCount + 1) else it
-                        }
+            runCatching {
+                val dir = File(gamesDir, gameId.toString())
+                if (!dir.isDirectory) return@runCatching false
+                val meta = readIndex().games.firstOrNull { it.id == gameId }
+                ZipOutputStream(BufferedOutputStream(out)).use { zos ->
+                    // 清单置于首位：导入侧首读即得元数据
+                    zos.putNextEntry(ZipEntry(PACKAGE_MANIFEST))
+                    zos.write(
+                        json.encodeToString(
+                            GamePackageManifest(title = meta?.title.orEmpty(), description = meta?.description.orEmpty())
+                        ).toByteArray(Charsets.UTF_8)
                     )
+                    zos.closeEntry()
+                    dir.walkTopDown()
+                        .filter { it.isFile }
+                        .forEach { f ->
+                            zos.putNextEntry(ZipEntry(f.relativeTo(dir).invariantSeparatorsPath))
+                            f.inputStream().use { it.copyTo(zos) }
+                            zos.closeEntry()
+                        }
+                }
+                true
+            }.onFailure { Log.e(LOG_TAG, "exportGameZip 失败: gameId=$gameId", it) }
+                .getOrDefault(false)
+        }
+
+    /**
+     * 首页「导入」按钮：读取 [input] 的 zip（与 [exportGameZip] 同构，容错外部打包工具
+     * 的单一顶层目录前缀），解包到新 games/<新id> 并注册索引，返回新游戏元数据——
+     * 新 id 即全新会话身份，"继续编辑"按现有装载链路从保存区播种工作区，天然自洽。
+     * 结构非法（缺 index.html / 路径逃逸 / 超大小上限 / 空 zip）返回 null。
+     */
+    suspend fun importGameZip(input: InputStream): GameMeta? = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            runCatching {
+                val files = readZipEntries(input) ?: return@runCatching null
+                val manifest = files[PACKAGE_MANIFEST]
+                    ?.let { runCatching { json.decodeFromString<GamePackageManifest>(it.toString(Charsets.UTF_8)) }.getOrNull() }
+                // 清单随包只读消费，不落进游戏文件夹（否则会混入游戏文件链路——撤销清单/运行合并素材）
+                val gameFiles = files - PACKAGE_MANIFEST
+                if (gameFiles[ENTRY_HTML] == null) return@runCatching null
+                var id = System.currentTimeMillis()
+                while (File(gamesDir, id.toString()).exists()) id++
+                val dir = File(gamesDir, id.toString()).apply { mkdirs() }
+                gameFiles.forEach { (rel, bytes) ->
+                    val target = File(dir, rel)
+                    target.parentFile?.mkdirs()
+                    target.writeBytes(bytes)
+                }
+                val meta = GameMeta(
+                    id = id,
+                    title = manifest?.title?.trim()?.takeIf { it.isNotEmpty() } ?: "导入的游戏",
+                    description = manifest?.description.orEmpty(),
+                    createdAt = id,
+                    updatedAt = id
                 )
-            }
+                writeIndex(GameIndex(readIndex().games + meta))
+                meta
+            }.onFailure { Log.e(LOG_TAG, "importGameZip 失败", it) }
+                .getOrNull()
         }
     }
+
+    /**
+     * 解包 zip 为「相对路径 → 字节」映射（导入侧私有，防御性解析）：
+     * - 名称规范化为 '/' 分隔；绝对路径或含 ".." 段的条目直接判包非法（防解包逃逸）；
+     * - 剥去可选的【单一顶层目录】前缀——外部工具按"打包文件夹"方式产出
+     *   "123/index.html" 形态；我们自己的导出顶层即根文件（index.html 等），不受影响；
+     * - 过滤旧版版本簿记（.versions 归档、current.txt 指针、sha256 校验文件，与保存链路同口径）；
+     * - 解包总量超过 [IMPORT_SIZE_LIMIT_BYTES] 判非法。任一防御失败返回 null。
+     */
+    private fun readZipEntries(input: InputStream): Map<String, ByteArray>? {
+        val raw = mutableListOf<Pair<String, ByteArray>>()
+        var total = 0L
+        ZipInputStream(BufferedInputStream(input)).use { zis ->
+            while (true) {
+                val ze = zis.nextEntry ?: break
+                if (ze.isDirectory) continue
+                val name = ze.name.replace('\\', '/').removePrefix("./")
+                if (name.isEmpty() || name.startsWith("/") || name.split('/').any { it == ".." || it.isEmpty() }) {
+                    return null
+                }
+                val bytes = zis.readBytes()
+                total += bytes.size
+                if (total > IMPORT_SIZE_LIMIT_BYTES) return null
+                raw += name to bytes
+            }
+        }
+        if (raw.isEmpty()) return null
+        val prefix = raw.first().first.substringBefore('/', "")
+        val hasCommonTopDir = prefix.isNotEmpty() && raw.all { (p, _) ->
+            p.length > prefix.length && p[prefix.length] == '/' && p.substringBefore('/', "") == prefix
+        }
+        val entries = if (hasCommonTopDir) raw.map { (p, b) -> p.removePrefix("$prefix/") to b } else raw
+        return entries
+            .filterNot { (rel, _) -> isLegacyArtifact(rel) }
+            .toMap()
+    }
+
+    /** 旧版版本簿记判定（导入过滤用）：.versions 目录、current.txt 指针、*.sha256 校验。 */
+    private fun isLegacyArtifact(rel: String): Boolean =
+        rel.split('/').any { it == VERSIONS_DIR || it == POINTER_FILE } || rel.endsWith(".sha256")
 
     /**
      * 文件可视系统：列出游戏存储文件夹（games/<id>）内 [relativePath] 子目录的一级条目
      * （空串 = 根目录）——子目录在前、其余按名称排序；路径经规范化校验不得逃出游戏目录。
      */
+    /**
+     * 文件可视系统：列出游戏存储文件夹（games/<id>；gameId=[DRAFT_ID] 时为草稿文件夹
+     * drafts/）内 [relativePath] 子目录的一级条目（空串 = 根目录）——子目录在前、
+     * 其余按名称排序；路径经规范化校验不得逃出游戏目录。
+     */
     suspend fun listGameFiles(gameId: Long, relativePath: String = ""): List<GameFileEntry> =
         withContext(Dispatchers.IO) {
             val dir = resolveInGameDir(gameId, relativePath) ?: return@withContext emptyList()
             if (!dir.isDirectory) return@withContext emptyList()
-            dir.listFiles()
-                ?.map { f ->
-                    GameFileEntry(
-                        name = f.name,
-                        isDirectory = f.isDirectory,
-                        sizeBytes = if (f.isFile) f.length() else 0L,
-                        childCount = if (f.isDirectory) f.listFiles()?.size ?: 0 else 0,
-                        lastModified = f.lastModified()
-                    )
-                }
-                ?.sortedWith(compareByDescending<GameFileEntry> { it.isDirectory }.thenBy { it.name })
-                ?: emptyList()
+            runCatching {
+                dir.listFiles()
+                    ?.map { f ->
+                        GameFileEntry(
+                            name = f.name,
+                            isDirectory = f.isDirectory,
+                            sizeBytes = if (f.isFile) f.length() else 0L,
+                            childCount = if (f.isDirectory) f.listFiles()?.size ?: 0 else 0,
+                            lastModified = f.lastModified()
+                        )
+                    }
+                    ?.sortedWith(compareByDescending<GameFileEntry> { it.isDirectory }.thenBy { it.name })
+                    ?: emptyList()
+            }.getOrDefault(emptyList())
         }
 
     /**
      * 文件可视系统：只读打开游戏目录内一个文本文件（查看与复制用，无任何写入路径）。
-     * 目标是目录、文件不存在或路径逃出游戏目录（../ 等）一律返回 null；
+     * 目标是目录、文件不存在或路径逃出游戏目录（../ 等）时抛 [FileNotFoundException]
+     * （携带现场上下文：根目录、目标判定、同级条目——真机排查"全部文件无法打开"用）；
      * 内容超过 [FILE_PREVIEW_LIMIT_BYTES] 截断预览；含 NUL 字节判为二进制不做文本展示。
+     *
+     * 瞬态加固：IO 异常（并发写入/文件重建的瞬时窗口）延迟 250ms 重试一次；
+     * 最终失败 Log.e（logcat tag=GameRepository）。
      */
-    suspend fun readGameFile(gameId: Long, relativePath: String): GameFileContent? =
+    suspend fun readGameFile(gameId: Long, relativePath: String): GameFileContent =
         withContext(Dispatchers.IO) {
-            val file = resolveInGameDir(gameId, relativePath) ?: return@withContext null
-            if (!file.isFile) return@withContext null
-            val size = file.length()
-            val truncated = size > FILE_PREVIEW_LIMIT_BYTES
-            val bytes = file.inputStream().use { it.readNBytes(FILE_PREVIEW_LIMIT_BYTES) }
-            val binary = bytes.indexOf(0.toByte()) >= 0
-            // 截断点可能切在多字节序列中间，解码尾部至多出现一个替换符，展示前去掉
-            val text = if (binary) "" else String(bytes, Charsets.UTF_8).let { if (truncated) it.trimEnd('\uFFFD') else it }
-            GameFileContent(
-                name = file.name,
-                relativePath = relativePath,
-                sizeBytes = size,
-                lastModified = file.lastModified(),
-                text = text,
-                truncated = truncated,
-                binary = binary
+            runCatching { readGameFileOnce(gameId, relativePath) }
+                .recoverCatching {
+                    delay(READ_RETRY_MS)
+                    readGameFileOnce(gameId, relativePath)
+                }
+                .onFailure {
+                    Log.e(LOG_TAG, "readGameFile 失败: gameId=$gameId path=$relativePath", it)
+                }
+                .getOrThrow()
+        }
+
+    private fun readGameFileOnce(gameId: Long, relativePath: String): GameFileContent {
+        val root = rootDirFor(gameId)
+        val file = resolveInGameDir(gameId, relativePath)
+            ?: throw FileNotFoundException(
+                "路径不可读（不存在/逃逸/根目录缺失）: path=$relativePath, root=${root.absolutePath}, " +
+                    "rootIsDir=${root.isDirectory}, siblings=${root.listFiles()?.size ?: -1}"
             )
+        if (!file.isFile) {
+            throw FileNotFoundException(
+                "目标不是文件: path=$relativePath, exists=${file.exists()}, isDir=${file.isDirectory}, " +
+                    "canRead=${file.canRead()}, root=${root.absolutePath}, siblings=${root.listFiles()?.size ?: -1}"
+            )
+        }
+        val size = file.length()
+        val truncated = size > FILE_PREVIEW_LIMIT_BYTES
+        // 有界读取（minSdk 26 兼容）：readNBytes(Int) 是 Java 11 API，Android API 33-
+        // 真机直接 NoSuchMethodError（实测：低版本手机全部文件"无法打开"的根因）。
+        // 用 read(byte[], off, len) 循环复制，语义与 readNBytes(limit) 等价：至多 limit 字节。
+        val bytes = file.inputStream().use { ins ->
+            val out = java.io.ByteArrayOutputStream(minOf(size, FILE_PREVIEW_LIMIT_BYTES.toLong()).toInt().coerceAtLeast(0))
+            val buf = ByteArray(8 * 1024)
+            var total = 0
+            while (total < FILE_PREVIEW_LIMIT_BYTES) {
+                val n = ins.read(buf, 0, minOf(buf.size, FILE_PREVIEW_LIMIT_BYTES - total))
+                if (n < 0) break
+                out.write(buf, 0, n)
+                total += n
+            }
+            out.toByteArray()
+        }
+        val binary = bytes.indexOf(0.toByte()) >= 0
+        // 截断点可能切在多字节序列中间，解码尾部至多出现一个替换符，展示前去掉
+        val text = if (binary) "" else String(bytes, Charsets.UTF_8).let { if (truncated) it.trimEnd('\uFFFD') else it }
+        return GameFileContent(
+            name = file.name,
+            relativePath = relativePath,
+            sizeBytes = size,
+            lastModified = file.lastModified(),
+            text = text,
+            truncated = truncated,
+            binary = binary
+        )
+    }
+
+    /**
+     * 文件可视系统「导出文件」的源数据：完整文件字节（不截断、二进制原样），
+     * 供系统 SAF 另存到用户选择的位置；目标消失或路径非法返回 null。
+     */
+    suspend fun readGameFileBytes(gameId: Long, relativePath: String): ByteArray? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val file = resolveInGameDir(gameId, relativePath) ?: return@runCatching null
+                if (!file.isFile) null else file.readBytes()
+            }.onFailure {
+                Log.e(LOG_TAG, "readGameFileBytes 失败: gameId=$gameId path=$relativePath", it)
+            }.getOrNull()
         }
 
     /**
@@ -351,28 +580,34 @@ class GameRepository(private val context: Context) {
                 rel != POINTER_FILE && !rel.endsWith(".sha256") &&
                     rel != "session.json" && rel != "agent_state.json" &&
                     !rel.startsWith("$VERSIONS_DIR/") && !rel.contains("/$VERSIONS_DIR/") &&
-                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.contains("/$SAVEPOINT_DIR/")
+                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.contains("/$SAVEPOINT_DIR/") &&
+                    !rel.startsWith("$LOG_DIR/") && !rel.contains("/$LOG_DIR/")
             }
             .sorted()
             .toList()
     }
 
-    /** 把游戏目录内相对路径解析为 File：规范化后必须仍位于 games/<id> 之下，防 ../ 逃逸。 */
-    private fun resolveInGameDir(gameId: Long, relativePath: String): File? {
-        val dir = File(gamesDir, gameId.toString())
-        if (!dir.isDirectory) return null
+    /** 浏览目标根目录：正 id = games/<id>，[DRAFT_ID] = 草稿文件夹 drafts/。 */
+    internal fun rootDirFor(gameId: Long): File =
+        if (gameId == DRAFT_ID) draftsDir else File(gamesDir, gameId.toString())
+
+    /** 把游戏目录内相对路径解析为 File：规范化后必须仍位于游戏根目录之下，防 ../ 逃逸。 */
+    private fun resolveInGameDir(gameId: Long, relativePath: String): File? = runCatching {
+        val dir = rootDirFor(gameId)
+        if (!dir.isDirectory) return@runCatching null
         val root = dir.canonicalPath + File.separator
         val target = File(dir, relativePath)
-        return if (target.canonicalPath == dir.canonicalPath || target.canonicalPath.startsWith(root)) target else null
-    }
+        if (target.canonicalPath == dir.canonicalPath || target.canonicalPath.startsWith(root)) target else null
+    }.getOrNull()
 
     // ---------- 草稿 ----------
 
     suspend fun saveDraft(html: String, session: List<ChatMessage>) {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
-                versionedWrite(File(draftsDir, "latest.html"), html)
+                File(draftsDir, "latest.html").writeText(html, Charsets.UTF_8)
                 File(draftsDir, "session.json").writeText(json.encodeToString(session), Charsets.UTF_8)
+                cleanupLegacyVersionArtifactsLocked(draftsDir)
             }
         }
     }
@@ -413,50 +648,72 @@ class GameRepository(private val context: Context) {
             File(draftsDir, "agent_state.json").exists()
     }
 
+    /**
+     * 首页"未同步新版本"标记的磁盘来源：冷启动时 GameAgent 尚未实例化（首页不装载
+     * 会话），持久化在 agent_state.json 的 unsavedVersion 字段只能直接扫描读取；
+     * 正则容忍键值间空白（kotlinx 输出紧凑、手工/其他序列化器可能带空格）。
+     */
+    private val unsavedFlagRegex = Regex("\"unsavedVersion\"\\s*:\\s*true")
+
+    suspend fun hasDraftUnsaved(): Boolean = withContext(Dispatchers.IO) {
+        File(draftsDir, "agent_state.json")
+            .takeIf { it.exists() }?.readText(Charsets.UTF_8)
+            ?.let { unsavedFlagRegex.containsMatchIn(it) } == true
+    }
+
+    suspend fun listUnsavedGameIds(): Set<Long> = withContext(Dispatchers.IO) {
+        gamesDir.listFiles { f -> f.isDirectory }
+            ?.mapNotNull { dir ->
+                val id = dir.name.toLongOrNull() ?: return@mapNotNull null
+                val state = File(dir, "agent_state.json")
+                if (state.exists() && unsavedFlagRegex.containsMatchIn(state.readText(Charsets.UTF_8))) id else null
+            }
+            ?.toSet() ?: emptySet()
+    }
+
     suspend fun clearDraft() {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
                 File(draftsDir, "latest.html").delete()
+                File(draftsDir, "latest.html.sha256").delete()
                 File(draftsDir, "session.json").delete()
                 File(draftsDir, "agent_state.json").delete()
                 File(draftsDir, ".versions").deleteRecursively()
                 File(draftsDir, "current.txt").delete()
+                // 草稿日志随草稿删除顺带删除（日志无独立清理路径）
+                File(draftsDir, LOG_DIR).deleteRecursively()
+            }
+        }
+    }
+
+    /**
+     * 草稿入库时的回合日志迁移：drafts/log → games/<id>/log。
+     * 入库不是删除——日志只能随游戏删除顺带删除，草稿期的历史回合日志应随会话
+     * 带进游戏文件夹（否则 clearDraft 会把它们连带删掉，游戏文件夹"找不到 log"）；
+     * 目标已存在同名文件（防御，正常不可能）时逐文件加序号合并。
+     */
+    suspend fun adoptDraftLogs(gameId: Long) {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val src = File(draftsDir, LOG_DIR)
+                if (!src.isDirectory || src.listFiles().isNullOrEmpty()) return@runCatching
+                val dst = File(File(gamesDir, gameId.toString()), LOG_DIR)
+                if (!dst.exists()) {
+                    src.renameTo(dst)
+                } else {
+                    src.listFiles()?.forEach { f ->
+                        var target = File(dst, f.name)
+                        var seq = 1
+                        while (target.exists()) target = File(dst, "${f.nameWithoutExtension}_${++seq}.log")
+                        f.renameTo(target)
+                    }
+                    src.deleteRecursively()
+                }
             }
         }
     }
 
     // ---------- 内部 ----------
-
-    /**
-     * 版本化写入：旧文件归档到 .versions/<v>-index.html，更新
-     * .versions/index.html.version（版本号）和 current.txt（指针），最后落盘 sha256。
-     * 归档滚动保留最近 [KEEP_VERSIONS] 个——保存区版本只用于人工排查，
-     * 不修剪会在反复保存后无限膨胀。
-     */
-    private fun versionedWrite(file: File, content: String) {
-        file.parentFile?.mkdirs()
-        val versionsDir = File(file.parentFile, ".versions").apply { mkdirs() }
-        val marker = File(versionsDir, "${file.name}.version")
-        val currentVersion = marker.takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull() ?: 0
-        if (file.isFile) {
-            val previous = File(versionsDir, "$currentVersion-${file.name}")
-            previous.writeBytes(file.readBytes())
-        }
-        val next = currentVersion + 1
-        file.writeText(content, Charsets.UTF_8)
-        marker.writeText(next.toString(), Charsets.UTF_8)
-        File(file.parentFile, "current.txt").writeText(file.name, Charsets.UTF_8)
-        File(file.parentFile, "${file.name}.sha256").writeText(sha256(content), Charsets.UTF_8)
-        if (next > KEEP_VERSIONS) {
-            val minKeep = next - KEEP_VERSIONS
-            versionsDir.listFiles()?.forEach { archived ->
-                val v = archived.name.substringBefore('-', "").toIntOrNull()
-                if (v != null && v < minKeep && archived.name.endsWith("-${file.name}")) {
-                    archived.delete()
-                }
-            }
-        }
-    }
 
     private fun sha256(content: String): String =
         MessageDigest.getInstance("SHA-256").digest(content.toByteArray(Charsets.UTF_8))

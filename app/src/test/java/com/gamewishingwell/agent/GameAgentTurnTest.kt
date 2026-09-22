@@ -2,6 +2,7 @@ package com.gamewishingwell.agent
 
 import android.content.Context
 import android.content.res.AssetManager
+import com.gamewishingwell.data.ChatMessage
 import com.gamewishingwell.data.GameRepository
 import com.gamewishingwell.data.LlmSettings
 import com.gamewishingwell.data.SettingsRepository
@@ -10,8 +11,13 @@ import com.gamewishingwell.llm.LlmClient
 import com.gamewishingwell.llm.LlmResponse
 import com.gamewishingwell.llm.Protocol
 import com.gamewishingwell.llm.ToolSpec
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
@@ -49,6 +55,34 @@ class GameAgentTurnTest {
             onToolCallDelta: (Int) -> Unit
         ): LlmResponse {
             calls += messages to tools
+            val step = queue.removeFirstOrNull() ?: LlmResponse("", emptyList())
+            if (step is Exception) throw step
+            step as LlmResponse
+            onDelta(step.text)
+            onDone()
+            return step
+        }
+    }
+
+    /** 门控脚本客户端：指定调用序号挂起（gate.await）直至 release——用于在回合中途
+     *  稳定观察"Agent Loop 进行中"的跨实例聚合状态（runState），不受真实时序抖动影响。 */
+    private class GatedLlmClient(steps: List<Any>, vararg gateAt: Int) : LlmClient {
+        override val protocol: Protocol = Protocol.OPENAI_COMPATIBLE
+        private val queue = ArrayDeque(steps)
+        private val gates = gateAt.associateWith { CompletableDeferred<Unit>() }
+        private var call = 0
+
+        fun release(step: Int) { gates[step]?.complete(Unit) }
+
+        override suspend fun streamChat(
+            messages: List<com.gamewishingwell.data.ChatMessage>,
+            onDelta: (String) -> Unit,
+            onThinking: (String) -> Unit,
+            onDone: () -> Unit,
+            tools: List<ToolSpec>,
+            onToolCallDelta: (Int) -> Unit
+        ): LlmResponse {
+            gates[call++]?.await()
             val step = queue.removeFirstOrNull() ?: LlmResponse("", emptyList())
             if (step is Exception) throw step
             step as LlmResponse
@@ -139,7 +173,6 @@ function restart(){}
             MutableStateFlow(LlmSettings(apiKey = "k", baseUrl = "http://localhost/v1", model = "m"))
         )
         `when`(settings.isConfigured()).thenReturn(true)
-        AgentLog.initDir(File(dir, "logs"))
         return GameAgent(
             appContext = context,
             repository = GameRepository(context),
@@ -293,6 +326,12 @@ function restart(){}
         // 首次保存（草稿入库）：显式命名
         val m1 = agent.saveCurrentGame("星域塔防")
         assertEquals("星域塔防", m1?.title)
+        // 草稿期回合日志随入库迁进游戏文件夹（不再随 clearDraft 消失）
+        assertTrue(
+            "游戏文件夹应有回合日志",
+            File(dir, "games/${m1?.id}/log").listFiles().orEmpty().isNotEmpty()
+        )
+        assertFalse(File(dir, "drafts/log").exists())
 
         // 已有游戏的旧版本（已命名）：空标题直接保存 = 保持原名，不弹重命名
         val m2 = agent.saveCurrentGame("")
@@ -323,6 +362,65 @@ function restart(){}
     }
 
     @Test
+    fun `草稿首回合运行中已落盘使首页卡片可见且停止后对话保留`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-draftvis-${System.nanoTime()}")
+        val context = mock(Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        val assets = mock(AssetManager::class.java)
+        `when`(assets.open(anyString())).thenReturn(ByteArrayInputStream("<html>template</html>".toByteArray()))
+        `when`(context.assets).thenReturn(assets)
+        val settings = mock(SettingsRepository::class.java)
+        `when`(settings.settings).thenReturn(
+            MutableStateFlow(LlmSettings(apiKey = "k", baseUrl = "http://localhost/v1", model = "m"))
+        )
+        `when`(settings.isConfigured()).thenReturn(true)
+        val repo = GameRepository(context)
+        // 第 0 次 LLM 调用（识别层 Lite 复核）挂起：回合稳定停在"运行中"
+        val client = GatedLlmClient(emptyList(), 0)
+        val agent = newAgent(dir, client = client)
+        val sendJob = launch { agent.sendUserMessage("做一个塔防游戏", qualityTier = "fast") }
+        withTimeout(10_000) { while (!agent.session.value.isGenerating) yield() }
+        // 首回合发送即落盘：整个回合期间 drafts/ 有簿记文件（首页 hasDraft 为 true，
+        // 草稿卡片显示——历史缺陷：落盘点全在回合结束态，首回合运行中卡片消失）。
+        // 落盘在 IO 线程异步完成，轮询等待而非立即断言。
+        withTimeout(10_000) { while (!File(dir, "drafts/session.json").exists()) yield() }
+        assertTrue(repo.hasDraft())
+        agent.stopGeneration()
+        sendJob.join()
+        // 停止即落盘：中断后的对话保留（重启后 loadDraftSession 可回显）
+        assertTrue(File(dir, "drafts/session.json").readText(Charsets.UTF_8).contains("塔防"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `陈旧的生成中持久化态装载时复位避免会话锁死`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-stale-${System.nanoTime()}")
+        val context = mock(Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        val assets = mock(AssetManager::class.java)
+        `when`(assets.open(anyString())).thenReturn(ByteArrayInputStream("<html>template</html>".toByteArray()))
+        `when`(context.assets).thenReturn(assets)
+        val settings = mock(SettingsRepository::class.java)
+        `when`(settings.settings).thenReturn(
+            MutableStateFlow(LlmSettings(apiKey = "k", baseUrl = "http://localhost/v1", model = "m"))
+        )
+        `when`(settings.isConfigured()).thenReturn(true)
+        val repo = GameRepository(context)
+        repo.saveDraft("<html>x</html>", listOf(ChatMessage("user", "旧消息")))
+        // 模拟进程在回合中途被杀：agent_state 持久化为"生成中"（发送即落盘后会出现）
+        repo.saveDraftAgentState("""{"isGenerating":true,"agentStage":"代码生成中","currentHtml":"<html>x</html>"}""")
+        val agent = newAgent(dir, client = ScriptedLlmClient(emptyList()))
+        agent.loadDraftSession()
+        assertFalse("陈旧生成态必须复位", agent.session.value.isGenerating)
+        // 复位后新回合不被 isGenerating 闸门拒绝（否则会话被永久锁死）
+        agent.sendUserMessage("这个游戏能联机吗")
+        assertFalse(agent.session.value.isGenerating)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
     fun `会话身份固定拒绝跨会话切换与重置`() = runBlocking {
         val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-pinned-${System.nanoTime()}")
         val script = ScriptedLlmClient(emptyList())
@@ -332,10 +430,12 @@ function restart(){}
         agent.loadGameSession(9)
         agent.loadDraftSession()
         agent.newSession()
-        val log = File(dir, "logs/agent.log").readText()
-        assertTrue("拒绝装载他游戏会话", log.contains("ignore loadGameSession(9): pinned to game-7"))
-        assertTrue("拒绝退回草稿装载", log.contains("ignore loadDraftSession: pinned to game-7"))
-        assertTrue("拒绝清空重置", log.contains("ignore newSession: pinned to game-7"))
+        assertTrue("身份保持 pinned 到 game-7", agent.boundGameId == 7L)
+        // 日志只能由回合入口创建：回合外的会话管理不产生任何日志文件
+        assertTrue(
+            "回合外不产生日志文件",
+            File(dir, "games/7/log").listFiles().isNullOrEmpty()
+        )
         dir.deleteRecursively()
         Unit
     }
@@ -353,7 +453,6 @@ function restart(){}
             MutableStateFlow(com.gamewishingwell.data.LlmSettings(apiKey = "k", baseUrl = "http://localhost/v1", model = "m"))
         )
         `when`(settings.isConfigured()).thenReturn(true)
-        AgentLog.initDir(File(dir, "logs"))
         val script = ScriptedLlmClient(
             listOf(
                 LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
@@ -374,6 +473,76 @@ function restart(){}
         // 同一实例以 game-<id> 续作（编辑上下文不中断）；草稿键位让位给新会话
         assertSame(draftAgent, hub.agentFor(meta.id))
         assertNotSame(draftAgent, hub.agentFor(null))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `会话运行视图随回合起止在草稿与游戏键位间切换`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-runstate-${System.nanoTime()}")
+        val context = mock(android.content.Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        val assets = mock(android.content.res.AssetManager::class.java)
+        `when`(assets.open(anyString())).thenReturn(ByteArrayInputStream("<html>template</html>".toByteArray()))
+        `when`(context.assets).thenReturn(assets)
+        val settings = mock(com.gamewishingwell.data.SettingsRepository::class.java)
+        `when`(settings.settings).thenReturn(
+            MutableStateFlow(com.gamewishingwell.data.LlmSettings(apiKey = "k", baseUrl = "http://localhost/v1", model = "m"))
+        )
+        `when`(settings.isConfigured()).thenReturn(true)
+        val htmlB = validHtml.replace("score: 0", "score: 1")
+        fun write(content: String) = LlmResponse(
+            "", toolCalls = listOf(
+                ToolCallData("c-${content.hashCode()}", "writefile", """{"path":"index.html","content":${jsonStr(content)}}""")
+            )
+        )
+        // gate 1 挂起草稿回合的代码生成轮（识别响应之后），gate 3 挂起入库重挂
+        // game-<id> 键位后的编辑回合首轮——两次挂起点各自稳定暴露"运行中"视图。
+        val client = GatedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                write(validHtml),
+                LlmResponse("完成"),
+                write(htmlB),
+                LlmResponse("完成")
+            ),
+            1, 3
+        )
+        val hub = AgentHub(context, GameRepository(context), settings, injectedClientFactory = { client })
+        val draft = hub.agentFor(null)
+        draft.awaitReady()
+        assertNull("开局无会话运行", hub.runState.value.draftStage)
+        assertTrue("开局游戏运行视图为空", hub.runState.value.gameStages.isEmpty())
+
+        val turn1 = launch { draft.sendUserMessage("做一个我的世界游戏", qualityTier = "fast") }
+        withTimeout(10_000) { while (hub.runState.value.draftStage == null) { yield(); delay(10) } }
+        val mid = hub.runState.value
+        assertTrue("草稿运行中应有阶段文案，实际 ${mid.draftStage}", mid.draftStage != null && mid.draftStage != AgentStage.IDLE)
+        assertTrue("此时无游戏会话运行", mid.gameStages.isEmpty())
+        client.release(1)
+        turn1.join()
+
+        // 交付即"有未保存新版本"（首页同色 "!"），保存后消失
+        withTimeout(10_000) { while (!hub.runState.value.draftUnsaved) { yield(); delay(10) } }
+        withTimeout(10_000) { while (hub.runState.value.draftStage != null) { yield(); delay(10) } }
+        val meta = draft.saveCurrentGame("运行态") ?: throw AssertionError("保存失败")
+        withTimeout(10_000) { while (hub.runState.value.draftUnsaved) { yield(); delay(10) } }
+
+        val turn2 = launch { draft.sendUserMessage("把分数调整一下", qualityTier = "fast") }
+        withTimeout(10_000) { while (hub.runState.value.gameStages[meta.id] == null) { yield(); delay(10) } }
+        val mid2 = hub.runState.value
+        assertTrue(
+            "入库后同实例应挂在 game 键位运行，实际 ${mid2.gameStages}",
+            mid2.gameStages[meta.id] != null && mid2.gameStages[meta.id] != AgentStage.IDLE
+        )
+        assertNull("草稿键位已让位给新会话", mid2.draftStage)
+        client.release(3)
+        turn2.join()
+        withTimeout(10_000) { while (hub.runState.value.gameStages.isNotEmpty()) { yield(); delay(10) } }
+        // 入库后的第二次交付：unsaved 挂在 game 键位（草稿键位恒 false）
+        withTimeout(10_000) { while (meta.id !in hub.runState.value.gameUnsaved) { yield(); delay(10) } }
+        assertFalse(hub.runState.value.draftUnsaved)
+        hub.shutdown()
         dir.deleteRecursively()
         Unit
     }
@@ -505,6 +674,131 @@ function restart(){}
         val allText = script.calls.last().first.joinToString(" ") { it.content }
         assertTrue("首次应为咨询式通知", allText.contains("可能因部分文件尚未写完"))
         assertTrue("同错复现应升级为正式反馈", allText.contains("连续两次发现同样错误"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `重写模块丢失导出成员被写入时刻拒绝并点名`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-export-${System.nanoTime()}")
+        // 我的世界事故形态：touch.js 重写丢 setUI 导出，main.js 的 Input.setUI 调用
+        // 让游戏一启动即崩——写入时刻的跨文件导出契约必须拒绝并指名缺失成员。
+        val touchFull = """
+            window.Input = (function(){
+              var uic = null;
+              function setUI(c){ uic = c; }
+              return { setUI: setUI, bind: function(){} };
+            })();
+        """.trimIndent()
+        val touchMissing = touchFull.replace("setUI: setUI, ", "")
+        val mainJs = "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\n" +
+            "function restart(){}\n" +
+            "(function(){ setTimeout(function(){ Input.setUI(document.createElement('canvas')); }, 30); })();"
+        val entryHtml = """<!DOCTYPE html><html><head>
+<link rel="stylesheet" href="css/style.css">
+</head><body><script src="js/touch.js"></script><script src="js/main.js"></script></body></html>"""
+        fun wcall(path: String, content: String) = ToolCallData(
+            "c-${path.hashCode()}-${content.hashCode()}", "writefile",
+            """{"path":"$path","content":${jsonStr(content)}}"""
+        )
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-css", "writefile", """{"path":"css/style.css","content":${jsonStr("body{margin:0}")}}"""),
+                        wcall("js/touch.js", touchFull),
+                        wcall("js/main.js", mainJs),
+                        wcall("index.html", entryHtml)
+                    )
+                ),
+                LlmResponse("", toolCalls = listOf(wcall("js/touch.js", touchMissing))), // 丢 setUI 的重写：应被拒绝
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+
+        // 拒绝信息回填给了模型（第 4 次请求历史可见），且指名模块/成员/调用方
+        val lastRequest = script.calls[3].first
+        assertTrue(
+            "应包含导出契约拒绝信息",
+            lastRequest.any { it.content.contains("跨文件模块导出契约被破坏") && it.content.contains("Input.setUI") }
+        )
+        // 文件未被改动：磁盘上的 touch.js 仍含 setUI 导出
+        val onDisk = File(File(dir, "agent/workspace/draft"), "js/touch.js").readText()
+        assertTrue("被拒写入不得落盘", onDisk.contains("setUI: setUI"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `回合累计全量重写达到三次注入咨询提示`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-advise-${System.nanoTime()}")
+        val entryHtml = """<!DOCTYPE html><html lang="zh"><head>
+<link rel="stylesheet" href="css/style.css">
+</head><body><script src="js/main.js"></script></body></html>"""
+        val jsContent = "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
+        val cssContent = "body{margin:0;background:#111}"
+        fun wcall(path: String, content: String) = ToolCallData(
+            "c-${path.hashCode()}-${content.hashCode()}", "writefile",
+            """{"path":"$path","content":${jsonStr(content)}}"""
+        )
+        // 快照式记录（不可变副本）：calls 逐轮状态不被后续折叠污染
+        class SnapClient(steps: List<Any>) : LlmClient {
+            override val protocol: Protocol = Protocol.OPENAI_COMPATIBLE
+            private val queue = ArrayDeque(steps)
+            val calls = mutableListOf<List<com.gamewishingwell.data.ChatMessage>>()
+            override suspend fun streamChat(
+                messages: List<com.gamewishingwell.data.ChatMessage>,
+                onDelta: (String) -> Unit,
+                onThinking: (String) -> Unit,
+                onDone: () -> Unit,
+                tools: List<ToolSpec>,
+                onToolCallDelta: (Int) -> Unit
+            ): LlmResponse {
+                calls += messages.toList()
+                val step = queue.removeFirstOrNull() ?: LlmResponse("", emptyList())
+                if (step is Exception) throw step
+                step as LlmResponse
+                onDelta(step.text)
+                onDone()
+                return step
+            }
+        }
+        val script = SnapClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        wcall("css/style.css", cssContent),
+                        wcall("js/main.js", jsContent),
+                        wcall("index.html", entryHtml)
+                    )
+                ),
+                LlmResponse("完成"),
+                // 第二回合入口的意图二分类（dev/chat），其后才是循环轮
+                LlmResponse("""{"intent":"dev","confidence":0.9,"reason":"改进诉求"}"""),
+                // 三次小改幅度的全量覆盖（均高于重写护栏相似度阈值）
+                LlmResponse("", toolCalls = listOf(wcall("css/style.css", cssContent.replace("#111", "#222")))),
+                LlmResponse("", toolCalls = listOf(wcall("js/main.js", jsContent.replace("score: 0", "score: 1")))),
+                LlmResponse("", toolCalls = listOf(wcall("index.html", entryHtml.replace("lang=\"zh\"", "lang=\"en\"")))),
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        agent.sendUserMessage("微调一下画面", qualityTier = "fast")
+
+        // 第三次覆盖（index.html）的观察附咨询提示；前两次不附
+        assertTrue(
+            "第三次全量覆盖应附咨询提示；n=${script.calls.size} 全部调用工具结果=" +
+                script.calls.mapIndexed { i, c ->
+                    "[$i]" + c.filter { it.role == "tool" }.joinToString("|") { it.content?.take(45) ?: "" }
+                }.joinToString(" ;; "),
+            script.calls[7].any { it.content.contains("全量重写提示") && it.content.contains("editfile") }
+        )
+        assertFalse("第二次覆盖不应提示", script.calls[6].any { it.content.contains("全量重写提示") })
         dir.deleteRecursively()
         Unit
     }

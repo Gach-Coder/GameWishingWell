@@ -69,9 +69,11 @@ function update(dt){
       score++;
       document.getElementById('score').textContent = score;
       beep(660);
+      saveProgress(score); // 对局进行中随进度落盘（退出重进从这里继续）
       balls.splice(i, 1);
     } else if (b.y - b.r > H) {
       over = true;
+      saveProgress(0); // 对局结束：对局部分归零、只留最高分，下次全新开局
     }
   }
 }
@@ -86,7 +88,7 @@ function draw(){
   }
   if (over) {
     ctx.fillStyle = '#fff'; ctx.font = '24px system-ui,sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('游戏结束，得分 ' + score, W/2, H/2);
+    ctx.fillText('游戏结束，得分 ' + score + '（最高 ' + best + '）', W/2, H/2);
   }
 }
 
@@ -95,6 +97,7 @@ function restart(){
   score = 0; over = false; balls = [];
   px = W / 2;
   document.getElementById('score').textContent = '0';
+  saveProgress(0); // 本局重置＝对局部分归零（best 保留）
 }
 
 // —— 可观测性契约：沙箱据此做自动不变量检查（负血量/NaN/实体泄漏/重开残留）——
@@ -106,6 +109,22 @@ window.__wwDebugState = function(){
     player: { x: Math.round(px), y: Math.round(py) }
   };
 };
+
+// —— 进度存档契约：localStorage 固定键 ww:save（防御性读写，永不报错）——
+// 对局状态（score）随进度连续落盘，重进从存档分数继续；结算/重开后对局部分归零、只留 best。
+var best = 0;
+try {
+  var saved = JSON.parse(localStorage.getItem('ww:save') || 'null');
+  if (saved && saved.v === 1 && typeof saved.best === 'number') {
+    best = saved.best;
+    if (typeof saved.score === 'number' && saved.score >= 0) score = saved.score; // 续玩：接上次中断的分数
+    document.getElementById('score').textContent = score;
+  }
+} catch (e) { try { localStorage.removeItem('ww:save'); } catch (e2) {} }
+function saveProgress(runScore){
+  if (score > best) best = score;
+  try { localStorage.setItem('ww:save', JSON.stringify({ v: 1, best: best, score: runScore })); } catch (e) {}
+}
 
 // —— WebAudio 简易音效（振荡器，无外部资源）——
 var actx = null;

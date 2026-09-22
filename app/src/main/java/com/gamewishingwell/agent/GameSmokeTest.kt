@@ -14,6 +14,7 @@ import android.webkit.WebViewClient
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -137,8 +138,10 @@ object SmokeTestProbe {
                   }
                 }
               } catch (e) {}
-              // localStorage 内存 stub：沙箱 iframe（opaque origin）访问真实
-              // localStorage 会抛 SecurityError，而真机游戏页正常——纯环境差异。
+              // localStorage 内存 stub（无条件安装）：沙箱要求每次尝试都是全新开局——
+              // 直载后真实 localStorage 跨尝试共享同一 origin，进度存档契约（ww:save）
+              // 会把上一次冒烟留下的存档恢复进下一次尝试，污染"全新开局"假定的场景
+              // 断言；真机游戏页不受影响（每游戏独立 origin 的真实存储）。
               try {
                 var mem = {};
                 var stub = {
@@ -149,15 +152,20 @@ object SmokeTestProbe {
                   key: function(i){ return Object.keys(mem)[i] || null; }
                 };
                 Object.defineProperty(stub, 'length', { get: function(){ return Object.keys(mem).length; } });
-                try { window.localStorage.getItem('x'); } catch (e) {
-                  try { Object.defineProperty(window, 'localStorage', { value: stub, configurable: true }); } catch (e2) {}
-                }
+                try { Object.defineProperty(window, 'localStorage', { value: stub, configurable: true }); } catch (e2) {}
               } catch (e) {}
               // 全局异常捕获：tick 之外（事件回调/异步）的异常也计入沙箱结果。
               try{Object.defineProperty(document,'visibilityState',{get:function(){return 'visible';},configurable:true});}catch(e){}
               try{Object.defineProperty(document,'hidden',{get:function(){return false;},configurable:true});}catch(e){}
+              // 未捕获异常（setTimeout/事件回调里抛出的 TypeError）与 Promise 拒绝
+              // 一并捕获——真机游戏页看得到的错误沙箱必须同样看得到（历史盲区：
+              // init 在 setTimeout 里抛 Input.setUI is not a function，探针只挂了
+              // console 钩子而看不见，崩溃版从像素门的 DOM 文本豁免钻过交付门）。
               window.addEventListener('error', function(e){
-                window.__wwSmokeResult.errors.push(String((e && e.message) || e || 'unknown-error'));
+                window.__wwSmokeResult.errors.push('uncaught: ' + String((e && e.message) || e || 'unknown-error'));
+              });
+              window.addEventListener('unhandledrejection', function(e){
+                window.__wwSmokeResult.errors.push('unhandledrejection: ' + String((e && e.reason) || e || 'unknown-rejection'));
               });
               var realCaf = window.cancelAnimationFrame && window.cancelAnimationFrame.bind(window);
               var ticked = 0;
@@ -166,10 +174,8 @@ object SmokeTestProbe {
               // deep（精品档）：restart() 真实重开后复跑半程帧，验证"完整重开"契约。
               var __deep = ${if (deep) "true" else "false"};
               var __light = ${if (light) "true" else "false"};
-              // 画面方向期望（宿主按 Game Schema 注入）：横板断言主画布宽>高，
-              // 竖版断言高>宽。getBoundingClientRect 反映 transform 后的视觉盒，
-              // 旋转画布实现的横板游戏同样按宽>高判定。
-              var __landscape = ${if (landscape) "true" else "false"};
+              // 画面方向期望已上移到宿主裁决侧（DeliveryGate.Context.landscape）：
+              // 探针只测量主画布几何，不再在 JS 里持有期望值。
               var phase = 1;   // 1=首次运行 2=restart 后复跑
               var limit = ${if (light) LIGHT_FRAMES else MAX_FRAMES};
               // 帧边界外（主阶段结束→场景/deep 阶段重置计数之间的空窗）的 rAF 注册
@@ -177,6 +183,10 @@ object SmokeTestProbe {
               // 真实定时器＝永久丢失），场景阶段游戏冻结、断言只能对 restart 后的
               // 初始状态求值，任何游戏逻辑修改都无法让谓词翻真（历史断言死循环的隐藏根因）。
               var __parkedRaf = [];
+              // 收尾测量（纯采集，判定在宿主 DeliveryGate）：JS 只量不判——
+              // 判定集中到 JVM 检查表后，每条规则可表驱动单测，模式边界不再开洞。
+              var __meas = {canvases: [], zeroSize: 0, domTextLen: 0,
+                            restartMissing: false, corner: [], mainCanvas: null, debugProblems: []};
               window.requestAnimationFrame = function(cb){
                 if (ticked < limit) { window.__wwSmokePending.push(cb); return window.__wwSmokePending.length; }
                 __parkedRaf.push(cb);
@@ -191,13 +201,11 @@ object SmokeTestProbe {
               window.cancelAnimationFrame = function(id){
                 if (realCaf) { try { realCaf(id); } catch(e) {} }
               };
-              // restart() 契约：全档检查存在性（生成契约要求全局 restart()）；
-              // deep 档真实调用一次，捕获"重开才暴露"的运行错误。
-              function restartPresenceCheck(){
+              // restart() 契约测量：存在性记录进证据（裁决在 DeliveryGate）；
+              // deep 档真实调用一次，捕获"重开才暴露"的运行错误（那是运行时错误，仍走 errors）。
+              function measureRestart(){
                 try {
-                  if (typeof window.restart !== 'function') {
-                    window.__wwSmokeResult.errors.push('restart-missing: 未找到全局 restart() 函数（契约要求提供完整重开）');
-                  }
+                  __meas.restartMissing = (typeof window.restart !== 'function');
                 } catch (e) {}
               }
               function exerciseRestart(){
@@ -207,24 +215,25 @@ object SmokeTestProbe {
                   window.__wwSmokeResult.errors.push('restart-error: 调用 restart() 抛错：' + String(e && e.message || e));
                 }
               }
-              // 可观测性契约断言：调用游戏提供的 __wwDebugState() 快照做通用不变量检查，
+              // 可观测性契约测量：调用游戏提供的 __wwDebugState() 快照做通用不变量检查，
               // 杀"不抛错但明显不对"的低级逻辑 bug：负血量实体未移除、NaN/Infinity 数值、
               // 实体数组无限增长（泄漏）、restart 后状态残留（afterRestart 时检查）。
-              function debugStateCheck(afterRestart){
+              // 问题清单记入证据（裁决在 DeliveryGate；light 模式只裁运行时错误行）。
+              function measureDebugState(afterRestart){
                 try {
                   var fn = window.__wwDebugState;
                   if (typeof fn !== 'function') {
-                    window.__wwSmokeResult.errors.push('debug-state-missing: 未找到 window.__wwDebugState()（可观测性契约：必须提供调试状态快照函数）');
+                    __meas.debugProblems.push('debug-state-missing: 未找到 window.__wwDebugState()（可观测性契约：必须提供调试状态快照函数）');
                     return;
                   }
                   var s = null;
                   try { s = fn(); }
                   catch (e) {
-                    window.__wwSmokeResult.errors.push('debug-state-error: __wwDebugState() 抛错：' + String(e && e.message || e));
+                    __meas.debugProblems.push('debug-state-error: __wwDebugState() 抛错：' + String(e && e.message || e));
                     return;
                   }
                   if (!s || typeof s !== 'object') {
-                    window.__wwSmokeResult.errors.push('debug-state-invalid: __wwDebugState() 必须返回状态对象（当前为 ' + (s === null ? 'null' : typeof s) + '）');
+                    __meas.debugProblems.push('debug-state-invalid: __wwDebugState() 必须返回状态对象（当前为 ' + (s === null ? 'null' : typeof s) + '）');
                     return;
                   }
                   var problems = [];
@@ -266,7 +275,7 @@ object SmokeTestProbe {
                     problems.push('restart-state-residue: restart() 后 state 仍为 over，游戏状态未完整重置');
                   }
                   for (var p = 0; p < problems.length && p < 5; p++) {
-                    window.__wwSmokeResult.errors.push(problems[p]);
+                    __meas.debugProblems.push(problems[p]);
                   }
                 } catch (e) { /* 检查器自身异常不作游戏失败 */ }
               }
@@ -293,6 +302,23 @@ object SmokeTestProbe {
                   pokePoint(fallback, pctCoord(xp, vw), pctCoord(yp, vh));
                 } catch (e) {}
               }
+              // 选择器定位（2026-09-19）：命中元素取 getBoundingClientRect 中心派发——
+              // 模型不再猜百分比坐标。实测坐标猜测屡屡落空（卡片在滚动容器/布局偏移下
+              // 不在模型以为的位置），模型被逼造"坐标兜底区"绕过，反噬真实手感。
+              // 返回派发描述（未命中时附"未命中元素"标记，失败回报可辨步骤问题）。
+              function pokeAtSelector(sel){
+                try {
+                  var el = null;
+                  try { el = document.querySelector(String(sel)); } catch (eQ) { el = null; }
+                  if (!el) return 'tap[' + String(sel) + '](未命中元素)';
+                  var r = el.getBoundingClientRect();
+                  var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                  pokePoint(el, cx, cy);
+                  return 'tap[' + String(sel) + ']@' + Math.round(cx) + ',' + Math.round(cy);
+                } catch (e) {
+                  return 'tap[' + String(sel) + '](派发异常)';
+                }
+              }
               function dragAtPct(x0, y0, x1, y1){
                 try {
                   var fallback = document.querySelector('canvas') || document.body;
@@ -308,7 +334,7 @@ object SmokeTestProbe {
                 for (var i = 0; i < __scenData.length; i++) {
                   var sc = __scenData[i];
                   if (!sc || !sc.expect) continue;
-                  var entry = {name: String(sc.name || sc.id || ('scenario-' + i)), system: String(sc.system || ''), ok: false, reason: ''};
+                  var entry = {name: String(sc.name || sc.id || ('scenario-' + i)), system: String(sc.system || ''), ok: false, reason: '', expect: String(sc.expect || '')};
                   var errBefore = window.__wwSmokeResult.errors.length;
                   try {
                     if (typeof window.restart === 'function') { window.restart(); }
@@ -328,7 +354,10 @@ object SmokeTestProbe {
                   // 断言求值函数（探针基础设施，非游戏代码，不受安全契约约束）。
                   var evalExpect = null;
                   try {
-                    evalExpect = new Function('s', 'return (' + String(sc.expect).slice(0, ${GameScenarios.MAX_EXPECT_LEN}) + ');');
+                    // 求值上下文同时提供 s（当前快照）与 s0（本场景起点快照深拷贝）：
+                    // 相机/姿态类断言写"与起点相对变化"而不是绝对基线锚点
+                    // （s.camera.pitch + 0.3 之类会把初始姿态错误锁定为预期）。
+                    evalExpect = new Function('s', 's0', 'return (' + String(sc.expect).slice(0, ${GameScenarios.MAX_EXPECT_LEN}) + ');');
                   } catch (eE) { evalExpect = null; }
                   // 字段发现：expect 引用的一级快照字段在第 0 帧即确定性校验——
                   // 字段错位立刻回报可用字段清单，不再跑到期限结束才让模型猜。
@@ -336,6 +365,9 @@ object SmokeTestProbe {
                   while ((mF = reF.exec(String(sc.expect)))) { if (!seen[mF[1]]) { seen[mF[1]] = 1; fields.push(mF[1]); } }
                   var snap0 = null;
                   try { snap0 = window.__wwDebugState(); } catch (e1) { snap0 = null; }
+                  // s0 深拷贝：场景推进中游戏会原地修改状态对象，别名会让相对断言两头同值。
+                  var snap0Copy = null;
+                  try { snap0Copy = JSON.parse(JSON.stringify(snap0)); } catch (eC) { snap0Copy = null; }
                   var why = '';
                   if (evalExpect === null) {
                     why = '断言表达式语法错误（修正 expect 后重写 scenarios.json）';
@@ -368,7 +400,7 @@ object SmokeTestProbe {
                     var probeOnce = function(){
                       try {
                         var s2 = window.__wwDebugState();
-                        if (!!evalExpect(s2)) { passed = true; passFrame = ticked; }
+                        if (!!evalExpect(s2, snap0Copy)) { passed = true; passFrame = ticked; }
                       } catch (e3) { evalErr = String(e3 && e3.message || e3); }
                     };
                     var advance = function(n){
@@ -382,11 +414,26 @@ object SmokeTestProbe {
                     // 输入序列：tap/drag 立即派发并记录派发点状态；frames 仅为步间节奏（可选）；
                     // 输入之间执行器默认推进 ${GameScenarios.INTER_STEP_FRAMES} 帧让输入生效并被逐帧观察到。
                     var steps = (sc.steps && sc.steps.length) ? sc.steps : [];
-                    for (var sI = 0; sI < steps.length && sI < ${GameScenarios.MAX_STEPS} && !passed && !evalErr; sI++) {
+                    // 零输入恒真检查（覆盖面守卫，2026-09）：断言在 restart() 后的初始状态即为真
+                    // = steps 指向的交互路径根本没被验证——测试形同虚设。实测事故：restart()
+                    // 语义为"默认阵容立即开战"，"开局即以3位英雄进入战斗"断言零输入即恒真，
+                    // 选人界面从此失去回归保护，后续修复重写触摸层时被无声跳过。
+                    if (!why && steps.length) {
+                      var vacuousAtStart = false;
+                      try { vacuousAtStart = !!evalExpect(snap0, snap0Copy); } catch (eV0) { vacuousAtStart = false; }
+                      if (vacuousAtStart) {
+                        why = '断言在零输入的初始状态即为真（恒真断言，未验证 steps 的交互路径）——' +
+                          'restart() 后的初始状态已满足该 expect，steps 没有驱动任何被验证的行为。' +
+                          '请改写 expect 为执行 steps 后才可能为真的结果断言（如驱动选人/开战后才成立的字段组合）。';
+                      }
+                    }
+                    for (var sI = 0; sI < steps.length && sI < ${GameScenarios.MAX_STEPS} && !passed && !evalErr && !why; sI++) {
                       var st = steps[sI];
                       if (!st) continue;
                       var inputDesc = '';
-                      if (st.tap && st.tap.length >= 2) {
+                      if (st.tapSel) {
+                        inputDesc = pokeAtSelector(st.tapSel);
+                      } else if (st.tap && st.tap.length >= 2) {
                         pokeAtPct(st.tap[0], st.tap[1]);
                         inputDesc = 'tap[' + st.tap[0] + ',' + st.tap[1] + ']';
                       } else if (st.drag && st.drag.length >= 4) {
@@ -404,14 +451,14 @@ object SmokeTestProbe {
                       }
                       if (!passed && !evalErr) advance(${GameScenarios.INTER_STEP_FRAMES});
                     }
-                    // 剩余期限跑满（advance 内建翻真即停与轨迹采样）。
-                    if (!passed && !evalErr) advance(horizon);
+                    // 剩余期限跑满（advance 内建翻真即停与轨迹采样）。恒真断言已定罪，不再跑满。
+                    if (!passed && !evalErr && !why) advance(horizon);
                     if (passed) {
                       entry.ok = true;
                       entry.reason = '第 ' + passFrame + ' 帧达成';
                     } else if (evalErr) {
-                      why = '断言表达式执行出错：' + evalErr;
-                    } else {
+                      why = '断言表达式执行错误：' + evalErr;
+                    } else if (!why) {
                       try { trace.push('帧' + ticked + ' ' + fieldVals(window.__wwDebugState())); } catch (e9) {}
                       var snapStr = '';
                       try { snapStr = JSON.stringify(window.__wwDebugState()); } catch (e5) { snapStr = ''; }
@@ -431,9 +478,7 @@ object SmokeTestProbe {
                     why = '场景执行期间出现运行错误（见 errors）';
                   }
                   entry.reason = why || entry.reason;
-                  if (!entry.ok) {
-                    window.__wwSmokeResult.errors.push('scenario-fail[' + (entry.system ? entry.system + '/' : '') + entry.name + ']: ' + why + '（断言：' + String(sc.expect) + '）');
-                  }
+                  // 失败行的格式化（scenario-fail[...]）由宿主 DeliveryGate 统一完成。
                   __scenLog.push(entry);
                 }
                 window.__wwSmokeResult.scenarios = __scenLog;
@@ -465,15 +510,14 @@ object SmokeTestProbe {
                   // 推满帧的本次调用直接落入收尾检查：宿主在 f==limit 的同一次轮询里
                   // 即可读到终态 passed，避免"帧已满但未 finalize"的空档被误判为设施异常。
                 }
-                if (__light) {
-                  // 轻量模式（中途冒烟）：只回答"运行时有没有报错"，收尾检查组
-                  //（白屏/方向/角落/restart/可观测性/断言）留给交付门裁决。
-                } else if (phase === 1) {
-                  restartPresenceCheck();
-                  blankCheck();
-                  reservedAreaCheck();
-                  orientationCheck();
-                  debugStateCheck(false);
+                // 收尾测量（纯采集；light 同样执行——开销可忽略，裁决侧重 light 只取
+                // 运行时错误行，其余行留给交付门）。
+                if (phase === 1) {
+                  measureRestart();
+                  measureCanvases();
+                  measureCorner();
+                  measureOrientation();
+                  measureDebugState(false);
                   // 功能断言：主跑帧与不变量检查全绿后才执行（有错时先修运行问题），
                   // 之后才进入 deep 复跑——断言自身会调用 restart() 重置。
                   runScenarioPhase();
@@ -484,12 +528,23 @@ object SmokeTestProbe {
                     return;
                   }
                 } else {
-                  blankCheck();
-                  debugStateCheck(true);
+                  measureCanvases();
+                  measureDebugState(true);
                 }
                 __finalized = true;
                 window.__wwSmokeFinalized = true; // 宿主完成判定的权威信号（deep 复跑中途不算完成）
-                window.__wwSmokeResult = {passed: window.__wwSmokeResult.errors.length === 0, framesRun: (phase === 2 ? ${MAX_FRAMES} + ticked : ticked), errors: window.__wwSmokeResult.errors, scenarios: __scenLog, canvasColors: window.__wwSmokeResult.canvasColors};
+                window.__wwEvidence = {
+                  errors: window.__wwSmokeResult.errors,
+                  framesRun: (phase === 2 ? ${MAX_FRAMES} + ticked : ticked),
+                  canvases: __meas.canvases,
+                  zeroSizeCanvases: __meas.zeroSize,
+                  domTextLen: __meas.domTextLen,
+                  restartMissing: __meas.restartMissing,
+                  cornerViolations: __meas.corner,
+                  mainCanvas: __meas.mainCanvas,
+                  debugStateProblems: __meas.debugProblems,
+                  scenarios: __scenLog
+                };
                 return;
               }
               // 宿主驱动入口：一次调用可推进多批帧（降低 evaluateJavascript 往返次数，
@@ -537,13 +592,17 @@ object SmokeTestProbe {
                 try {
                   var target = hitTarget(x, y, fallback);
                   var t = mkTouch(target, x, y);
+                  // 事件序对齐真实浏览器：touchstart → touchend → click（click 在 touchend 之后合成）。
+                  // 历史缺陷：旧序为 touchstart → click → touchend，页面按"每事件独立 toggle"处理时
+                  // 同一次点按会被解析成 pick/unpick/pick 三连跳——合成环境逼出"事件去重 hack"，
+                  // 而这些 hack 在真机上反而劣化手感。
                   var ts = mkTouchEvent('touchstart', t);
                   if (ts) target.dispatchEvent(ts);
+                  var te = mkTouchEvent('touchend', t);
+                  if (te) target.dispatchEvent(te);
                   var click = document.createEvent('MouseEvents');
                   click.initMouseEvent('click', true, true, window, 1, x, y, x, y, false, false, false, false, 0, null);
                   target.dispatchEvent(click);
-                  var te = mkTouchEvent('touchend', t);
-                  if (te) target.dispatchEvent(te);
                 } catch (e) {
                   window.__wwSmokeResult.errors.push('touch-dispatch:' + String(e && e.message || e));
                 }
@@ -559,11 +618,10 @@ object SmokeTestProbe {
                   window.__wwSmokeResult.errors.push('touch-drag:' + String(e && e.message || e));
                 }
               }
-              // 画面空白检测 v2（像素多样性裁决）：跑满帧后对每个非零尺寸 canvas 降采样统计
-              // 量化颜色数——真实游戏画面必然多于 2 种颜色；纯色画布（只剩背景/天空清除色）
-              // = 无任何实际渲染，即使页面有 HUD 文本也判失败。历史盲区：旧实现用
-              // "PNG 体积>3KB 或页面文本≥30字"双豁免，WebGL 零三角形交付（顶点全 NaN 被
-              // GPU 裁剪）凭 HUD 文本带病通过。无 canvas 的 DOM 游戏保留文本规则。
+              // 像素采样（测量）：48×48 降采样 + 4bit/通道量化——真实游戏画面必然
+              // 多于 2 种颜色；采样异常返回 colors=0（宿主按"证据缺失"裁决，不再当
+              // "无 canvas 的 DOM 游戏"处理）。历史盲区：WebGL 零三角形交付（顶点全
+              // NaN 被 GPU 裁剪）凭 HUD 文本豁免带病通过，已由 canvas 声明分流根除。
               function sampleCanvasColors(c){
                 try {
                   var S = 48;
@@ -593,43 +651,32 @@ object SmokeTestProbe {
                   return { colors: 0, desc: '像素不可读' };
                 }
               }
-              function blankCheck(){
+              // 画面证据测量 v3（纯采集，裁决在 DeliveryGate）：对每个非零尺寸 canvas
+              // 降采样统计量化颜色数；0 尺寸画布计数（canvas 游戏"零存活画布"= 初始化
+              // 未抵达渲染，宿主判 canvas-not-alive）；DOM 文本长度同时采集（仅 DOM
+              // 游戏的兜底规则用，canvas 声明的游戏不再走文本豁免——历史事故：初始化
+              // 崩溃后无存活画布，凭帮助文案 ≥30 字钻过像素门交付）。
+              function measureCanvases(){
                 try {
                   var canvases = document.querySelectorAll('canvas');
-                  var live = [];
+                  var live = 0;
                   for (var i = 0; i < canvases.length; i++) {
                     var c = canvases[i];
                     if (c.width === 0 || c.height === 0) continue;
-                    live.push(c);
-                  }
-                  if (live.length === 0) {
-                    // DOM 游戏：无可读文本 = 白屏（旧实现对无 canvas 页面从不报空白，一并补上）
-                    var text0 = ((document.body && document.body.innerText) || '').trim();
-                    if (text0.length < 30) {
-                      window.__wwSmokeResult.errors.push('playability-blank-screen: 画面检测未发现任何渲染内容（白屏），游戏未实际运行或未绘制');
+                    live++;
+                    if (__meas.canvases.length < 4) {
+                      var st = sampleCanvasColors(c);
+                      __meas.canvases.push({w: c.width, h: c.height, colors: st.colors, note: st.desc || ''});
                     }
-                    return;
                   }
-                  var best = 0, bestDesc = '';
-                  for (var j = 0; j < live.length && j < 4; j++) {
-                    var st = sampleCanvasColors(live[j]);
-                    if (st.colors > best) { best = st.colors; bestDesc = st.desc; }
-                  }
-                  window.__wwSmokeResult.canvasColors = best;
-                  if (best < 3) {
-                    window.__wwSmokeResult.errors.push('playability-blank-canvas: 画面像素仅 ' + best + ' 种颜色' +
-                      (bestDesc ? '（' + bestDesc + '）' : '') +
-                      '——画布疑似只有背景/天空清除色的纯色填充，无任何实际渲染内容。请排查：' +
-                      '①几何体是否真正加入场景且含有效顶点（顶点表结构与索引方式必须匹配，NaN 顶点会被 GPU 全部裁剪导致只剩背景色）；' +
-                      '②渲染循环是否持续执行 renderer.render；③相机位置是否在场景内朝向内容；' +
-                      '④WebGL 画布若实际有内容但此处读不到，创建 renderer 时必须带 preserveDrawingBuffer:true');
-                  }
+                  __meas.zeroSize = canvases.length - live;
+                  __meas.domTextLen = ((document.body && document.body.innerText) || '').trim().length;
                 } catch (e) {}
               }
-              // 平台按钮角落执法（平台契约）：左上/右上角各约 ${RESERVED_CORNER_W}x${RESERVED_TOP_PX}px 是
-              // 平台"返回/设置"按钮悬浮区——角落内出现任何可交互元素即失败（会被平台按钮遮挡而无法点击）。
-              // 顶部其余区域（含整条顶带）可自由布局画面/HUD/文字，无保留区留白要求。
-              function reservedAreaCheck(){
+              // 平台按钮角落测量（平台契约）：左上/右上角各约 ${RESERVED_CORNER_W}x${RESERVED_TOP_PX}px 是
+              // 平台"返回/设置"按钮悬浮区——角落内的可交互元素清单记入证据（裁决在
+              // DeliveryGate）。顶部其余区域（含整条顶带）可自由布局画面/HUD/文字，无保留区留白要求。
+              function measureCorner(){
                 try {
                   var bad = [];
                   var vw = window.innerWidth || 360;
@@ -648,18 +695,14 @@ object SmokeTestProbe {
                       bad.push(el.tagName.toLowerCase() + (label ? '(' + label + ')' : '') + '@' + Math.round(r.left) + ',' + Math.round(r.top));
                     }
                   }
-                  if (bad.length) {
-                    window.__wwSmokeResult.errors.push('top-corner-reserved: 左上/右上角平台按钮悬浮区（约' + cornerW + 'x' + ${RESERVED_TOP_PX} + 'px）出现可交互元素（会被平台返回/设置按钮遮挡无法点击）：' + bad.slice(0, 3).join(' | ') + '；请将这些元素移出两个角落，顶部其余区域可自由布局');
-                  }
+                  __meas.corner = bad;
                 } catch (e) {}
               }
-              // 画面方向断言（Game Schema 契约）：取面积最大的可见 canvas 为主画布，
-              // 其视觉宽高比必须与 design_schema 的 orientation 一致。拦"把关卡做成
-              // 横向卷轴但画面仍是竖版"的假横板——这正是玩家投诉"说是横屏实际竖屏"的来源。
-              // 同时检查铺满程度：主画布宽度应占视口宽 ≥85%、高度占 ≥60%——拦"固定逻辑
-              // 分辨率 + 等比缩放居中"的黑边适配（宽屏左右大片空白）。
-              // 无 canvas 的 DOM 游戏跳过（内容检测由白屏检查兜底）。
-              function orientationCheck(){
+              // 主画布几何测量（方向/铺满裁决的输入）：取面积最大的可见 canvas 的视觉
+              // 盒（getBoundingClientRect 反映 transform 后的视觉尺寸，旋转画布实现的
+              // 横板游戏同样按宽>高判定）；无可见画布记 null（canvas 声明的游戏由
+              // canvas-not-alive 行裁决，DOM 游戏由文本规则兜底）。
+              function measureOrientation(){
                 try {
                   var canvases = document.querySelectorAll('canvas');
                   var main = null, mainArea = 0;
@@ -670,18 +713,8 @@ object SmokeTestProbe {
                     if (area > mainArea) { mainArea = area; main = r; }
                   }
                   if (!main) return;
-                  var w = Math.round(main.width), h = Math.round(main.height);
-                  if (__landscape && w <= h) {
-                    window.__wwSmokeResult.errors.push('orientation-mismatch: 画面方向应为横板（主画布宽>高），实际主画布为 ' + w + 'x' + h + '。横板游戏不能只把关卡做成横向卷轴而保持竖版/窄幅画面：平台会以横屏视口加载，直接以窗口实际尺寸为逻辑分辨率全屏铺满即可，不要旋转画布');
-                  } else if (!__landscape && h <= w) {
-                    window.__wwSmokeResult.errors.push('orientation-mismatch: 画面方向应为竖版（主画布高>宽），实际主画布为 ' + w + 'x' + h + '；请按竖屏视口布局');
-                  }
                   var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
-                  if (vw > 0 && vh > 0 && main.width >= vw * 0.5) {
-                    if (main.width < vw * 0.85 || main.height < vh * 0.6) {
-                      window.__wwSmokeResult.errors.push('canvas-not-fullscreen: 主画布 ' + w + 'x' + h + ' 未铺满视口 ' + Math.round(vw) + 'x' + Math.round(vh) + '（要求宽≥85%、高≥60%）。禁止固定逻辑分辨率后等比缩放居中留黑边——应以窗口实际尺寸为逻辑分辨率全屏自适应');
-                    }
-                  }
+                  __meas.mainCanvas = {w: Math.round(main.width), h: Math.round(main.height), vw: Math.round(vw), vh: Math.round(vh)};
                 } catch (e) {}
               }
               // 看门狗已移除：离屏页面的 setTimeout 可能被冻结（永不触发）；
@@ -738,6 +771,9 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         light: Boolean
     ): SmokeTestResult {
         val prepared = HtmlEnhancer.inject(SmokeTestProbe.inject(html, deep, scenariosJson, landscape, light))
+        // canvas 游戏判定依据（原始入口 html，避免探针/引擎注入文本干扰）：
+        // 声明了 <canvas> 或 three/pixi 引擎的游戏不适用 DOM 文本豁免。
+        val canvasDeclared = DeliveryGate.canvasDeclaredIn(html)
         // 轻量模式帧数少，外层超时相应收紧（仍留设施慢启动余量）。
         val timeoutMs = when {
             light -> LIGHT_TIMEOUT_MS
@@ -749,7 +785,7 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         // 健康 renderer 上；游戏自身错误（有错误文本/帧有推进）不属于此类，不重试。
         var last = SmokeTestResult(false, errors = listOf("冒烟测试超时"), message = "smoke-timeout")
         repeat(MAX_ATTEMPTS) { attempt ->
-            val result = runOnce(prepared, timeoutMs, landscape)
+            val result = runOnce(prepared, timeoutMs, light, canvasDeclared, landscape)
             last = result.copy(attempts = attempt + 1)
             if (!isRetryableInfraFailure(result)) return last
             if (attempt < MAX_ATTEMPTS - 1) {
@@ -759,7 +795,13 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         return last
     }
 
-    private suspend fun runOnce(prepared: String, timeoutMs: Long, landscape: Boolean): SmokeTestResult =
+    private suspend fun runOnce(
+        prepared: String,
+        timeoutMs: Long,
+        light: Boolean,
+        canvasDeclared: Boolean,
+        landscape: Boolean
+    ): SmokeTestResult =
         withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { cont ->
                 val main = Handler(Looper.getMainLooper())
@@ -851,9 +893,12 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                     if (finished) return
                     polls++
                     // 每次轮询顺手驱动一帧批次（宿主驱动帧推进：evaluateJavascript 不经定时器队列，
-                    // 不受离屏 WebView 后台节流影响），再读取探针终态。
+                    // 不受离屏 WebView 后台节流影响），再读取探针进度/终态证据。
                     val js = "(function(){try{if(window.__wwPump){window.__wwPump($FRAMES_PER_POLL);}}catch(pumpErr){}" +
-                        "try{var r=window.__wwSmokeResult;return JSON.stringify({p:r&&r.passed!==undefined&&r.passed,f:r&&r.framesRun||0,e:r&&r.errors||[],fin:!!window.__wwSmokeFinalized,rs:document.readyState,m:!!window.__wwSmokeInstalled,pfn:typeof window.__wwPump,pc:window.__wwPumpCount||0,sc:(r&&r.scenarios)||[],cc:(r&&r.canvasColors)||0});}catch(err){return JSON.stringify({p:false,f:0,e:[String(err)],done:true,rs:document.readyState});}})()"
+                        "try{var r=window.__wwSmokeResult;return JSON.stringify({f:(r&&r.framesRun)||0,e:(r&&r.errors)||[]," +
+                        "fin:!!window.__wwSmokeFinalized,ev:(window.__wwEvidence?JSON.stringify(window.__wwEvidence):null)," +
+                        "rs:document.readyState,m:!!window.__wwSmokeInstalled,pfn:typeof window.__wwPump,pc:window.__wwPumpCount||0});}" +
+                        "catch(err){return JSON.stringify({f:0,e:[String(err)],fin:true,rs:document.readyState});}})()"
                     webView.evaluateJavascript(js) { value ->
                         // 取消与回调的竞态兜底：stopAll 置位后 WebView 已销毁/结果已无意义，
                         // 不再续排下一轮（否则对已销毁实例无限 200ms 重轮）。
@@ -873,23 +918,48 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                             finish(SmokeTestResult(false, errors = listOf("冒烟测试超时"), message = "smoke-frozen"))
                             return@evaluateJavascript
                         }
-                        val parsed = parseProbeResult(value, emptyList())
-                        // 完成判定不重复解析原文：framesRun 已实时同步（>=MAX 即跑满），
-                        // errors 非空即出错，passed 为探针 finalize 的终态。
-                        // 完成判定以探针定稿为准：deep 复跑期间 framesRun 已达 MAX 但未定稿，
-                        // 不能提前收单（历史 bug：读到中间态被判"结果不可读"设施异常）。
-                        if (parsed.errors.isNotEmpty() || parsed.passed || parsed.finalized) {
-                            val console = synchronized(consoleErrors) { consoleErrors.toList() }
-                            finish(
+                        val obj = decodeProbeObject(value)
+                        val liveErrors = obj?.stringList("e").orEmpty()
+                        val framesNow = obj?.intOrNull("f") ?: 0
+                        val fin = obj?.boolOrNull("fin") == true
+                        val console = synchronized(consoleErrors) { consoleErrors.toList() }
+                        when {
+                            // 运行时错误已出现即可提前收单（fail-fast），不必等跑满帧。
+                            liveErrors.isNotEmpty() -> finish(
                                 SmokeTestResult(
-                                    passed = parsed.passed && console.isEmpty(),
-                                    framesRun = parsed.framesRun,
-                                    errors = parsed.errors + console,
-                                    message = if (parsed.passed) "smoke-ok" else "smoke-failed"
+                                    passed = false,
+                                    framesRun = framesNow,
+                                    errors = liveErrors + console,
+                                    message = "smoke-failed"
                                 )
                             )
-                        } else {
-                            main.postDelayed(::poll, POLL_INTERVAL_MS)
+                            // 探针定稿：解码证据 → 交付门检查表裁决（测量与判定分离，
+                            // Verdict 是唯一事实来源，日志/反馈都从它派生）。
+                            fin -> {
+                                val evidence = decodeEvidence(obj?.get("ev"))
+                                if (evidence == null) {
+                                    finish(
+                                        SmokeTestResult(
+                                            passed = false,
+                                            framesRun = framesNow,
+                                            errors = listOf("探针已定稿但证据缺失（ev 不可读）"),
+                                            message = "probe-evidence-missing"
+                                        )
+                                    )
+                                } else {
+                                    val verdict = DeliveryGate.evaluate(
+                                        evidence,
+                                        DeliveryGate.Context(light = light, canvasDeclared = canvasDeclared, landscape = landscape)
+                                    )
+                                    finish(
+                                        verdict.copy(
+                                            errors = verdict.errors + console,
+                                            passed = verdict.passed && console.isEmpty()
+                                        )
+                                    )
+                                }
+                            }
+                            else -> main.postDelayed(::poll, POLL_INTERVAL_MS)
                         }
                     }
                 }
@@ -923,7 +993,9 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                         override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
                             if (consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
                                 val msg = consoleMessage.message() ?: ""
-                                if (msg.isNotBlank() && !msg.startsWith("[游戏错误]")) {
+                                // 浏览器干预告警（passive preventDefault 等）不算游戏错误：
+                                // 与真实异常同通道但语义不同，采集侧即分流（见 BrowserInterventions）。
+                                if (msg.isNotBlank() && !msg.startsWith("[游戏错误]") && !BrowserInterventions.isIntervention(msg)) {
                                     synchronized(consoleErrors) { consoleErrors += msg.take(200) }
                                 }
                             }
@@ -1004,42 +1076,68 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         return runCatching { Json.parseToJsonElement(decoded) as? JsonObject }.getOrNull()
     }
 
-    private fun parseProbeResult(raw: String?, consoleErrors: List<String>): SmokeTestResult {
-        val fallback = SmokeTestResult(false, errors = consoleErrors, message = "probe-result-unavailable")
-        val json = decodeProbeObject(raw) ?: return fallback
+    /** ev 字段是"JSON 字符串里再嵌一层 JSON 文本"，需二次解码为证据对象。 */
+    private fun decodeEvidence(ev: JsonElement?): DeliveryGate.Evidence? {
+        val raw = (ev as? JsonPrimitive)?.contentOrNull ?: return null
+        val obj = runCatching { Json.parseToJsonElement(raw) as? JsonObject }.getOrNull() ?: return null
         return try {
-            val passed = (json["p"] as? JsonPrimitive)?.contentOrNull == "true"
-            val frames = (json["f"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
-            val errors = (json["e"] as? JsonArray)?.mapNotNull {
-                (it as? JsonPrimitive)?.contentOrNull
-            } ?: emptyList()
-            // 功能断言结果：[{name, system, ok, reason}] → 摘要行 + 计数。
-            val scenEntries = (json["sc"] as? JsonArray)
-                ?.filterIsInstance<JsonObject>()
-                .orEmpty()
-            val scenResults = scenEntries.map { entry ->
-                val name = (entry["name"] as? JsonPrimitive)?.contentOrNull ?: "scenario"
-                val system = (entry["system"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-                val ok = (entry["ok"] as? JsonPrimitive)?.contentOrNull == "true"
-                val reason = (entry["reason"] as? JsonPrimitive)?.contentOrNull.orEmpty()
-                val label = if (system.isBlank()) name else "$system/$name"
-                if (ok) "$label 通过" else "$label 失败:${reason.take(160)}"
+            val canvases = (obj["canvases"] as? JsonArray)
+                ?.filterIsInstance<JsonObject>().orEmpty()
+                .map {
+                    DeliveryGate.CanvasMeasurement(
+                        w = it.intOrNull("w") ?: 0,
+                        h = it.intOrNull("h") ?: 0,
+                        colors = it.intOrNull("colors") ?: 0,
+                        note = it.stringOrNull("note")
+                    )
+                }
+            val main = (obj["mainCanvas"] as? JsonObject)?.let {
+                DeliveryGate.MainCanvasGeometry(
+                    w = it.intOrNull("w") ?: 0,
+                    h = it.intOrNull("h") ?: 0,
+                    vw = it.intOrNull("vw") ?: 0,
+                    vh = it.intOrNull("vh") ?: 0
+                )
             }
-            SmokeTestResult(
-                passed = passed && errors.isEmpty(),
-                framesRun = frames,
-                errors = errors + consoleErrors,
-                finalized = (json["fin"] as? JsonPrimitive)?.contentOrNull == "true",
-                message = if (passed) "smoke-ok" else "smoke-failed",
-                scenarioTotal = scenEntries.size,
-                scenarioPassed = scenResults.count { it.endsWith(" 通过") },
-                scenarioResults = scenResults,
-                canvasColors = (json["cc"] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: 0
+            val scenarios = (obj["scenarios"] as? JsonArray)
+                ?.filterIsInstance<JsonObject>().orEmpty()
+                .map {
+                    DeliveryGate.ScenarioEntry(
+                        name = it.stringOrNull("name") ?: "scenario",
+                        system = it.stringOrNull("system").orEmpty(),
+                        ok = it.boolOrNull("ok") == true,
+                        reason = it.stringOrNull("reason").orEmpty(),
+                        expect = it.stringOrNull("expect").orEmpty()
+                    )
+                }
+            DeliveryGate.Evidence(
+                errors = obj.stringList("errors"),
+                framesRun = obj.intOrNull("framesRun") ?: 0,
+                canvases = canvases,
+                zeroSizeCanvases = obj.intOrNull("zeroSizeCanvases") ?: 0,
+                domTextLen = obj.intOrNull("domTextLen") ?: 0,
+                restartMissing = obj.boolOrNull("restartMissing") == true,
+                cornerViolations = obj.stringList("cornerViolations"),
+                mainCanvas = main,
+                debugStateProblems = obj.stringList("debugStateProblems"),
+                scenarios = scenarios
             )
         } catch (_: Exception) {
-            fallback
+            null
         }
     }
+
+    private fun JsonObject.stringOrNull(key: String): String? =
+        (this[key] as? JsonPrimitive)?.contentOrNull
+
+    private fun JsonObject.intOrNull(key: String): Int? =
+        stringOrNull(key)?.toIntOrNull()
+
+    private fun JsonObject.boolOrNull(key: String): Boolean? =
+        stringOrNull(key)?.toBooleanStrictOrNull()
+
+    private fun JsonObject.stringList(key: String): List<String> =
+        (this[key] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
 
     private companion object {
         // 外层兜底超时：仅防挂起（宿主驱动下正常路径数秒完成）。

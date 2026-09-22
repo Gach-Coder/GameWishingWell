@@ -81,7 +81,6 @@ class GameViewModel(
                     }
                     source == "game" && gameId > 0 -> {
                         val h = repository.loadGameHtml(gameId)
-                        if (h != null) repository.touchPlay(gameId)
                         // 运行区多文件：入口 + 保存区文本文件（js/css 等）内联合并
                         val files = if (h != null) repository.loadGameTextFiles(gameId) else emptyMap()
                         val runnable = h?.let { GameBundle.inline(it) { rel -> files[rel] } }
@@ -152,6 +151,16 @@ class GameViewModel(
             agent.awaitReady()
             val meta = agent.saveCurrentGame(title)
             onDone(meta != null)
+        }
+    }
+
+    /** 保存入口统一裁决：会话已绑定已命名游戏 → 直接覆盖保持原名（onDone）；
+     *  未命名草稿 → 首次保存需命名（onNeedName，UI 弹框后经 saveDraft(title) 提交）。 */
+    fun saveGame(onNeedName: () -> Unit, onDone: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val agent = boundAgent ?: hub.agentFor(null)
+            agent.awaitReady()
+            if (agent.boundGameId == null) onNeedName() else onDone(agent.saveCurrentGame("") != null)
         }
     }
 }

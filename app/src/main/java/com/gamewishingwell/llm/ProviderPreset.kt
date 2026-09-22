@@ -25,7 +25,15 @@ data class ProviderPreset(
      * 手输清单外的模型名同样有效（自定义网关/新模型无需改代码）。
      * 空清单（custom）不提供下拉，纯手输。
      */
-    val models: List<String> = emptyList()
+    val models: List<String> = emptyList(),
+    /**
+     * 设置页 Base URL 下拉的可选清单（首位即默认，与 baseUrl 一致）：地址字段始终可自由编辑，
+     * 手输清单外的地址同样有效（网关换址/内网代理无需改代码）。
+     * 备选地址是同厂商的套餐专用端点（如小米 Token Plan）或国际端点——Key 与端点
+     * 必须来自同一发放平台（国内/国际 Key 不通用），切换后需换对应平台的 Key。
+     * 清单不足两项时不提供下拉（无备选可言）；custom 纯手输。
+     */
+    val baseUrls: List<String> = emptyList()
 )
 
 object ProviderPresets {
@@ -41,7 +49,10 @@ object ProviderPresets {
         ProviderPreset(
             "kimi", "Kimi (Moonshot)", "https://api.moonshot.cn/v1", "moonshot-v1-8k",
             Protocol.OPENAI_COMPATIBLE, 16384,
-            models = listOf("moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k", "kimi-k2-turbo-preview")
+            models = listOf("moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k", "kimi-k2-turbo-preview"),
+            // 国内端点（默认，人民币计费）/国际端点 api.moonshot.ai（美元计费）——
+            // 两平台账号与 Key 独立，切换端点需换对应平台签发的 Key。
+            baseUrls = listOf("https://api.moonshot.cn/v1", "https://api.moonshot.ai/v1")
         ),
         ProviderPreset(
             "openai", "OpenAI", "https://api.openai.com/v1", "gpt-4o-mini",
@@ -55,26 +66,37 @@ object ProviderPresets {
         ),
         // 智谱开放平台 OpenAI 兼容端点（Bearer 鉴权、/chat/completions、SSE、function calling 均兼容）；
         // 默认 glm-5.3-flash，模型名可在设置页下拉选择或直接改为其他 GLM 系列。
+        // 备选端点：国内 Coding Plan 专用（编码套餐额度，本应用即编码场景）与国际平台 Z.ai
+        // （api.z.ai，美元计费）——后两者的 Key 分别在 coding 套餐与 Z.ai 平台签发。
         ProviderPreset(
             "zhipu", "智谱 GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-5.3-flash",
             Protocol.OPENAI_COMPATIBLE, 16384,
-            models = listOf("glm-5.3-flash", "glm-5.3", "glm-4.6", "glm-4-flash")
+            models = listOf("glm-5.3-flash", "glm-5.3", "glm-4.6", "glm-4-flash"),
+            baseUrls = listOf(
+                "https://open.bigmodel.cn/api/paas/v4",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "https://api.z.ai/api/paas/v4"
+            )
         ),
         // 小米 MiMo 开放平台（https://mimo.mi.com）：OpenAI 兼容端点（Bearer 鉴权、/chat/completions、SSE、function calling 均兼容）；
-        // 默认 mimo-v2.5（V2 系列已于 2026-06-30 弃用，V2.5 为当前主推，可选 mimo-v2.5-pro）。
+        // 默认 mimo-v2.5（V2 系列已于 2026-06-30 弃用，V2.5 为当前主推；V2.6 系列已上线，可选）。
+        // 备选端点 token-plan-cn：Token Plan（百万亿 Token 激励计划等套餐额度）专用，
+        // 与余额计费的默认端点共用同一控制台的 Key，按额度来源选择。
         ProviderPreset(
             "xiaomi", "小米 MiMo", "https://api.xiaomimimo.com/v1", "mimo-v2.5",
             Protocol.OPENAI_COMPATIBLE, 16384,
-            models = listOf("mimo-v2.5", "mimo-v2.5-pro")
+            models = listOf("mimo-v2.5", "mimo-v2.5-pro", "mimo-v2.6-flash", "mimo-v2.6-pro"),
+            baseUrls = listOf("https://api.xiaomimimo.com/v1", "https://token-plan-cn.xiaomimimo.com/v1")
         ),
         // MiniMax 稀宇开放平台：OpenAI 兼容端点（Bearer 鉴权、/chat/completions、SSE、function calling 均兼容）。
-        // 国内端点 api.minimaxi.com/v1（默认），国际端点 api.minimax.io/v1 可在设置页改 Base URL 切换。
-        // 模型 ID 遵循平台 MiniMax-M* 命名；M 系列内置交错思考、无法关闭——
+        // 国内端点 api.minimaxi.com/v1（默认），国际端点 api.minimax.io/v1 可在下拉切换——
+        // 两平台账号与 Key 独立。模型 ID 遵循平台 MiniMax-M* 命名；M 系列内置交错思考、无法关闭——
         // 若网关拒绝 thinking 字段，客户端已有"去掉该字段重试"兜底。
         ProviderPreset(
             "minimax", "MiniMax", "https://api.minimaxi.com/v1", "MiniMax-M3",
             Protocol.OPENAI_COMPATIBLE, 16384,
-            models = listOf("MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5")
+            models = listOf("MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5"),
+            baseUrls = listOf("https://api.minimaxi.com/v1", "https://api.minimax.io/v1")
         ),
         // OpenRouter 聚合网关（https://openrouter.ai）：OpenAI 兼容端点（Bearer 鉴权、/chat/completions、
         // SSE 流式、function calling 均兼容）。下拉内置全部免费端点模型（快照同步自

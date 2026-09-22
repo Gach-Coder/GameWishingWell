@@ -77,7 +77,6 @@ fun WishwellApp() {
                 HomeScreen(
                     onOpenGame = { id -> navController.navigate("game?source=game&gameId=$id") },
                     onEditGame = { id -> navController.navigate("chat?gameId=$id") },
-                    onNewChat = { navController.navigate("chat") },
                     onContinueDraft = { navController.navigate("chat?draft=true") },
                     onOpenFiles = { id -> navController.navigate("files?gameId=$id") }
                 )

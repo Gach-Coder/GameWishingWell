@@ -1,7 +1,13 @@
 package com.gamewishingwell.ui.files
 
+import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -34,15 +40,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.addPathNodes
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -51,18 +59,22 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.gamewishingwell.data.GameFileContent
 import com.gamewishingwell.data.GameFileEntry
+import com.gamewishingwell.data.GameRepository
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.FileViewerState
 import com.gamewishingwell.ui.viewmodels.FileBrowserViewModel
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
  * 文件可视系统（资源管理器样式，全程只读）：
- * 首页游戏卡「文件夹」选项进入，逐级浏览该游戏存储文件夹（games/<id>）——
- * 点击文件夹进入子目录（.versions / .savepoint 同样可进），系统返回键或返回箭头逐级退回；
- * 点击文件以只读查看器打开：等宽字体展示文本，长按可选中复制（复制全部入口在顶栏），
+ * 首页游戏卡「文件夹」选项进入（草稿卡片同样进入草稿文件夹），逐级浏览游戏存储
+ * 文件夹（games/<id> 或 drafts/）——点击文件夹进入子目录（.versions / .savepoint /
+ * log 同样可进），系统返回键或返回箭头逐级退回；
+ * 点击文件以只读查看器打开：等宽字体展示文本，长按可选中复制，顶栏「导出文件」
+ * 经系统 SAF 把完整文件另存到任意位置（不截断、二进制原样）；
  * 不提供任何编辑/修改/保存路径；大文件超限截断预览、二进制内容不做文本预览。
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -79,18 +91,49 @@ fun FileBrowserScreen(
     val currentPath by vm.currentPath.collectAsState()
     val viewer by vm.viewer.collectAsState()
 
+    val isDraft = gameId == GameRepository.DRAFT_ID
+
     LaunchedEffect(gameId) { vm.load(gameId) }
 
     // 系统返回键：先关查看器，再退上级目录，根目录时交回导航（回首页）
-    BackHandler(enabled = viewer != null || currentPath.isNotEmpty()) {
+    val viewerState = viewer
+    BackHandler(enabled = viewerState != null || currentPath.isNotEmpty()) {
         when {
-            viewer != null -> vm.closeFile()
+            viewerState != null -> vm.closeFile()
             else -> vm.navigateUp()
         }
     }
 
-    if (viewer != null) {
-        FileViewerContent(state = viewer!!, onClose = vm::closeFile)
+    // 导出中转：点击「导出文件」先记下目标，SAF「另存为」返回 Uri 后读取完整字节写入
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var pendingExport by remember { mutableStateOf<String?>(null) }
+    val exportLauncher = rememberLauncherForActivityResult(ExportFileContract()) { uri ->
+        val relativePath = pendingExport
+        pendingExport = null
+        if (uri == null || relativePath == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val bytes = vm.readExportBytes(relativePath)
+            val ok = bytes != null && runCatching {
+                context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) } != null
+            }.getOrDefault(false)
+            Toast.makeText(
+                context,
+                if (ok) "已导出文件" else "导出失败，请重试",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    if (viewerState != null) {
+        FileViewerContent(
+            state = viewerState,
+            onClose = vm::closeFile,
+            onExport = { content ->
+                pendingExport = content.relativePath
+                exportLauncher.launch(content.name)
+            }
+        )
         return
     }
 
@@ -100,7 +143,11 @@ fun FileBrowserScreen(
             TopAppBar(
                 title = {
                     Text(
-                        if (currentPath.isEmpty()) "游戏文件夹" else folderName,
+                        if (currentPath.isEmpty()) {
+                            if (isDraft) "草稿文件夹" else "游戏文件夹"
+                        } else {
+                            folderName
+                        },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -118,7 +165,7 @@ fun FileBrowserScreen(
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
             Text(
-                "应用私有目录 · games/$gameId" +
+                "应用私有目录 · ${if (isDraft) "drafts" else "games/$gameId"}" +
                     (if (currentPath.isEmpty()) "" else "/$currentPath") +
                     " · 只读（共 ${entries?.size ?: 0} 项）",
                 style = MaterialTheme.typography.labelSmall,
@@ -136,7 +183,11 @@ fun FileBrowserScreen(
                 )
             } else if (list.isEmpty()) {
                 Text(
-                    if (currentPath.isEmpty()) "文件夹为空或游戏已被删除" else "此文件夹为空",
+                    when {
+                        currentPath.isNotEmpty() -> "此文件夹为空"
+                        isDraft -> "文件夹为空或草稿已被删除"
+                        else -> "文件夹为空或游戏已被删除"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(24.dp)
@@ -161,12 +212,14 @@ fun FileBrowserScreen(
     }
 }
 
-/** 只读文件查看器：顶栏带「复制全部」，正文 SelectionContainer 可长按选中复制，无编辑入口。 */
+/** 只读文件查看器：顶栏「导出文件」（系统 SAF 另存，完整内容），正文 SelectionContainer 可长按选中复制，无编辑入口。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FileViewerContent(state: FileViewerState, onClose: () -> Unit) {
-    val context = LocalContext.current
-    @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
+private fun FileViewerContent(
+    state: FileViewerState,
+    onClose: () -> Unit,
+    onExport: (GameFileContent) -> Unit
+) {
     Scaffold(
         topBar = {
             TopAppBar(
@@ -184,11 +237,9 @@ private fun FileViewerContent(state: FileViewerState, onClose: () -> Unit) {
                 },
                 actions = {
                     val content = (state as? FileViewerState.Ready)?.content
-                    if (content != null && !content.binary && content.text.isNotEmpty()) {
-                        TextButton(onClick = {
-                            clipboard.setText(AnnotatedString(content.text))
-                            Toast.makeText(context, "已复制全部内容", Toast.LENGTH_SHORT).show()
-                        }) { Text("复制全部") }
+                    if (content != null) {
+                        // 二进制/截断文件同样可导出：导出的是完整原始文件，不是预览内容
+                        TextButton(onClick = { onExport(content) }) { Text("导出文件") }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -204,12 +255,20 @@ private fun FileViewerContent(state: FileViewerState, onClose: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(padding).padding(24.dp)
             )
-            FileViewerState.Failed -> Text(
-                "无法打开文件（可能已被移动或删除）",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(padding).padding(24.dp)
-            )
+            is FileViewerState.Failed -> Column(Modifier.padding(padding).padding(24.dp)) {
+                Text(
+                    "无法打开文件（可能已被移动或删除）",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                state.reason?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                }
+            }
             is FileViewerState.Ready -> ReadyFileBody(state.content, padding)
         }
     }
@@ -230,13 +289,13 @@ private fun ReadyFileBody(content: GameFileContent, padding: PaddingValues) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "${describeBytes(content.sizeBytes)} · ${formatDateTime(content.lastModified)} · 只读，可长按选中复制",
+                "${describeBytes(content.sizeBytes)} · ${formatDateTime(content.lastModified)} · 只读，可长按选中复制或导出",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             if (content.truncated) {
                 Text(
-                    "文件较大，已截断仅预览前 ${content.text.length} 字符",
+                    "文件较大，已截断仅预览前 ${content.text.length} 字符（导出为完整内容）",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error
                 )
@@ -317,10 +376,12 @@ private fun fileTypeOf(entry: GameFileEntry): String = when {
     entry.isDirectory -> when (entry.name) {
         ".versions" -> "版本归档文件夹"
         ".savepoint" -> "保存点（撤销锚点）"
+        "log" -> "Agent 日志文件夹"
         else -> "文件夹"
     }
     entry.name.endsWith(".html") -> "HTML 网页"
     entry.name.endsWith(".json") -> "JSON 数据"
+    entry.name.endsWith(".log") -> "Agent 日志"
     entry.name.endsWith(".sha256") -> "SHA-256 校验"
     entry.name.endsWith(".version") -> "版本标记"
     entry.name.endsWith(".txt") -> "文本"
@@ -378,4 +439,33 @@ private val WwFileIcon: ImageVector by lazy {
             fillAlpha = 0.6f
         )
     }.build()
+}
+
+/**
+ * 「导出文件」的系统另存契约（ACTION_CREATE_DOCUMENT）：入参 = 目标文件名
+ * （MIME 按扩展名推断），出参 = 用户选择位置的 Uri；由调用方把完整文件字节
+ * 写入该 Uri。相比固定 MIME 的 CreateDocument，可在点击时按文件类型决定 MIME。
+ */
+private class ExportFileContract : ActivityResultContract<String, Uri?>() {
+    override fun createIntent(context: Context, input: String): Intent =
+        Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType(mimeOf(input))
+            .putExtra(Intent.EXTRA_TITLE, input)
+
+    override fun parseResult(resultCode: Int, intent: Intent?): Uri? =
+        if (resultCode == Activity.RESULT_OK) intent?.data else null
+}
+
+private fun mimeOf(fileName: String): String = when {
+    fileName.endsWith(".html", ignoreCase = true) || fileName.endsWith(".htm", ignoreCase = true) ->
+        "text/html"
+    fileName.endsWith(".css", ignoreCase = true) -> "text/css"
+    fileName.endsWith(".js", ignoreCase = true) || fileName.endsWith(".mjs", ignoreCase = true) ->
+        "text/javascript"
+    fileName.endsWith(".json", ignoreCase = true) -> "application/json"
+    fileName.endsWith(".log", ignoreCase = true) || fileName.endsWith(".txt", ignoreCase = true) ||
+        fileName.endsWith(".md", ignoreCase = true) || fileName.endsWith(".sha256", ignoreCase = true) ||
+        fileName.endsWith(".version", ignoreCase = true) -> "text/plain"
+    else -> "application/octet-stream"
 }

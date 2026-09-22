@@ -14,7 +14,7 @@ class JsonTest {
     fun `游戏索引序列化往返`() {
         val index = GameIndex(
             games = listOf(
-                GameMeta(id = 1001L, title = "打地鼠", description = "一个打地鼠小游戏", createdAt = 1001L, updatedAt = 1002L, playCount = 3),
+                GameMeta(id = 1001L, title = "打地鼠", description = "一个打地鼠小游戏", createdAt = 1001L, updatedAt = 1002L),
                 GameMeta(id = 1002L, title = "接水果", createdAt = 1003L, updatedAt = 1003L)
             )
         )

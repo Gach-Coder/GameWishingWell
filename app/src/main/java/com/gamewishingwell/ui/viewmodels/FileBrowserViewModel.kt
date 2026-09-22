@@ -11,11 +11,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-/** 只读文件查看器的状态：打开中 / 就绪 / 打不开（文件消失、路径非法等）。 */
+/** 只读文件查看器的状态：打开中 / 就绪 / 打不开（文件消失、路径非法、读取异常等）。 */
 sealed interface FileViewerState {
     data object Loading : FileViewerState
     data class Ready(val content: GameFileContent) : FileViewerState
-    data object Failed : FileViewerState
+
+    /** [reason] 为现场诊断信息（异常摘要/目标不可读原因），查看器以小字展示。 */
+    data class Failed(val reason: String? = null) : FileViewerState
 }
 
 /**
@@ -63,9 +65,14 @@ class FileBrowserViewModel(private val repository: GameRepository) : ViewModel()
         viewerJob?.cancel()
         _viewer.value = FileViewerState.Loading
         viewerJob = viewModelScope.launch {
-            _viewer.value = repository.readGameFile(gameId, relativePath)
-                ?.let(FileViewerState::Ready)
-                ?: FileViewerState.Failed
+            // 读取不可用会抛异常（携带现场上下文）；失败原因小字展示在查看器里，
+            // 并顺带刷新列表——若条目已被并发删除，列表同步回到真实状态（消除幽灵条目）。
+            runCatching { repository.readGameFile(gameId, relativePath) }
+                .onSuccess { _viewer.value = FileViewerState.Ready(it) }
+                .onFailure {
+                    refresh()
+                    _viewer.value = FileViewerState.Failed("${it.javaClass.simpleName}: ${it.message}".take(160))
+                }
         }
     }
 
@@ -74,11 +81,16 @@ class FileBrowserViewModel(private val repository: GameRepository) : ViewModel()
         _viewer.value = null
     }
 
+    /** 「导出文件」的源数据：完整文件字节（不截断、二进制原样），失败返回 null。 */
+    suspend fun readExportBytes(relativePath: String): ByteArray? =
+        runCatching { repository.readGameFileBytes(gameId, relativePath) }.getOrNull()
+
     private fun refresh() {
         listJob?.cancel()
         _entries.value = null
         listJob = viewModelScope.launch {
-            _entries.value = repository.listGameFiles(gameId, _currentPath.value)
+            _entries.value = runCatching { repository.listGameFiles(gameId, _currentPath.value) }
+                .getOrDefault(emptyList())
         }
     }
 

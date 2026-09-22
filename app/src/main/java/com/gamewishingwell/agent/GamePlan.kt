@@ -443,8 +443,8 @@ object PlanningEngine {
                 result += "3D 场景/模型渲染方案"
             }
             GameSchema.DIMENSION_2_5D -> {
-                result += "纯平面 2D 渲染方案"
-                result += "3D 场景/模型渲染方案"
+                result += "纯平面 2D 渲染方案（无纵深与等距感）"
+                result += "自由视角/可旋转/可缩放相机的全 3D 方案（2.5D 相机锁定固定等距角）"
             }
             GameSchema.DIMENSION_3D -> {
                 result += "纯平面 2D 渲染方案"
@@ -456,13 +456,17 @@ object PlanningEngine {
         } else {
             "竖版/竖屏布局方案"
         }
-        // 引擎条件化：3D 用内置 three.js（+真刚体需求可选 cannon）；物理系统用内置
-        // matter.js（手写碰撞是 bug 重灾区）；2D/2.5D 默认 Canvas 2D（弹幕类性能
-        // 不足时可选 pixi）。条件裁决见 GameEngines.allowedFor。
-        result += if (schema.visualDimension == GameSchema.DIMENSION_3D) {
-            "手写 Canvas 2D 软件光栅化模拟 3D（3D 必须使用内置 three.js 引擎：在 head 声明 <meta name=\"ww-engine\" content=\"three\">，平台渲染时自动注入）"
-        } else {
-            "3D 渲染方案（2D/2.5D 用 Canvas 2D 自绘；弹幕类同屏数百实体性能不足时可选内置 pixi.js）"
+        // 引擎条件化：3D 用内置 three.js（+真刚体需求可选 cannon）；2.5D 同样用内置
+        // three.js 正交等距框架（手写等距投影/深度排序是实测 bug 重灾区，2026-09-07
+        // 起 2.5D 与 3D 同等待遇）；物理系统用内置 matter.js；2D 默认 Canvas 2D
+        // （弹幕类性能不足时可选 pixi）。条件裁决见 GameEngines.allowedFor。
+        result += when (schema.visualDimension) {
+            GameSchema.DIMENSION_3D ->
+                "手写 Canvas 2D 软件光栅化模拟 3D（3D 必须使用内置 three.js 引擎：在 head 声明 <meta name=\"ww-engine\" content=\"three\">，平台渲染时自动注入）"
+            GameSchema.DIMENSION_2_5D ->
+                "手写斜 45° 投影/深度排序模拟 2.5D（2.5D 必须使用内置 three.js 正交相机等距框架：在 head 声明 <meta name=\"ww-engine\" content=\"three\">，平台渲染时自动注入；深度排序交给深度缓冲）"
+            else ->
+                "3D 渲染方案（2D 用 Canvas 2D 自绘；弹幕类同屏数百实体性能不足时可选内置 pixi.js）"
         }
         if (schema.gameSystems.contains("物理")) {
             result += "手写物理/碰撞模拟（物理系统必须使用内置 matter.js：声明 ww-engine 由平台注入；3D 真刚体需求可选 cannon）"

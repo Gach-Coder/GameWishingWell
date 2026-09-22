@@ -61,6 +61,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.gamewishingwell.agent.BrowserInterventions
 import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.agent.HtmlEnhancer
 import com.gamewishingwell.ui.rememberContainer
@@ -156,8 +157,30 @@ fun GameScreen(
     }
 
     val loadHtml: (WebView, String) -> Unit = { view, h ->
-        view.loadDataWithBaseURL(null, HtmlEnhancer.inject(h), "text/html", "UTF-8", null)
+        // 每游戏独立假 origin（子域隔离）：localStorage 的 origin 只由 scheme+host+port
+        // 构成、路径不参与——同 host 不同 path 的全部游戏会折叠成同一 origin 共享同一份
+        // localStorage（实测事故：两局游戏 ww:save schema 不同，交叉读取触发防御性删除
+        // 互相清档）。host 内嵌 source+gameId 后每游戏独立键空间，存档跨重启/覆盖安装
+        // 存活，预览与运行区互不污染；假域名不产生任何网络请求（游戏自包含）。
+        view.loadDataWithBaseURL(
+            "https://$source$gameId.ww.local/",
+            HtmlEnhancer.inject(h), "text/html", "UTF-8", null
+        )
         loadedHtml = h
+    }
+
+    // 清除存档（平台通用，不依赖游戏配合）：删 ww:save 契约键后整页重载——比 restart()
+    // 更彻底（restart 只重置本局，内存中的最高分等跨局状态保留；重载后从空存档全新开局）。
+    val clearSaveAndRestart: () -> Unit = {
+        val view = webView
+        val h = loadedHtml
+        view?.evaluateJavascript(
+            "(function(){try{localStorage.removeItem('ww:save');}catch(e){}})()"
+        ) { _ ->
+            if (h != null) loadHtml(view, h)
+        }
+        closeSettings()
+        Toast.makeText(context, "已清除存档", Toast.LENGTH_SHORT).show()
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -189,7 +212,13 @@ fun GameScreen(
                     webChromeClient = object : WebChromeClient() {
                         override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
                             if (consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
-                                vm.onJsError(consoleMessage.message() ?: "未知 JS 错误")
+                                val msg = consoleMessage.message() ?: "未知 JS 错误"
+                                // 浏览器干预告警（passive preventDefault 等）不弹报错覆盖层：
+                                // 不是游戏缺陷，弹给用户只会驱动"修复良性告警"的高危回合
+                                // （实测 61 轮重写触摸架构消告警，真实手感反而劣化）。
+                                if (!BrowserInterventions.isIntervention(msg)) {
+                                    vm.onJsError(msg)
+                                }
                             }
                             return true
                         }
@@ -325,10 +354,14 @@ fun GameScreen(
                     )
                     Spacer(Modifier.size(4.dp))
                     Text(
-                        "重新游戏会重置本局进度；未入库草稿保存时命名入库，已入库游戏直接覆盖保存（保持原名）。",
+                        "重新游戏只重置本局（保留存档）；清除存档会删除最高分等跨局记录并重开。首次保存命名入库，之后保存直接覆盖（保持原名），改名可在首页进行。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    Spacer(Modifier.size(8.dp))
+                    TextButton(onClick = clearSaveAndRestart) {
+                        Text("清除存档并重开", color = MaterialTheme.colorScheme.error)
+                    }
                 }
             },
             confirmButton = {
@@ -342,10 +375,10 @@ fun GameScreen(
                                     Toast.makeText(context, "正在生成中，请等本轮完成后再保存", Toast.LENGTH_SHORT).show()
                                 } else {
                                     closeSettings()
-                                    if (loadedGameId != null) {
-                                        // 已有游戏的旧版本（已命名）：直接覆盖保存不必重命名；
-                                        // 空标题经 saveCurrentGame 语义化为"保持原名"。
-                                        vm.saveDraft("") { ok ->
+                                    // 仅首次保存询问命名（未命名草稿）；已命名游戏直接覆盖保持原名。
+                                    vm.saveGame(
+                                        onNeedName = { showSaveDialog = true },
+                                        onDone = { ok ->
                                             Toast.makeText(
                                                 context,
                                                 if (ok) "已保存" else "保存失败",
@@ -353,9 +386,7 @@ fun GameScreen(
                                             ).show()
                                             if (ok) onHome()
                                         }
-                                    } else {
-                                        showSaveDialog = true
-                                    }
+                                    )
                                 }
                             }
                         ) { Text("保存游戏") }
@@ -372,6 +403,7 @@ fun GameScreen(
         )
     }
 
+    // 首次保存（未命名草稿）命名框：默认名取会话首条用户消息前 20 字。
     if (showSaveDialog) {
         val defaultTitle = remember {
             vm.agentSession.value?.messages

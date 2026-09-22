@@ -74,6 +74,7 @@ fun SettingsScreen() {
     var showKey by remember { mutableStateOf(false) }
     var providerMenu by remember { mutableStateOf(false) }
     var modelMenu by remember { mutableStateOf(false) }
+    var baseUrlMenu by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         providerId = settings.providerId
@@ -169,14 +170,45 @@ fun SettingsScreen() {
                 modifier = Modifier.fillMaxWidth()
             )
 
-            OutlinedTextField(
-                value = baseUrl,
-                onValueChange = { baseUrl = it },
-                label = { Text("接口地址 Base URL") },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                modifier = Modifier.fillMaxWidth()
-            )
+            // 接口地址：可编辑 + 服务商下拉（可选清单来自 ProviderPreset.baseUrls，首位即默认）。
+            // 备选是同厂商的套餐专用端点（小米 Token Plan、智谱 Coding Plan）或国际端点——
+            // Key 与端点须来自同一发放平台，切换后记得换对应平台的 Key。
+            // 手输清单外的地址同样有效；无备选的服务商（清单不足两项）不提供下拉。
+            val baseUrlOptions = currentPreset?.baseUrls.orEmpty()
+            ExposedDropdownMenuBox(
+                expanded = baseUrlMenu,
+                onExpandedChange = { if (baseUrlOptions.size > 1) baseUrlMenu = it }
+            ) {
+                OutlinedTextField(
+                    value = baseUrl,
+                    onValueChange = { baseUrl = it },
+                    label = { Text("接口地址 Base URL") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    trailingIcon = if (baseUrlOptions.size > 1) {
+                        { ExposedDropdownMenuDefaults.TrailingIcon(expanded = baseUrlMenu) }
+                    } else null,
+                    modifier = Modifier
+                        .menuAnchor(MenuAnchorType.PrimaryEditable)
+                        .fillMaxWidth()
+                )
+                if (baseUrlOptions.size > 1) {
+                    ExposedDropdownMenu(
+                        expanded = baseUrlMenu,
+                        onDismissRequest = { baseUrlMenu = false }
+                    ) {
+                        baseUrlOptions.forEach { u ->
+                            DropdownMenuItem(
+                                text = { Text(u) },
+                                onClick = {
+                                    baseUrl = u
+                                    baseUrlMenu = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
 
             // 模型名称：可编辑 + 服务商下拉（可选清单来自 ProviderPreset.models，首位即默认）。
             // 手输清单外的模型名同样有效——自定义网关/新模型无需改代码；custom 无清单不提供下拉。
