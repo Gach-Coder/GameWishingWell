@@ -1,9 +1,12 @@
 package com.gamewishingwell.agent
 
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+
+/** 参数面板的参数档案：合法键集（GAME_CONFIG 顶层键）+ 键 → 行尾注释（检测与默认参数视图用）。 */
+data class ConfigParamInfo(val keys: Set<String>, val docs: Map<String, String>)
 
 /**
  * 参数外置契约（平台侧共享常量与解析器，校验器/注入器/参数面板三方同源）：
@@ -267,19 +270,36 @@ object GameConfigContract {
 
     /** 默认参数表的展示用形态（面板"默认参数"只读视图）。 */
     fun prettyDefaults(html: String): String? =
-        extractDefaults(html)?.let { prettyJson.encodeToString(it) }
+        extractDefaults(html)?.let { prettyJson.encodeToString(JsonObject.serializer(), it) }
 
     /**
-     * 面板"填充全部"模板：默认值全量铺底、当前覆盖逐键盖顶（玩家看到的就是生效值），
-     * 键序＝默认表序在前、覆盖新增键在后。默认表或覆盖非法时返回 null。
+     * 逐行提取 GAME_CONFIG 参数的行尾注释：键 → 注释文本（`"key": 值, // 注释` 形态；
+     * 无注释的键缺席）。数组内层键行无注释不误收；值内含 // 时注释从首个 // 截取（仅展示用，
+     * 容差可接受）。
      */
-    fun buildEditorTemplate(defaults: JsonObject, currentOverride: String?): String? {
-        val override = currentOverride
-            ?.takeIf { isValidOverrideJson(it) }
-            ?.let { runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
-        val merged = LinkedHashMap<String, JsonElement>()
-        defaults.forEach { (k, v) -> merged[k] = v }
-        override?.forEach { (k, v) -> merged[k] = v }
-        return prettyJson.encodeToString(JsonObject(merged))
-    }
+    private val paramDocRegex = Regex(
+        """^[ \t]*"([A-Za-z_$][\w$]*)"[ \t]*:.*?//[ \t]?(.*)$""",
+        RegexOption.MULTILINE
+    )
+
+    fun extractParamDocs(content: String): Map<String, String> =
+        paramDocRegex.findAll(content).associate { it.groupValues[1] to it.groupValues[2].trim() }
+
+    /** 默认参数视图渲染：`"键": 值    // 注释`（保留 config.js 声明序，无注释键省略注释段）。 */
+    fun renderDefaults(defaults: JsonObject, docs: Map<String, String>): String =
+        defaults.entries.joinToString("\n") { (k, v) ->
+            val doc = docs[k]
+            "\"$k\": $v" + if (doc.isNullOrEmpty()) "" else "    // $doc"
+        }
+
+    /**
+     * 参数值输入的宽松解析：先按 JSON 解析（数字/布尔/null/数组/对象都接受），
+     * 解析失败按字符串字面量处理（参数面板输入框免引号——填 #ffb034 即字符串色值）。
+     */
+    fun parseValueOrString(text: String): JsonElement =
+        runCatching { json.parseToJsonElement(text.trim()) }.getOrElse { JsonPrimitive(text) }
+
+    /**
+     * 面板"填充全部"模板已随参数调整编辑器结构化改版移除（检测/逐项添加取代全量铺底）。
+     */
 }

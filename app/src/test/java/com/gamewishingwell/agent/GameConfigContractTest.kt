@@ -99,19 +99,41 @@ class GameConfigContractTest {
     }
 
     @Test
-    fun `编辑器模板-默认全量叠加当前覆盖`() {
-        val defaults = GameConfigContract.extractDefaults(contractHtml)!!
-        val template = GameConfigContract.buildEditorTemplate(defaults, """{"playerSpeed": 260, "myExtra": "自定义"}""")!!
-        val parsed = GameConfigContract.extractDefaults("window.GAME_CONFIG = $template;")
-        assertNotNull(parsed)
-        // 覆盖值盖顶、默认键保留、用户新增键带上
-        assertEquals("260", (parsed!!["playerSpeed"] as kotlinx.serialization.json.JsonPrimitive).content)
-        assertEquals("100", (parsed["maxHp"] as kotlinx.serialization.json.JsonPrimitive).content)
-        assertEquals("自定义", (parsed["myExtra"] as kotlinx.serialization.json.JsonPrimitive).content)
-        // 覆盖非法（坏 JSON）时等价于无覆盖
-        val fallback = GameConfigContract.buildEditorTemplate(defaults, "{oops")!!
-        assertTrue(fallback.contains("\"playerSpeed\""))
-        assertTrue(fallback.contains("130"))
+    fun `注释提取与默认值渲染`() {
+        // 带注释样例验证键→行尾注释提取
+        val cfg = """
+            window.GAME_CONFIG = {
+              "speed": 260,            // 移动速度
+              "name": "疾风", // 名字
+              "items": [1, 2],         // 道具表
+              "noComment": true
+            };
+        """.trimIndent()
+        val d = GameConfigContract.extractParamDocs(cfg)
+        assertEquals("移动速度", d["speed"])
+        assertEquals("名字", d["name"])
+        assertEquals("道具表", d["items"])
+        assertNull(d["noComment"])
+        // 渲染：默认值 + 行尾注释（无注释键省略注释段）
+        val defaults = GameConfigContract.extractDefaults(cfg)!!
+        val rendered = GameConfigContract.renderDefaults(defaults, d)
+        assertTrue(rendered.contains("\"speed\": 260    // 移动速度"))
+        assertTrue(rendered.contains("\"noComment\": true"))
+    }
+
+    @Test
+    fun `宽松值解析-数字布尔数组按JSON-其余按字符串`() {
+        assertEquals("260", (GameConfigContract.parseValueOrString("260") as kotlinx.serialization.json.JsonPrimitive).content)
+        assertEquals("true", (GameConfigContract.parseValueOrString("true") as kotlinx.serialization.json.JsonPrimitive).content)
+        assertEquals("false", (GameConfigContract.parseValueOrString("false") as kotlinx.serialization.json.JsonPrimitive).content)
+        // 数组/对象按 JSON 原样
+        assertEquals(3, (GameConfigContract.parseValueOrString("[1, 2, 3]") as kotlinx.serialization.json.JsonArray).size)
+        // 非法 JSON（颜色/含空格文本/带引号残缺）按字符串字面量
+        assertEquals("#ffb347", (GameConfigContract.parseValueOrString("#ffb347") as kotlinx.serialization.json.JsonPrimitive).content)
+        assertEquals("疾 风", (GameConfigContract.parseValueOrString("疾 风") as kotlinx.serialization.json.JsonPrimitive).content)
+        assertEquals("\"", (GameConfigContract.parseValueOrString("\"") as kotlinx.serialization.json.JsonPrimitive).content)
+        // 首尾空白剔除后再判定
+        assertEquals("260", (GameConfigContract.parseValueOrString(" 260 ") as kotlinx.serialization.json.JsonPrimitive).content)
     }
 
     // ---------- 写入护栏支持（修复轮 config 维护） ----------

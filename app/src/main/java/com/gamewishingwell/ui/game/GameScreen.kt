@@ -23,7 +23,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Settings
@@ -44,6 +46,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -109,9 +112,6 @@ fun GameScreen(
     var showSaveDialog by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showConfigEditor by remember { mutableStateOf(false) }
-    var configText by remember { mutableStateOf("{}") }
-    var configError by remember { mutableStateOf<String?>(null) }
-    var showConfigDefaults by remember { mutableStateOf(false) }
     var volume by remember { mutableStateOf(0.8f) }
     var loadDone by remember { mutableStateOf(false) }
 
@@ -351,7 +351,9 @@ fun GameScreen(
             onDismissRequest = closeSettings,
             title = { Text("游戏设置") },
             text = {
-                Column {
+                // 横屏短屏（手机 ~360dp 可用高）下内容超出对话框高度——可滚动，
+                // 否则尾部的按钮会被裁出屏外（实测 density 480 横屏"参数调整"被裁掉）
+                Column(Modifier.verticalScroll(rememberScrollState())) {
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -374,15 +376,15 @@ fun GameScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.size(8.dp))
-                    TextButton(onClick = clearSaveAndRestart) {
-                        Text("清除存档并重开", color = MaterialTheme.colorScheme.error)
-                    }
                     // 参数调整入口（参数外置契约）：仅运行区（game）且游戏定义了
                     // GAME_CONFIG 时显示——玩家免 LLM 直接改参数（user_config.json）。
                     if (source == "game" && configSupported) {
                         TextButton(onClick = { showConfigEditor = true }) {
                             Text("参数调整")
                         }
+                    }
+                    TextButton(onClick = clearSaveAndRestart) {
+                        Text("清除存档并重开", color = MaterialTheme.colorScheme.error)
                     }
                 }
             },
@@ -425,22 +427,27 @@ fun GameScreen(
         )
     }
 
-    // 参数调整编辑器（参数外置契约·玩家免 LLM 调参）：编辑 games/<id>/user_config.json，
-    // JSON 对象校验通过才落盘（仓库侧同一道闸）；保存后 reload → 覆盖流变化 →
-    // 整页重载生效（参数在游戏 init 读取一次；对局进度由 ww:save 存档契约自动恢复）。
-    // 恢复全部默认＝清空为 {} 保存；"默认参数"只读视图解决"有哪些参数可调"的可发现性。
+    // 参数调整编辑器（参数外置契约·结构化两栏）：上栏填参数名点【检测】——合法则展示该参数
+    // 注释并把当前生效值自动填入下栏（覆盖优先、默认兜底）；下栏改新值点【添加更改】入暂存
+    // 清单，可继续检测/添加多条；【保存并生效】把全部更改并入 user_config.json 并整页重载
+    // 生效（参数在游戏 init 读取一次；对局进度由 ww:save 存档契约自动恢复）。
+    // 免 JSON 语法：数值直接填数字、布尔填 true/false、其余按文本原样保存（仓库侧仍校验整体 JSON）。
     if (showConfigEditor) {
-        LaunchedEffect(Unit) {
-            configText = vm.readUserConfigRaw()
-            configError = null
-            showConfigDefaults = false
-        }
+        var cfgName by remember { mutableStateOf("") }
+        var cfgValue by remember { mutableStateOf("") }
+        var cfgCheckNote by remember { mutableStateOf<String?>(null) }
+        var cfgCheckOk by remember { mutableStateOf(false) }
+        var cfgError by remember { mutableStateOf<String?>(null) }
+        var showDefaultsView by remember { mutableStateOf(false) }
+        val pending = remember { mutableStateListOf<Pair<String, String>>() }
+        val paramInfo by vm.configInfo.collectAsState()
+
         AlertDialog(
             onDismissRequest = { showConfigEditor = false },
             title = { Text("参数调整") },
             text = {
-                Column {
-                    if (showConfigDefaults) {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    if (showDefaultsView) {
                         Text(
                             "默认参数（只读，来自游戏配置）",
                             style = MaterialTheme.typography.labelSmall,
@@ -448,28 +455,103 @@ fun GameScreen(
                         )
                         Spacer(Modifier.size(6.dp))
                         Text(
-                            configDefaults ?: "（默认参数解析失败：可直接编辑覆盖 JSON）",
+                            configDefaults ?: "（默认参数解析失败：仍可按参数名直接添加更改）",
                             style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
                         )
                     } else {
                         Text(
-                            "以 JSON 对象覆盖想改的参数，其余用游戏默认值；保存并重载后生效。" +
-                                "例：{\"playerSpeed\": 260}。清空为 {} 保存即恢复全部默认。",
+                            "上栏填参数名点【检测】，下栏改值后【添加更改】；可连续添加多条，最后【保存并生效】。" +
+                                "数值直接填数字，布尔填 true/false，其余按文本原样填写。",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Spacer(Modifier.size(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = cfgName,
+                                onValueChange = {
+                                    cfgName = it
+                                    cfgCheckOk = false
+                                    cfgCheckNote = null
+                                },
+                                label = { Text("参数名") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(Modifier.size(8.dp))
+                            OutlinedButton(onClick = {
+                                val name = cfgName.trim()
+                                val info = paramInfo
+                                when {
+                                    info == null ->
+                                        { cfgCheckOk = false; cfgCheckNote = "参数表解析失败，无法校验参数名" }
+                                    name.isEmpty() ->
+                                        { cfgCheckOk = false; cfgCheckNote = "请先填写参数名" }
+                                    name !in info.keys -> {
+                                        cfgCheckOk = false
+                                        cfgCheckNote = "「$name」不是该游戏的参数（点【默认参数】可查看全部参数名）"
+                                    }
+                                    else -> {
+                                        cfgCheckOk = true
+                                        val doc = info.docs[name]
+                                        cfgCheckNote = "✓ " + if (doc.isNullOrEmpty()) "（无注释）" else doc
+                                        cfgValue = vm.effectiveParamValue(name) ?: ""
+                                    }
+                                }
+                            }) { Text("检测") }
+                        }
+                        cfgCheckNote?.let {
+                            Spacer(Modifier.size(4.dp))
+                            Text(
+                                it,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (cfgCheckOk) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                            )
+                        }
+                        Spacer(Modifier.size(6.dp))
                         OutlinedTextField(
-                            value = configText,
+                            value = cfgValue,
                             onValueChange = {
-                                configText = it
-                                configError = null
+                                cfgValue = it
+                                cfgError = null
                             },
-                            minLines = 4,
-                            maxLines = 10,
-                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            label = { Text("新数值（检测后自动填当前值）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
                         )
-                        configError?.let {
+                        Spacer(Modifier.size(6.dp))
+                        TextButton(
+                            enabled = cfgCheckOk && cfgValue.isNotBlank(),
+                            onClick = {
+                                val name = cfgName.trim()
+                                pending.removeAll { it.first == name }
+                                pending.add(name to cfgValue.trim())
+                                cfgName = ""
+                                cfgValue = ""
+                                cfgCheckOk = false
+                                cfgCheckNote = null
+                            }
+                        ) { Text("添加更改") }
+                        if (pending.isNotEmpty()) {
+                            Spacer(Modifier.size(4.dp))
+                            Text(
+                                "当前更改（${pending.size} 项，未保存）",
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                            pending.forEach { (k, v) ->
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        "$k = $v",
+                                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    TextButton(onClick = { pending.removeAll { it.first == k } }) {
+                                        Text("移除", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            }
+                        }
+                        cfgError?.let {
                             Spacer(Modifier.size(4.dp))
                             Text(
                                 it,
@@ -482,31 +564,27 @@ fun GameScreen(
             },
             confirmButton = {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (showConfigDefaults) {
-                        TextButton(onClick = { showConfigDefaults = false }) { Text("返回编辑") }
+                    if (showDefaultsView) {
+                        TextButton(onClick = { showDefaultsView = false }) { Text("返回编辑") }
                     } else {
-                        TextButton(
-                            enabled = configDefaults != null,
+                        TextButton(onClick = { showDefaultsView = true }) { Text("默认参数") }
+                        Button(
+                            enabled = pending.isNotEmpty(),
                             onClick = {
-                                vm.buildFullConfigTemplate { tpl ->
-                                    tpl?.let {
-                                        configText = it
-                                        configError = null
+                                val changes = pending.toList()
+                                vm.saveUserConfigChanges(changes) { ok ->
+                                    if (ok) {
+                                        showConfigEditor = false
+                                        closeSettings()
+                                        Toast.makeText(
+                                            context, "已保存 ${changes.size} 项更改，重载后生效", Toast.LENGTH_SHORT
+                                        ).show()
+                                    } else {
+                                        cfgError = "保存失败：更改未落盘，请重试"
                                     }
                                 }
                             }
-                        ) { Text("填充全部") }
-                        TextButton(onClick = {
-                            vm.saveUserConfig(configText) { ok ->
-                                if (ok) {
-                                    showConfigEditor = false
-                                    closeSettings()
-                                    Toast.makeText(context, "已保存，重载后生效", Toast.LENGTH_SHORT).show()
-                                } else {
-                                    configError = "不是合法的 JSON 对象（应为 {\"键\": 值} 形式，字符串用双引号）"
-                                }
-                            }
-                        }) { Text("保存并生效") }
+                        ) { Text("保存并生效") }
                     }
                 }
             },

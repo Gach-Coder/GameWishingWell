@@ -3,6 +3,7 @@ package com.gamewishingwell.ui.viewmodels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.gamewishingwell.agent.AgentHub
+import com.gamewishingwell.agent.ConfigParamInfo
 import com.gamewishingwell.agent.GameAgent
 import com.gamewishingwell.agent.GameBundle
 import com.gamewishingwell.agent.GameConfigContract
@@ -21,6 +22,9 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class GameViewModel(
@@ -62,9 +66,17 @@ class GameViewModel(
     private val _configSupported = MutableStateFlow(false)
     val configSupported: StateFlow<Boolean> = _configSupported.asStateFlow()
 
-    /** 默认参数表（GAME_CONFIG 提取＋规范化为 JSON；提取失败为 null＝"填充全部"不可用）。 */
+    /** 默认参数表（GAME_CONFIG 提取＋注释渲染；提取失败为 null＝"默认参数"视图不可用）。 */
     private val _configDefaults = MutableStateFlow<String?>(null)
     val configDefaults: StateFlow<String?> = _configDefaults.asStateFlow()
+
+    /** 参数档案（合法键集 + 注释）：编辑器"检测"的校验依据与注释展示来源。 */
+    private val _configInfo = MutableStateFlow<ConfigParamInfo?>(null)
+    val configInfo: StateFlow<ConfigParamInfo?> = _configInfo.asStateFlow()
+
+    /** 生效值查找缓存（load 时刷新）：override 优先、default 兜底——"检测"自动填当前值。 */
+    private var defaultsObj: JsonObject? = null
+    private var overrideObj: JsonObject? = null
 
     private val sessionJson = Json { ignoreUnknownKeys = true }
 
@@ -116,16 +128,26 @@ class GameViewModel(
             _landscape.value = landscape
             _jsError.value = null
             // 参数外置契约的运行区装载：覆盖文件原文 → 合法才注入；GAME_CONFIG 探测
-            // 与默认表提取都在合并视图上做（config.js 已内联，单文件游戏同样成立）。
+            // 与默认表/参数档案提取都在合并视图上做（config.js 已内联，单文件游戏同样成立）。
             if (source == "game" && gameId > 0 && html != null) {
                 val raw = repository.readUserConfig(gameId)
-                _configOverride.value = raw?.takeIf { GameConfigContract.isValidOverrideJson(it) }
+                val validOverride = raw?.takeIf { GameConfigContract.isValidOverrideJson(it) }
+                _configOverride.value = validOverride
                 _configSupported.value = GameConfigContract.hasConfigObject(html)
-                _configDefaults.value = GameConfigContract.prettyDefaults(html)
+                val defaults = GameConfigContract.extractDefaults(html)
+                defaultsObj = defaults
+                overrideObj = validOverride
+                    ?.let { runCatching { sessionJson.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+                val docs = GameConfigContract.extractParamDocs(html)
+                _configDefaults.value = defaults?.let { GameConfigContract.renderDefaults(it, docs) }
+                _configInfo.value = defaults?.let { ConfigParamInfo(keys = it.keys, docs = docs) }
             } else {
                 _configOverride.value = null
                 _configSupported.value = false
                 _configDefaults.value = null
+                _configInfo.value = null
+                defaultsObj = null
+                overrideObj = null
             }
         }
     }
@@ -202,35 +224,34 @@ class GameViewModel(
         }
     }
 
-    // ---------- 参数调整面板（参数外置契约·玩家免 LLM 调参） ----------
+    // ---------- 参数调整面板（参数外置契约·玩家免 LLM 调参·结构化两栏编辑器） ----------
 
-    /** 编辑器初值：覆盖文件原文（含外部导入的坏文件——如实展示供修复）；无文件给空对象。 */
-    suspend fun readUserConfigRaw(): String =
-        _loadedGameId.value?.let { repository.readUserConfig(it) } ?: "{}"
+    /** "检测"自动填充的当前生效值：覆盖优先、默认兜底（字符串值免引号展示；非 JsonPrimitive 原样紧凑序列化）。 */
+    fun effectiveParamValue(name: String): String? {
+        val el = overrideObj?.get(name) ?: defaultsObj?.get(name) ?: return null
+        return if (el is JsonPrimitive) el.content else el.toString()
+    }
 
-    /** 保存覆盖并重载生效：JSON 对象校验在仓库写入前（false＝非法不落盘，UI 提示）。 */
-    fun saveUserConfig(text: String, onDone: (Boolean) -> Unit) {
+    /**
+     * "保存并生效"：把暂存的全部更改（键→输入原文）并入既有覆盖（同键盖顶）后整体落盘，
+     * 成功即 reload（覆盖流变化 → 整页重载生效）。输入值经宽松解析（数字/布尔/数组按 JSON，
+     * 其余按字符串）——写入前的 JSON 对象校验仍在仓库侧兜底。
+     */
+    fun saveUserConfigChanges(changes: List<Pair<String, String>>, onDone: (Boolean) -> Unit) {
         val id = _loadedGameId.value
-        if (id == null) {
+        if (id == null || changes.isEmpty()) {
             onDone(false)
             return
         }
         viewModelScope.launch {
-            val ok = repository.writeUserConfig(id, text)
+            val merged = LinkedHashMap<String, JsonElement>()
+            overrideObj?.forEach { (k, v) -> merged[k] = v }
+            changes.forEach { (k, raw) ->
+                if (k.isNotBlank()) merged[k.trim()] = GameConfigContract.parseValueOrString(raw)
+            }
+            val ok = repository.writeUserConfig(id, JsonObject(merged).toString())
             if (ok) reload()
             onDone(ok)
-        }
-    }
-
-    /** "填充全部"模板：默认参数全量 + 当前覆盖逐键盖顶（玩家看到的就是生效值）。 */
-    fun buildFullConfigTemplate(onDone: (String?) -> Unit) {
-        viewModelScope.launch {
-            val id = _loadedGameId.value
-            val html = _html.value
-            if (id == null || html == null) return@launch onDone(null)
-            val defaults = withContext(Dispatchers.IO) { GameConfigContract.extractDefaults(html) }
-                ?: return@launch onDone(null)
-            onDone(GameConfigContract.buildEditorTemplate(defaults, repository.readUserConfig(id)))
         }
     }
 }
