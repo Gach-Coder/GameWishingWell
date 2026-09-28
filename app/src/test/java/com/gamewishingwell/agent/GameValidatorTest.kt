@@ -167,4 +167,33 @@ class GameValidatorTest {
         val r4 = GameValidator.validate(selfContained, localFileExists = { true })
         assertFalse(r4.warnings.any { it.category == "structure" })
     }
+
+    @Test
+    fun `参数外置契约-首代生成强制存在且合并行完整`() {
+        val base = "<html><body><script>window.__wwDebugState = function(){};</script></body></html>"
+        // 首代生成（requireConfigContract）缺 GAME_CONFIG：error
+        val missing = GameValidator.validate(base, requireConfigContract = true)
+        assertTrue(missing.errors.any { it.category == "config" && it.message.contains("缺少参数外置契约") })
+        // 修改/修复轮（默认 false）不追溯旧游戏：无 config 相关错误
+        val legacy = GameValidator.validate(base)
+        assertFalse(legacy.errors.any { it.category == "config" })
+        // 契约完整（定义＋平台覆盖合并行）：无 config 错误
+        val ok = GameValidator.validate(
+            "<html><body><script>window.GAME_CONFIG = { \"speed\": 1 };" +
+                "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});" +
+                "window.__wwDebugState = function(){};</script></body></html>",
+            requireConfigContract = true
+        )
+        assertFalse(ok.errors.any { it.category == "config" })
+    }
+
+    @Test
+    fun `参数外置契约-定义了 GAME_CONFIG 却缺合并行任何轮都是 error`() {
+        val partial = "<html><body><script>window.GAME_CONFIG = { \"speed\": 1 };" +
+            "window.__wwDebugState = function(){};</script></body></html>"
+        // 即便修改轮（requireConfigContract=false）：模型本轮自己写了 GAME_CONFIG
+        // 就必须带合并行（补一行不违反修改范围契约）
+        val report = GameValidator.validate(partial)
+        assertTrue(report.errors.any { it.category == "config" && it.message.contains("__wwConfigOverride") })
+    }
 }

@@ -81,6 +81,15 @@ class GameRepository(private val context: Context) {
         const val AGENT_STATE_FILE = "agent_state.json"
 
         /**
+         * 玩家参数覆盖文件名（games/<id>/user_config.json）：平台自有 JSON、非游戏
+         * 代码文件——内容经"参数调整"面板写入（写入前校验为 JSON 对象），加载时由
+         * HtmlEnhancer 注入为 window.__wwConfigOverride 供游戏合并。与簿记同族的
+         * 隔离语义：保存镜像删除豁免、撤销清单与运行合并素材排除（不进 GameBundle
+         * /编辑区/Agent 视野），导出/导入 zip 随保存区整体往返。
+         */
+        const val USER_CONFIG_FILE = "user_config.json"
+
+        /**
          * 导出包内【编辑区】条目的保留前缀（.ww-workspace/<相对路径>）：编辑区
          * agent/workspace/game-<id> 里可能有未保存到保存区的修改（unsavedVersion），
          * 属于该对话现场的一部分——不随包导出则导入后"会话与状态描述新版、文件是旧版"。
@@ -204,7 +213,9 @@ class GameRepository(private val context: Context) {
     private fun writeGameFilesLocked(dir: File, files: Map<String, String>) {
         files.forEach { (name, content) ->
             if (name == POINTER_FILE || name.contains("/$VERSIONS_DIR/") || name.startsWith("$VERSIONS_DIR/") ||
-                name.startsWith("$LOG_DIR/") || name.contains("/$LOG_DIR/")
+                name.startsWith("$LOG_DIR/") || name.contains("/$LOG_DIR/") ||
+                // 玩家参数覆盖是平台通道（参数面板专用），同名"游戏文件"拒收防通道被冒用
+                name == USER_CONFIG_FILE
             ) {
                 return@forEach
             }
@@ -216,7 +227,7 @@ class GameRepository(private val context: Context) {
         mirrorDeleteLocked(dir, files)
     }
 
-    /** 镜像删除：移除保存区内不在编辑区清单中的游戏文件（簿记/保存点/日志豁免）。 */
+    /** 镜像删除：移除保存区内不在编辑区清单中的游戏文件（簿记/保存点/日志/玩家参数覆盖豁免）。 */
     private fun mirrorDeleteLocked(dir: File, files: Map<String, String>) {
         runCatching {
             dir.walkTopDown()
@@ -224,6 +235,7 @@ class GameRepository(private val context: Context) {
                 .forEach { f ->
                     val rel = f.relativeTo(dir).invariantSeparatorsPath
                     val exempt = rel == "session.json" || rel == "agent_state.json" ||
+                        rel == USER_CONFIG_FILE ||
                         rel.startsWith("$SAVEPOINT_DIR/") || rel.startsWith("$LOG_DIR/")
                     if (!exempt && rel !in files) f.delete()
                 }
@@ -302,7 +314,7 @@ class GameRepository(private val context: Context) {
             .filter { it.isFile }
             .map { it.relativeTo(dir).invariantSeparatorsPath }
             .filter { rel ->
-                rel != "session.json" && rel != "agent_state.json" &&
+                rel != "session.json" && rel != "agent_state.json" && rel != USER_CONFIG_FILE &&
                     rel != POINTER_FILE && !rel.endsWith(".sha256") &&
                     !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$VERSIONS_DIR/") &&
                     !rel.startsWith("$LOG_DIR/")
@@ -327,8 +339,50 @@ class GameRepository(private val context: Context) {
     }
 
     suspend fun loadGameAgentState(gameId: Long): String? = withContext(Dispatchers.IO) {
-        val f = File(File(gamesDir, gameId.toString()), "agent_state.json")
+        val f = File(File(gamesDir, gameId.toString()), AGENT_STATE_FILE)
         if (f.exists()) f.readText(Charsets.UTF_8) else null
+    }
+
+    // ---------- 玩家参数覆盖（参数外置契约·平台通道） ----------
+
+    /**
+     * 读取玩家参数覆盖原文（参数调整面板的编辑初值）。不存在返回 null；
+     * 内容不保证合法 JSON（外部导入的包可能携带坏文件）——注入与生效由调用方
+     * 先过 GameConfigContract.isValidOverrideJson，编辑器如实展示供玩家修复。
+     */
+    suspend fun readUserConfig(gameId: Long): String? = withContext(Dispatchers.IO) {
+        val f = File(File(gamesDir, gameId.toString()), USER_CONFIG_FILE)
+        if (f.isFile) f.readText(Charsets.UTF_8) else null
+    }
+
+    /**
+     * 写入玩家参数覆盖：只收 JSON 对象（写入前校验，坏 JSON 一律拒绝不落盘——
+     * 注入管道只消费合法 JSON，这道闸保证本文件永远不把游戏页面弄挂）。
+     * 不存在的游戏返回 false。
+     */
+    suspend fun writeUserConfig(gameId: Long, content: String): Boolean {
+        val trimmed = content.trim()
+        val isJsonObject = runCatching {
+            json.parseToJsonElement(trimmed) is JsonObject
+        }.getOrDefault(false)
+        if (!isJsonObject) return false
+        return withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                val dir = File(gamesDir, gameId.toString())
+                if (!dir.exists()) return@withLock false
+                File(dir, USER_CONFIG_FILE).writeText(trimmed, Charsets.UTF_8)
+                true
+            }
+        }
+    }
+
+    /** 删除玩家参数覆盖（清空为默认参数；文件不存在时幂等无害）。 */
+    suspend fun clearUserConfig(gameId: Long) {
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                File(File(gamesDir, gameId.toString()), USER_CONFIG_FILE).delete()
+            }
+        }
     }
 
     // ---------- 保存点（撤销锚点） ----------
@@ -685,7 +739,8 @@ class GameRepository(private val context: Context) {
     /**
      * 保存区（games/<id>）的全部游戏文件相对路径（递归，多文件形态含 js/css 子目录）。
      * 排除平台簿记与会话文件：.versions 归档（任何层级）、current.txt 指针、*.sha256、
-     * session.json/agent_state.json、.savepoint 保存点。撤销（保存版→编辑版覆盖）以此为准。
+     * session.json/agent_state.json、user_config.json（玩家参数覆盖，非游戏文件）、
+     * .savepoint 保存点。撤销（保存版→编辑版覆盖）以此为准。
      */
     suspend fun savedGameFilePaths(gameId: Long): List<String> = withContext(Dispatchers.IO) {
         val dir = File(gamesDir, gameId.toString())
@@ -695,7 +750,7 @@ class GameRepository(private val context: Context) {
             .map { it.relativeTo(dir).invariantSeparatorsPath }
             .filter { rel ->
                 rel != POINTER_FILE && !rel.endsWith(".sha256") &&
-                    rel != "session.json" && rel != "agent_state.json" &&
+                    rel != "session.json" && rel != "agent_state.json" && rel != USER_CONFIG_FILE &&
                     !rel.startsWith("$VERSIONS_DIR/") && !rel.contains("/$VERSIONS_DIR/") &&
                     !rel.startsWith("$SAVEPOINT_DIR/") && !rel.contains("/$SAVEPOINT_DIR/") &&
                     !rel.startsWith("$LOG_DIR/") && !rel.contains("/$LOG_DIR/")

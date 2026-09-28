@@ -108,6 +108,12 @@ class GameToolExecutor(
     /** 3D 游戏：scenarios 必含与 s0 相对的视角旋转断言（防"改弱断言绕过视角验证"）。 */
     private val requireViewAssertion: Boolean = false,
     /**
+     * 参数外置契约维护——参数键删除/改名的授权判定（键名 → 是否放行）：用户指令
+     * 点名该键或授权重做时 true。修复/迭代轮里 GAME_CONFIG 参数键只增不减
+     * （悬空引用与键守恒见 [configContractViolation]），与断言 id 守恒同语义。
+     */
+    private val configKeyDeletionAuthorized: (String) -> Boolean = { false },
+    /**
      * 修复轮建议范围（软约束）：报错签名涉及的工作区文件集合。非空时，写入范围外
      * 文件在观察里附越界提醒（不拒绝——跨文件修复合法，实测 touch 事件类报错
      * 的正确修复同时涉及 ui 与 main 两个文件；这里只把"顺带改无关系统"变成
@@ -259,6 +265,7 @@ class GameToolExecutor(
         }
         rewriteViolation(path, content)?.let { return outcome(call, ok = false, it) }
         moduleContractViolation(path, content)?.let { return outcome(call, ok = false, it) }
+        configContractViolation(path, content)?.let { return outcome(call, ok = false, it) }
         if (path == GameScenarios.FILE) {
             scenarioContinuityViolation(content)?.let { return outcome(call, ok = false, it) }
         }
@@ -341,6 +348,7 @@ class GameToolExecutor(
         }
         rewriteViolation(path, updated)?.let { return outcome(call, ok = false, it) }
         moduleContractViolation(path, updated)?.let { return outcome(call, ok = false, it) }
+        configContractViolation(path, updated)?.let { return outcome(call, ok = false, it) }
         if (path == GameScenarios.FILE) {
             scenarioContinuityViolation(updated)?.let { return outcome(call, ok = false, it) }
         }
@@ -380,6 +388,38 @@ class GameToolExecutor(
                 } +
                 "。重写模块文件时必须保留既有导出成员（return {...} 对象不得丢项，" +
                 "入口调用的每个 X.fn 都必须能解析）；请补回缺失成员后重写。文件未被改动。"
+        } catch (_: Exception) {
+            null // 预检自身异常不拦写入（宁可漏报不误伤）
+        }
+    }
+
+    /**
+     * 参数外置契约维护预检（写盘前执行，非 null=违规文本，调用方直接拒绝且不落盘）：
+     * 回合起点已定义 GAME_CONFIG 的游戏（修复/迭代轮）执行三类检查——悬空引用
+     * （引用了未定义的键）、参数键守恒（删除/改名需 [configKeyDeletionAuthorized]
+     * 点名授权）、值类型纯 JSON。首次生成轮不参与（并行写入的正常时序不拦，
+     * 结构存在性由验收校验把关）。与模块导出契约同触发条件（写 js/入口时）。
+     */
+    private fun configContractViolation(path: String, newContent: String): String? {
+        if (!path.endsWith(".js") && path != GameFileWorkspaceEntryPoint.DEFAULT) return null
+        return try {
+            val files = HashMap<String, String>()
+            var readable = true
+            workspace.manifest().files.forEach { f ->
+                if (f.path == path) {
+                    files[f.path] = newContent
+                } else {
+                    val c = workspace.read(f.path)
+                    if (c == null) readable = false else files[f.path] = c
+                }
+            }
+            files[path] = newContent // manifest 尚无的新文件也纳入写入后视图
+            if (!readable) return null
+            val violations = GameStaticCheck.configContractViolations(
+                files, turnStartSnapshot, configKeyDeletionAuthorized
+            )
+            if (violations.isEmpty()) null
+            else "致命错误：" + violations.joinToString("；") + "。文件未被改动。"
         } catch (_: Exception) {
             null // 预检自身异常不拦写入（宁可漏报不误伤）
         }

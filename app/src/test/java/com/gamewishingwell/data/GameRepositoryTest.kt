@@ -678,4 +678,59 @@ class GameRepositoryTest {
         }
         dir.deleteRecursively()
     }
+
+    @Test
+    fun `玩家参数覆盖-读写校验与两区链路豁免`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-ucfg-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            val meta = repo.saveGame(
+                "塔防", "描述",
+                mapOf("index.html" to "<html>v1</html>", "js/main.js" to "var a=1;"),
+                listOf(ChatMessage("user", "做一个游戏"))
+            )
+            val gameDir = File(dir, "games/${meta.id}")
+
+            // 写入：只收 JSON 对象；数组/坏 JSON 拒绝不落盘
+            assertTrue(repo.writeUserConfig(meta.id, """{"playerSpeed": 260}"""))
+            assertFalse(repo.writeUserConfig(meta.id, "[1,2]"))
+            assertFalse(repo.writeUserConfig(meta.id, "{oops"))
+            assertEquals("""{"playerSpeed": 260}""", repo.readUserConfig(meta.id))
+            // 不存在的游戏拒写；不存在的文件读 null
+            assertFalse(repo.writeUserConfig(99999L, "{}"))
+            assertNull(repo.readUserConfig(99999L))
+
+            // 保存（编辑区整体覆盖+镜像删除）不碰玩家覆盖：它不是游戏文件
+            repo.overwriteGameFiles(
+                meta.id,
+                mapOf("index.html" to "<html>v2</html>"),
+                listOf(ChatMessage("user", "做一个游戏"))
+            )
+            assertEquals("""{"playerSpeed": 260}""", repo.readUserConfig(meta.id))
+            // 撤销清单与运行合并素材排除（不进编辑区、不被 GameBundle 内联）
+            assertFalse(repo.savedGameFilePaths(meta.id).contains(GameRepository.USER_CONFIG_FILE))
+            assertFalse(repo.loadGameTextFiles(meta.id).containsKey(GameRepository.USER_CONFIG_FILE))
+
+            // 模型侧同名"游戏文件"拒收（平台通道防冒用）：保存清单里的同名文件不落盘
+            repo.overwriteGameFiles(
+                meta.id,
+                mapOf("index.html" to "<html>v3</html>", GameRepository.USER_CONFIG_FILE to "{\"hacked\":true}"),
+                listOf(ChatMessage("user", "做一个游戏"))
+            )
+            assertEquals("""{"playerSpeed": 260}""", repo.readUserConfig(meta.id))
+
+            // 清除：恢复默认（幂等）
+            repo.clearUserConfig(meta.id)
+            assertNull(repo.readUserConfig(meta.id))
+            repo.clearUserConfig(meta.id)
+
+            // 导出/导入随保存区整体往返：玩家调参随包迁移
+            repo.writeUserConfig(meta.id, """{"speed": 9}""")
+            val zip = ByteArrayOutputStream()
+            assertTrue(repo.exportGameZip(meta.id, zip))
+            val imported = repo.importGameZip(ByteArrayInputStream(zip.toByteArray()))
+            assertEquals("""{"speed": 9}""", repo.readUserConfig(imported!!.id))
+        }
+        dir.deleteRecursively()
+    }
 }

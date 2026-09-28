@@ -75,7 +75,14 @@ object GameValidator {
          * 入参是否为内联合并后的视图：是则跳过"超大内联建议拆分"结构提示
          * （合并视图天然全内联，该提示只对原始入口有意义）。
          */
-        inlineView: Boolean = false
+        inlineView: Boolean = false,
+        /**
+         * 是否强制参数外置契约（GAME_CONFIG 存在性）：仅首次生成轮置 true——
+         * 修改/修复轮不追溯（修改范围契约：不得强迫旧游戏补参数外置重构）；
+         * "定义了 GAME_CONFIG 却缺平台覆盖合并行"在任何轮都是 error
+         * （该行只可能来自本轮新写的代码，补一行不违反修改范围）。
+         */
+        requireConfigContract: Boolean = false
     ): ValidationReport {
         if (html.isBlank()) {
             return ValidationReport(
@@ -210,6 +217,30 @@ object GameValidator {
                 "observability", FILE_INDEX_HTML, 1,
                 "缺少可观测性契约：必须提供全局函数 window.__wwDebugState = function(){...}，" +
                     "返回 { state, score, entities:[{type,hp,x,y}], player:{...} } 状态快照（沙箱据此做自动不变量检查）",
+                "error"
+            )
+        }
+
+        // 参数外置契约：可调参数集中 window.GAME_CONFIG，且必须合并平台参数覆盖
+        //（玩家"参数调整"面板经 window.__wwConfigOverride 免 LLM 注入修改，
+        //  缺合并行＝玩家调参不生效）。存在性仅首代生成轮强制（见 requireConfigContract）。
+        val hasConfigObject = GameConfigContract.hasConfigObject(html)
+        if (hasConfigObject && !html.contains(GameConfigContract.OVERRIDE_BRIDGE)) {
+            checks += ValidationIssue(
+                "config", FILE_INDEX_HTML, 1,
+                "参数外置契约不完整：已定义 GAME_CONFIG 但缺少平台覆盖合并行——" +
+                    "必须在定义之后紧跟 ${GameConfigContract.MERGE_LINE}；" +
+                    "逻辑代码经 GAME_CONFIG.xxx 引用参数，不得散写数值字面量",
+                "error"
+            )
+        }
+        if (!hasConfigObject && requireConfigContract) {
+            checks += ValidationIssue(
+                "config", FILE_INDEX_HTML, 1,
+                "缺少参数外置契约：必须集中定义可调参数 window.GAME_CONFIG = { \"键\": 值, ... }" +
+                    "（速度/伤害/生命/生成频率/价格/关卡数值等一切可调数值与文本，值为纯 JSON 类型：" +
+                    "数字/字符串/布尔/数组；工具模式放 js/config.js，单文件直出放脚本最前），" +
+                    "并紧跟 ${GameConfigContract.MERGE_LINE}",
                 "error"
             )
         }

@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.gamewishingwell.agent.AgentHub
 import com.gamewishingwell.agent.GameAgent
 import com.gamewishingwell.agent.GameBundle
+import com.gamewishingwell.agent.GameConfigContract
 import com.gamewishingwell.agent.GameSchema
 import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.data.GameRepository
@@ -50,14 +51,33 @@ class GameViewModel(
     private val _landscape = MutableStateFlow(false)
     val landscape: StateFlow<Boolean> = _landscape.asStateFlow()
 
+    /**
+     * 玩家参数覆盖（参数外置契约）：仅运行区（source=game）装载——合法 JSON 才注入
+     * （HtmlEnhancer 消费）；预览/草稿不注入（编辑区版本与保存区参数空间不同步）。
+     */
+    private val _configOverride = MutableStateFlow<String?>(null)
+    val configOverride: StateFlow<String?> = _configOverride.asStateFlow()
+
+    /** 当前游戏是否支持参数调整（合并视图定义了 GAME_CONFIG）：参数面板入口显隐依据。 */
+    private val _configSupported = MutableStateFlow(false)
+    val configSupported: StateFlow<Boolean> = _configSupported.asStateFlow()
+
+    /** 默认参数表（GAME_CONFIG 提取＋规范化为 JSON；提取失败为 null＝"填充全部"不可用）。 */
+    private val _configDefaults = MutableStateFlow<String?>(null)
+    val configDefaults: StateFlow<String?> = _configDefaults.asStateFlow()
+
     private val sessionJson = Json { ignoreUnknownKeys = true }
 
     /** 当前游戏页的加载源（game=运行区 / preview=编辑区 / draft=草稿）。 */
     private var playSource: String = "draft"
 
+    /** 最近一次 load 的入参：参数覆盖保存后 reload 重读（html 相同、覆盖已变）。 */
+    private var loadArgs: Pair<String, Long>? = null
+
     fun load(source: String, gameId: Long) {
         viewModelScope.launch {
             playSource = source
+            loadArgs = source to gameId
             // 预览绑定对应会话实例（草稿预览=草稿会话；游戏预览=该游戏的编辑会话，
             // 冷启动时 hub 装载其持久化会话）；生成状态与保存栏位均来自该会话。
             val agent = hub.agentFor(gameId.takeIf { source == "preview" && it > 0 })
@@ -95,7 +115,25 @@ class GameViewModel(
             _loadedGameId.value = id
             _landscape.value = landscape
             _jsError.value = null
+            // 参数外置契约的运行区装载：覆盖文件原文 → 合法才注入；GAME_CONFIG 探测
+            // 与默认表提取都在合并视图上做（config.js 已内联，单文件游戏同样成立）。
+            if (source == "game" && gameId > 0 && html != null) {
+                val raw = repository.readUserConfig(gameId)
+                _configOverride.value = raw?.takeIf { GameConfigContract.isValidOverrideJson(it) }
+                _configSupported.value = GameConfigContract.hasConfigObject(html)
+                _configDefaults.value = GameConfigContract.prettyDefaults(html)
+            } else {
+                _configOverride.value = null
+                _configSupported.value = false
+                _configDefaults.value = null
+            }
         }
+    }
+
+    /** 参数覆盖保存后的生效通道：重读运行区文件与覆盖（html 通常不变、覆盖已变，
+     *  GameScreen 检测到 override 变化即整页重载——参数在游戏 init 时读取一次）。 */
+    fun reload() {
+        loadArgs?.let { (s, g) -> load(s, g) }
     }
 
     /** 从持久化的 agent_state.json 读画面方向；缺失/解析失败按竖版处理（不强制旋转）。 */
@@ -161,6 +199,38 @@ class GameViewModel(
             val agent = boundAgent ?: hub.agentFor(null)
             agent.awaitReady()
             if (agent.boundGameId == null) onNeedName() else onDone(agent.saveCurrentGame("") != null)
+        }
+    }
+
+    // ---------- 参数调整面板（参数外置契约·玩家免 LLM 调参） ----------
+
+    /** 编辑器初值：覆盖文件原文（含外部导入的坏文件——如实展示供修复）；无文件给空对象。 */
+    suspend fun readUserConfigRaw(): String =
+        _loadedGameId.value?.let { repository.readUserConfig(it) } ?: "{}"
+
+    /** 保存覆盖并重载生效：JSON 对象校验在仓库写入前（false＝非法不落盘，UI 提示）。 */
+    fun saveUserConfig(text: String, onDone: (Boolean) -> Unit) {
+        val id = _loadedGameId.value
+        if (id == null) {
+            onDone(false)
+            return
+        }
+        viewModelScope.launch {
+            val ok = repository.writeUserConfig(id, text)
+            if (ok) reload()
+            onDone(ok)
+        }
+    }
+
+    /** "填充全部"模板：默认参数全量 + 当前覆盖逐键盖顶（玩家看到的就是生效值）。 */
+    fun buildFullConfigTemplate(onDone: (String?) -> Unit) {
+        viewModelScope.launch {
+            val id = _loadedGameId.value
+            val html = _html.value
+            if (id == null || html == null) return@launch onDone(null)
+            val defaults = withContext(Dispatchers.IO) { GameConfigContract.extractDefaults(html) }
+                ?: return@launch onDone(null)
+            onDone(GameConfigContract.buildEditorTemplate(defaults, repository.readUserConfig(id)))
         }
     }
 }

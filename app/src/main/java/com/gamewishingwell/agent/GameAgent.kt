@@ -1633,12 +1633,14 @@ class GameAgent(
             // 缺失=error 引导模型先 writefile 创建），外部资源与二进制禁令不变。
             // 校验对象是内联后的合并视图——可观测性契约（__wwDebugState）与 eval 禁令
             // 可能落在被引用的 js 文件里，只看原始入口会误报"缺少契约"回炉。
+            // 参数外置契约只对首次生成强制（修改/修复轮不追溯旧游戏）。
             validate = { html ->
                 GameValidator.validate(
                     GameBundle.inline(html) { rel -> workspaceRead(rel) },
                     allowedEngines,
                     localFileExists = { rel -> workspaceFileExists(rel) },
-                    inlineView = true
+                    inlineView = true,
+                    requireConfigContract = existingHtml.isNullOrBlank()
                 )
             },
             allowFullRewrite = allowFullRewrite,
@@ -1646,7 +1648,10 @@ class GameAgent(
             protectedScenarioIds = protectedScenarioIds,
             advisoryScope = advisoryScope,
             // 3D 硬性契约：视角旋转断言必含且不得改弱（写入校验打回，防断言作弊）
-            requireViewAssertion = plan.visualDimension == GameSchema.DIMENSION_3D
+            requireViewAssertion = plan.visualDimension == GameSchema.DIMENSION_3D,
+            // 参数外置契约维护：参数键删除/改名的授权判定——用户指令点名键名或授权
+            // 重做才放行（sanitizedInstruction 已剔除否定窗口，防"不要删 X"误授权）
+            configKeyDeletionAuthorized = { allowFullRewrite || sanitizedInstruction.contains(it) }
         )
 
         var outcome = runToolLoop(
@@ -1759,9 +1764,19 @@ class GameAgent(
         scopeFence: Boolean = false
     ): GenOutcome {
         val customSystem = settingsRepository.settings.value.systemPrompt.trim()
+        // 玩家参数覆盖注入（参数面板 user_config.json）：编辑已保存游戏且玩家有覆盖时，
+        // 让模型看见玩家已把哪些参数调成了什么值（覆盖优先于 config.js 默认值）。
+        val playerOverrideNote = runCatching {
+            editingGameId?.let { id ->
+                GameConfigContract.renderOverrideNote(repository.readUserConfig(id))
+            }
+        }.getOrNull()
         val messages = mutableListOf(
             ChatMessage("system", GamePrompt.systemPrompt(customSystem.ifBlank { null }, toolMode = true)),
-            ChatMessage("user", buildToolContextMessage(instruction, plan, firstGeneration, scopeFence))
+            ChatMessage(
+                "user",
+                buildToolContextMessage(instruction, plan, firstGeneration, scopeFence, playerOverrideNote)
+            )
         )
 
         var round = 0
@@ -1912,12 +1927,14 @@ class GameAgent(
                 // 模型声称完成：以工作区内容为准重新校验，通过且（修改轮）确实
                 // 发生了内容变化才接受；防止模型不做任何修改就宣称完成。
                 if (content != null) {
-                    // 验收同样校验内联合并视图（__wwDebugState 可能定义在被引用的 js 文件里）
+                    // 验收同样校验内联合并视图（__wwDebugState 可能定义在被引用的 js 文件里）；
+                    // 参数外置契约与执行器同一裁决：首次生成强制、修改轮不追溯
                     val report = GameValidator.validate(
                         GameBundle.inline(content) { rel -> workspaceRead(rel) },
                         allowedEngines,
                         localFileExists = { rel -> workspaceFileExists(rel) },
-                        inlineView = true
+                        inlineView = true,
+                        requireConfigContract = firstGeneration
                     )
                     lastReport = report
                     if (!report.hasErrors) {
@@ -2574,13 +2591,18 @@ class GameAgent(
         append(GamePrompt.tierPrompt(QualityTier.normalize(_session.value.qualityTier)))
     }
 
-    /** 工具模式上下文（最小化注入）：模板或 rolling summary + 指令 + 策划 Schema + 工作流。 */
+    /** 工具模式上下文（最小化注入）：模板或 rolling summary + 指令 + 策划 Schema + 工作流。
+     *  [playerConfigOverride] 为玩家参数覆盖清单（参数面板 user_config.json 的渲染，
+     *  编辑已保存游戏且玩家有覆盖时注入）——覆盖优先于 config.js 默认值，模型看不见
+     *  会让"调简单点"类修改被覆盖静默吞掉。 */
     private fun buildToolContextMessage(
         instruction: String,
         plan: DesignPlan,
         firstGeneration: Boolean,
         /** 修改范围契约：修改回合且用户未明确要求重做时注入（仅提示词层约束，执行层不检查）。 */
-        scopeFence: Boolean = false
+        scopeFence: Boolean = false,
+        /** 玩家参数覆盖清单（GameConfigContract.renderOverrideNote 产物；null=无覆盖不注入）。 */
+        playerConfigOverride: String? = null
     ): String = buildString {
         if (firstGeneration) {
             append(
@@ -2613,6 +2635,12 @@ class GameAgent(
         }
         // 局部连续性通道：最近 N 条有效用户指令逐字注入（见 RecentInstructionWindow）。
         RecentInstructionWindow.render(_session.value.messages)?.let {
+            append(it)
+            append("\n\n")
+        }
+        // 玩家参数覆盖（参数面板）：玩家已手动调整的参数清单——改名/删键、调默认值
+        // 类修改都必须知道覆盖的存在（覆盖优先于默认值）。
+        playerConfigOverride?.let {
             append(it)
             append("\n\n")
         }

@@ -127,4 +127,85 @@ window.G = { state: 'menu' };
         )
         assertEquals(1, GameStaticCheck.moduleExportViolations(broken).size)
     }
+
+    // ---------- 参数外置契约维护（写入时刻，修复/迭代轮） ----------
+
+    private val CFG_JS = """
+window.GAME_CONFIG = { "speed": 3, "hp": 100 };
+Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});
+""".trimIndent()
+
+    private val MAIN_JS = """
+var CFG = window.GAME_CONFIG;
+var v = CFG.speed + CFG.hp;
+""".trimIndent()
+
+    private fun startView() = mapOf("js/config.js" to CFG_JS, "js/main.js" to MAIN_JS)
+
+    @Test
+    fun `参数维护-悬空引用被拦`() {
+        // main.js 新引用了 config 里没有的键：致命
+        val files = startView() + ("js/main.js" to MAIN_JS + "\nvar d = CFG.critRate;")
+        val v = GameStaticCheck.configContractViolations(files, startView()) { false }
+        assertEquals(listOf(1, v.size).max(), v.size) // 1 条
+        assertTrue(v[0].contains("悬空引用") && v[0].contains("critRate"))
+    }
+
+    @Test
+    fun `参数维护-删除键未授权被拦且点名授权放行`() {
+        // config.js 删掉 hp 键（未授权）：致命并点名
+        val lost = startView() + (
+            "js/config.js" to """window.GAME_CONFIG = { "speed": 3 };""" +
+                "\nObject.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});"
+            )
+        val blocked = GameStaticCheck.configContractViolations(lost, startView()) { false }
+        assertTrue(blocked.any { it.contains("只增不减") && it.contains("hp") })
+        // 同一删除，但指令点名了 hp 键名：放行（只剩悬空引用检查——main.js 仍引用 hp）
+        val named = GameStaticCheck.configContractViolations(lost, startView()) { it == "hp" }
+        // main.js 引用 hp 而键已删：悬空引用照拦（授权删键≠允许留悬空引用）
+        assertTrue(named.any { it.contains("悬空引用") && it.contains("hp") })
+        assertTrue(named.none { it.contains("只增不减") })
+        // 键删了且引用同步清理：完全放行
+        val clean = lost + ("js/main.js" to "var CFG = window.GAME_CONFIG;\nvar v = CFG.speed;")
+        assertTrue(GameStaticCheck.configContractViolations(clean, startView()) { it == "hp" }.isEmpty())
+    }
+
+    @Test
+    fun `参数维护-新增键与调值不受限`() {
+        val grown = startView() + (
+            "js/config.js" to """window.GAME_CONFIG = { "speed": 9, "hp": 50, "critRate": 0.2 };""" +
+                "\nObject.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});"
+            ) + ("js/main.js" to MAIN_JS + "\nvar c = CFG.critRate;")
+        assertTrue(GameStaticCheck.configContractViolations(grown, startView()) { false }.isEmpty())
+    }
+
+    @Test
+    fun `参数维护-函数值被打回`() {
+        val fn = startView() + (
+            "js/config.js" to "window.GAME_CONFIG = { speed: function(){ return 3; } };\n" +
+                "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});"
+            )
+        // hp 键同时被删（函数字面量不可解析）——只断言值类型那条在场
+        val v = GameStaticCheck.configContractViolations(fn, startView()) { true }
+        assertTrue(v.any { it.contains("非 JSON 值") })
+    }
+
+    @Test
+    fun `参数维护-首代生成与旧游戏不参与`() {
+        // 起点无 GAME_CONFIG（首次生成）：不拦（并行写入正常时序）
+        val fresh = mapOf(
+            "js/main.js" to "var CFG = window.GAME_CONFIG;\nvar v = CFG.speed;",
+            "index.html" to "<html><script src=\"js/main.js\"></script></html>"
+        )
+        assertTrue(GameStaticCheck.configContractViolations(fresh, emptyMap()) { false }.isEmpty())
+        // 旧游戏（起点与当前都无 GAME_CONFIG）：全部跳过
+        val legacy = mapOf("index.html" to "<html><script>var a=1;</script></html>")
+        assertTrue(GameStaticCheck.configContractViolations(legacy, legacy) { false }.isEmpty())
+    }
+
+    @Test
+    fun `参数维护-注释里的引用不算悬空`() {
+        val commented = startView() + ("js/main.js" to MAIN_JS + "\n// 修 CFG.critRate 的注释")
+        assertTrue(GameStaticCheck.configContractViolations(commented, startView()) { false }.isEmpty())
+    }
 }

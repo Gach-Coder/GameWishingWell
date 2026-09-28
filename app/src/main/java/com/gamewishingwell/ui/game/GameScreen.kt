@@ -51,6 +51,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import android.os.Build
 import android.view.WindowManager
@@ -90,6 +91,10 @@ fun GameScreen(
     val html by vm.html.collectAsState()
     val jsError by vm.jsError.collectAsState()
     val loadedGameId by vm.loadedGameId.collectAsState()
+    // 参数外置契约：覆盖注入（loadHtml 消费）与面板入口显隐（GAME_CONFIG 探测）
+    val configOverride by vm.configOverride.collectAsState()
+    val configSupported by vm.configSupported.collectAsState()
+    val configDefaults by vm.configDefaults.collectAsState()
     val context = LocalContext.current
     // 保存护栏的 UI 侧：生成中 currentHtml 是未验收的中间版本，此刻入库会把半成品
     // 固化为"已保存版本"（agent 侧 saveCurrentGame 为最终闸门，此处先禁用入口）。
@@ -98,8 +103,15 @@ fun GameScreen(
 
     var webView by remember { mutableStateOf<WebView?>(null) }
     var loadedHtml by remember { mutableStateOf<String?>(null) }
+    // 与 loadedHtml 同源的覆盖快照：html 不变而覆盖变化（参数保存后 reload）时
+    // 仍要整页重载（参数在游戏 init 时读取一次，重载即生效）。
+    var loadedOverride by remember { mutableStateOf<String?>(null) }
     var showSaveDialog by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var showConfigEditor by remember { mutableStateOf(false) }
+    var configText by remember { mutableStateOf("{}") }
+    var configError by remember { mutableStateOf<String?>(null) }
+    var showConfigDefaults by remember { mutableStateOf(false) }
     var volume by remember { mutableStateOf(0.8f) }
     var loadDone by remember { mutableStateOf(false) }
 
@@ -156,17 +168,20 @@ fun GameScreen(
         onDispose { controller?.show(WindowInsetsCompat.Type.statusBars()) }
     }
 
-    val loadHtml: (WebView, String) -> Unit = { view, h ->
+    val loadHtml: (WebView, String, String?) -> Unit = { view, h, overrideJson ->
         // 每游戏独立假 origin（子域隔离）：localStorage 的 origin 只由 scheme+host+port
         // 构成、路径不参与——同 host 不同 path 的全部游戏会折叠成同一 origin 共享同一份
         // localStorage（实测事故：两局游戏 ww:save schema 不同，交叉读取触发防御性删除
         // 互相清档）。host 内嵌 source+gameId 后每游戏独立键空间，存档跨重启/覆盖安装
         // 存活，预览与运行区互不污染；假域名不产生任何网络请求（游戏自包含）。
+        // 参数覆盖（overrideJson）经 HtmlEnhancer 注入为 window.__wwConfigOverride，
+        // 游戏侧 GAME_CONFIG 合并行消费——仅合法 JSON 会走到这里（VM 已过滤）。
         view.loadDataWithBaseURL(
             "https://$source$gameId.ww.local/",
-            HtmlEnhancer.inject(h), "text/html", "UTF-8", null
+            HtmlEnhancer.inject(h, overrideJson), "text/html", "UTF-8", null
         )
         loadedHtml = h
+        loadedOverride = overrideJson
     }
 
     // 清除存档（平台通用，不依赖游戏配合）：删 ww:save 契约键后整页重载——比 restart()
@@ -174,10 +189,11 @@ fun GameScreen(
     val clearSaveAndRestart: () -> Unit = {
         val view = webView
         val h = loadedHtml
+        val ov = loadedOverride
         view?.evaluateJavascript(
             "(function(){try{localStorage.removeItem('ww:save');}catch(e){}})()"
         ) { _ ->
-            if (h != null) loadHtml(view, h)
+            if (h != null) loadHtml(view, h, ov)
         }
         closeSettings()
         Toast.makeText(context, "已清除存档", Toast.LENGTH_SHORT).show()
@@ -231,9 +247,12 @@ fun GameScreen(
                 val h = html
                 // WebView 在 Compose 首次测量前 viewport 高度可能为 0，此时加载 HTML
                 // 会让 100vh / 100% 根高度永久计算为 0，导致 Canvas 场景不可见。
-                // 因此只在 WebView 已有实际尺寸后加载。
-                if (h != null && loadedHtml != h && view.width > 0 && view.height > 0) {
-                    loadHtml(view, h)
+                // 因此只在 WebView 已有实际尺寸后加载。html 或参数覆盖任一变化都重载
+                // （参数保存后 html 不变、覆盖已变）。
+                if (h != null && (loadedHtml != h || loadedOverride != configOverride) &&
+                    view.width > 0 && view.height > 0
+                ) {
+                    loadHtml(view, h, configOverride)
                 }
             },
             onRelease = { view ->
@@ -243,6 +262,7 @@ fun GameScreen(
                 runCatching { view.destroy() }
                 if (webView == view) webView = null
                 loadedHtml = null
+                loadedOverride = null
             },
             modifier = Modifier
                 .fillMaxSize()
@@ -250,8 +270,8 @@ fun GameScreen(
                     if (size.width > 0 && size.height > 0) {
                         val h = html
                         val view = webView
-                        if (h != null && view != null && loadedHtml != h) {
-                            loadHtml(view, h)
+                        if (h != null && view != null && (loadedHtml != h || loadedOverride != configOverride)) {
+                            loadHtml(view, h, configOverride)
                         }
                     }
                 }
@@ -357,6 +377,13 @@ fun GameScreen(
                     TextButton(onClick = clearSaveAndRestart) {
                         Text("清除存档并重开", color = MaterialTheme.colorScheme.error)
                     }
+                    // 参数调整入口（参数外置契约）：仅运行区（game）且游戏定义了
+                    // GAME_CONFIG 时显示——玩家免 LLM 直接改参数（user_config.json）。
+                    if (source == "game" && configSupported) {
+                        TextButton(onClick = { showConfigEditor = true }) {
+                            Text("参数调整")
+                        }
+                    }
                 }
             },
             confirmButton = {
@@ -394,6 +421,97 @@ fun GameScreen(
             },
             dismissButton = {
                 TextButton(onClick = closeSettings) { Text("继续游戏") }
+            }
+        )
+    }
+
+    // 参数调整编辑器（参数外置契约·玩家免 LLM 调参）：编辑 games/<id>/user_config.json，
+    // JSON 对象校验通过才落盘（仓库侧同一道闸）；保存后 reload → 覆盖流变化 →
+    // 整页重载生效（参数在游戏 init 读取一次；对局进度由 ww:save 存档契约自动恢复）。
+    // 恢复全部默认＝清空为 {} 保存；"默认参数"只读视图解决"有哪些参数可调"的可发现性。
+    if (showConfigEditor) {
+        LaunchedEffect(Unit) {
+            configText = vm.readUserConfigRaw()
+            configError = null
+            showConfigDefaults = false
+        }
+        AlertDialog(
+            onDismissRequest = { showConfigEditor = false },
+            title = { Text("参数调整") },
+            text = {
+                Column {
+                    if (showConfigDefaults) {
+                        Text(
+                            "默认参数（只读，来自游戏配置）",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.size(6.dp))
+                        Text(
+                            configDefaults ?: "（默认参数解析失败：可直接编辑覆盖 JSON）",
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                        )
+                    } else {
+                        Text(
+                            "以 JSON 对象覆盖想改的参数，其余用游戏默认值；保存并重载后生效。" +
+                                "例：{\"playerSpeed\": 260}。清空为 {} 保存即恢复全部默认。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.size(6.dp))
+                        OutlinedTextField(
+                            value = configText,
+                            onValueChange = {
+                                configText = it
+                                configError = null
+                            },
+                            minLines = 4,
+                            maxLines = 10,
+                            textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                        )
+                        configError?.let {
+                            Spacer(Modifier.size(4.dp))
+                            Text(
+                                it,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (showConfigDefaults) {
+                        TextButton(onClick = { showConfigDefaults = false }) { Text("返回编辑") }
+                    } else {
+                        TextButton(
+                            enabled = configDefaults != null,
+                            onClick = {
+                                vm.buildFullConfigTemplate { tpl ->
+                                    tpl?.let {
+                                        configText = it
+                                        configError = null
+                                    }
+                                }
+                            }
+                        ) { Text("填充全部") }
+                        TextButton(onClick = {
+                            vm.saveUserConfig(configText) { ok ->
+                                if (ok) {
+                                    showConfigEditor = false
+                                    closeSettings()
+                                    Toast.makeText(context, "已保存，重载后生效", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    configError = "不是合法的 JSON 对象（应为 {\"键\": 值} 形式，字符串用双引号）"
+                                }
+                            }
+                        }) { Text("保存并生效") }
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showConfigEditor = false }) { Text("关闭") }
             }
         )
     }

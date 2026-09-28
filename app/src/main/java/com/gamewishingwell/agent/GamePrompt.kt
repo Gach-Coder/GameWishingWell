@@ -79,7 +79,7 @@ object GamePrompt {
         val organizationRule = if (toolMode) {
             """
             多文件组织是默认工作方式：index.html 是唯一入口，只放 HTML 骨架与文件引用；
-            样式独立为 css/*.css；脚本按职责拆为 js/*.js（如 js/config.js 常量与关卡数据、js/entities.js 实体与系统逻辑、
+            样式独立为 css/*.css；脚本按职责拆为 js/*.js（如 js/config.js 参数表 window.GAME_CONFIG 与关卡数据【输出要求第 10 条·参数外置契约】、js/entities.js 实体与系统逻辑、
             js/main.js 初始化与主循环——main 放引用列表最后），以相对路径引用
             （<script src="js/main.js"></script>、<link rel="stylesheet" href="css/style.css">），
             平台加载前自动内联合并成一个自包含页面——离线可玩承诺不变；跨文件经全局变量/命名空间协作
@@ -146,6 +146,14 @@ object GamePrompt {
            页面初始化时防御性恢复：JSON.parse 与字段校验放在 try/catch 内，解析失败、字段异常或 v 不符时删除该键走全新开局；
            恢复成功且对局未结束 → 跳过开始界面直接从存档波次/关卡继续对局；restart() 只重置本局并把存档的对局部分归零（记录类保留）。
            所有 localStorage 读写必须 try/catch 包裹（存储被禁用时不许报错）。
+        10. 【参数外置契约（硬性）】游戏的可调参数必须集中定义在配置对象 window.GAME_CONFIG：
+           速度、伤害、生命、生成频率、价格、掉落率、关卡与波次数值、尺寸、颜色、文案等一切可调数值或文本，
+           以键值对写入（键名用可读英文如 playerSpeed/maxHp/waveInterval，值为纯 JSON 类型：数字/字符串/布尔/数组——禁止函数或表达式），
+           定义之后必须紧跟一行平台覆盖合并：${GameConfigContract.MERGE_LINE}。
+           逻辑代码不得散写这些参数字面量，一律经 window.GAME_CONFIG.xxx 引用；游戏初始化时读取一次即可（后续帧用读取后的值）。
+           多文件组织时 GAME_CONFIG 放在 js/config.js（首个被引用的 js）；单文件直出时放在脚本最前面。
+           平台"参数调整"面板据此让玩家不经 AI 直接改参数（平台把玩家修改经 window.__wwConfigOverride 注入进来），
+           缺少该对象或缺少合并行＝玩家调参完全失效。
     """.trimIndent() + "\n\n" + hardRules()
     }
 
@@ -169,6 +177,7 @@ object GamePrompt {
         - 只用浏览器全局白名单 API，不引用未定义变量；
         - 声明前置：var/let/const 在作用域顶部；
         - 自包含：不引用不存在的本地图片/音频；
+        - 可调参数一律进 window.GAME_CONFIG 并带平台覆盖合并行（参数外置契约，见输出要求第 10 条），逻辑代码经 GAME_CONFIG.xxx 引用，不散写参数字面量；
         - 首次生成整量写入（工具模式按多文件组织建文件，见工作流）；后续修改用最小替换而非重写整文件。
     """.trimIndent()
 
@@ -620,7 +629,7 @@ $seedSystems
         excluded_systems（仅含用户明确说“不要”的系统）与 excluded_approaches 是硬性排除范围，不得实现或引入。
         复杂系统（AI、商店、技能、关卡等）先在 JS 中隔离成独立函数/模块并优先自检，不得与核心循环交叉污染。
         基础校验通过后即交付玩家试玩，不要在游戏内添加自动测试代码、测试按钮或调试面板；运行错误由玩家回传后再修复。
-        输出前确认：无 eval、无外部资源、restart() 存在、__wwDebugState 快照存在、进度存档契约（ww:save 对局状态存档＋重进从存档波次续玩）存在、触控可玩、声明前置、主画布方向与 design_schema 的 orientation 一致且铺满视口（无固定分辨率黑边）、触控控件为标准布局（横板左下◀▶右下跳跃，方向语义为横向）、左上/右上角平台按钮区无交互元素。
+        输出前确认：无 eval、无外部资源、restart() 存在、__wwDebugState 快照存在、进度存档契约（ww:save 对局状态存档＋重进从存档波次续玩）存在、参数外置契约（window.GAME_CONFIG 定义＋${GameConfigContract.OVERRIDE_BRIDGE} 合并行）存在、触控可玩、声明前置、主画布方向与 design_schema 的 orientation 一致且铺满视口（无固定分辨率黑边）、触控控件为标准布局（横板左下◀▶右下跳跃，方向语义为横向）、左上/右上角平台按钮区无交互元素。
     """.trimIndent()
 
     /**
@@ -638,11 +647,14 @@ $seedSystems
         1. 先在心里列文件计划（每个文件的职责与引用顺序），再逐个 writefile 落盘——多文件组织是默认工作方式（平台运行前自动内联合并，游戏仍离线自包含）：
            - index.html：HTML 骨架＋<link>/<script> 引用（几十行即可，不写游戏逻辑）；
            - css/style.css：全部样式（画布布局、HUD、菜单、按钮、响应式）；
-           - js/config.js：常量与数值表（尺寸/速度/颜色/关卡与实体数据）；
+           - js/config.js：参数表——定义 window.GAME_CONFIG = { "键": 值, ... }（全部可调参数，值为纯 JSON 类型）
+             并紧跟 ${GameConfigContract.MERGE_LINE}（平台参数面板的注入通道，缺这行玩家调参不生效）；
+             其后再放关卡/实体数据表；
            - js/<系统>.js：按 design_schema 的系统一文件（如 js/player.js、js/enemies.js、js/levels.js、js/audio.js）；
            - js/main.js：初始化、主循环、restart() 与 __wwDebugState()（含 ww:save 存档的初始化恢复），引用顺序放最后。
            引用顺序＝依赖顺序（普通 script 无模块系统：先加载的定义全局，后加载的使用）；跨文件经全局命名空间协作（如 var WW = window.WW || {}; WW.spawnEnemy = function(){...}）。
-           写入顺序：先写被引用的 js/css 文件、最后写 index.html——入口校验会即时核对引用存在性，入口先写会暂时报"引用文件不存在"（属正常时序，全部文件写完即消失）。
+           写入顺序：先写被引用的 js/css 文件、最后写 index.html——入口校验会即时核对引用存在性，入口先写会暂时报"引用文件不存在"（属正常时序，全部文件写完即消失；
+           参数外置契约同理：js/config.js 尚未写入时合并视图暂时缺 GAME_CONFIG，写完即消失）。
            在同一轮响应里并行发起全部 writefile 一次写完——拆分让每次写入体量小而稳（不易截断），后续 editfile 在小文件里定位更准、readfile 更省。
            体量确实很小的游戏可精简为 index.html + css/style.css + js/main.js；引用的每个文件都必须真实 writefile 创建（缺文件会被校验打回）。
            必须完整实现 design_schema 清单内的全部系统（p0 与 p1 条目缺一不可），内容量以策划清单为准，
@@ -674,6 +686,7 @@ $seedSystems
   - 互不依赖的多处修改，请在同一轮并行发起多个 editfile 调用（一次响应可包含多个 tool call），不要每轮只改一处。
   - readfile 尽量一次整读（文件通常千行以内，不要切片）；确需多个区段时也应在同一轮并行发起多个 readfile。读完定位到修改点后，尽量把互不依赖的修改在同一轮并行 editfile 落盘——每多一轮往返就多一份等待。
   - 文件被修改后，此前的 readfile 结果会被标记过期；请依据 editfile 返回的修改点上下文片段继续编辑，避免反复整读文件。
+        - GAME_CONFIG 参数键只增不减（执行层强制）：新增参数先在 js/config.js 补键、再写引用它的代码；删除或改名既有参数键须用户指令点名键名；参数值保持纯 JSON 类型（数字/字符串/布尔/数组——函数/表达式会被打回）。
         """.trimIndent()
     }
 }

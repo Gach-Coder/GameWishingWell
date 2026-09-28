@@ -137,4 +137,44 @@ class HtmlEnhancerTest {
             HtmlEnhancer.engineSourceProvider = provider
         }
     }
+
+    // ---------- 玩家参数覆盖注入（参数外置契约） ----------
+
+    @Test
+    fun `携带覆盖时注入 override 且先于视口修复与游戏脚本`() {
+        val html = "<html><head><script>window.GAME_CONFIG = { \"speed\": 1 };" +
+            "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});</script></head>" +
+            "<body><script>var x=1;</script></body></html>"
+        val out = HtmlEnhancer.inject(html, """{"speed": 260}""")
+        assertTrue(out.contains("window.__wwConfigOverride = {\"speed\": 260}"))
+        // 配置层最先：覆盖 → 视口修复 → 游戏脚本（游戏 init 读 GAME_CONFIG 时覆盖已并入）
+        val overrideAt = out.indexOf("window.__wwConfigOverride =")
+        assertTrue(overrideAt in 0 until out.indexOf("__wwViewportFixApplied"))
+        assertTrue(overrideAt < out.indexOf("GAME_CONFIG = "))
+    }
+
+    @Test
+    fun `覆盖注入幂等且非对象与空值静默跳过`() {
+        val html = "<html><head></head><body><script>var x=1;</script></body></html>"
+        // 不携带覆盖（沙箱验收路径）：与旧行为一致
+        assertFalse(HtmlEnhancer.inject(html).contains("__wwConfigOverrideLoaded"))
+        // 非对象形态（数组/字符串/空白）：不注入
+        assertFalse(HtmlEnhancer.inject(html, "[1,2]").contains("__wwConfigOverrideLoaded"))
+        assertFalse(HtmlEnhancer.inject(html, "   ").contains("__wwConfigOverrideLoaded"))
+        // 二次注入幂等
+        val once = HtmlEnhancer.inject(html, """{"a":1}""")
+        val twice = HtmlEnhancer.inject(once, """{"a":1}""")
+        assertEquals(1, Regex("__wwConfigOverrideLoaded").findAll(twice).count())
+        assertEquals(once, twice)
+    }
+
+    @Test
+    fun `覆盖值里的 script 闭合字面量被转义`() {
+        val out = HtmlEnhancer.inject(
+            "<html><head></head><body></body></html>",
+            """{"evil": "</script><script>alert(1)"}"""
+        )
+        // 值内的 </script 已转义为 <\/script（注入块不会被提前闭合，alert 不会外泄成真脚本）
+        assertTrue(out.contains("""window.__wwConfigOverride = {"evil": "<\/script><script>alert(1)"};"""))
+    }
 }

@@ -533,6 +533,51 @@ Agent处理message流程如下：
 		  存档契约会把上一次冒烟留下的 ww:save 恢复进下一次尝试，污染"全新开局"假定的场景断言。
 		  设置面板新增"清除存档并重开"（平台通用：删 ww:save 后整页重载——比 restart() 彻底，
 		  内存中的最高分等跨局状态一并归零；restart 只重置本局保留存档）。
+		参数外置与玩家调参（2026-09-28 落地，user_config.json 运行时覆盖层，全程零 LLM）：
+		  生成契约第 10 条【参数外置契约（硬性）】：全部可调参数（速度/伤害/生命/生成频率/价格/
+		  关卡数值/颜色/文案等）集中定义 window.GAME_CONFIG——工具模式放 js/config.js（首个被引用
+		  的 js）、单文件直出放脚本最前；键名可读英文、值为纯 JSON 类型（数字/字符串/布尔/数组，
+		  禁函数与表达式），定义后必须紧跟 Object.assign(window.GAME_CONFIG, window.__wwConfigOverride
+		  || {})，逻辑代码经 GAME_CONFIG.xxx 引用不散写参数字面量；参考模板 game_template.html 已内置示范。
+		  校验（GameValidator.validate 新增 requireConfigContract 参数）：首代生成轮（回合起点工作区
+		  无入口文件）强制 GAME_CONFIG 存在；"定义了 GAME_CONFIG 却缺平台覆盖合并行"任何轮都是
+		  error（补一行不违反修改范围契约）；修改/修复轮不追溯旧游戏（SCOPE_FENCE 优先）。
+		  提取/规范化解析器与共享常量在 GameConfigContract（校验器/注入器/参数面板三方同源）：
+		  从合并视图花括号配对提取 GAME_CONFIG 字面量（字符串感知），容错规范化（去注释/尾逗号、
+		  未引号键补引号、单引号转双引号）后按严格 JSON 解析为默认参数表——解析失败返回 null
+		  只降级"填充全部/默认参数视图"，不影响编辑与注入。
+		  玩家侧调参（对已保存游戏）：games/<id>/user_config.json——平台自有 JSON、非游戏文件
+		  （保存镜像删除豁免、撤销清单与运行合并素材排除——不进编辑区/Agent 视野/GameBundle 内联；
+		  writeGameFilesLocked 对模型写入的同名文件拒收防通道冒用；导出/导入 zip 随保存区整体往返；
+		  仓库 writeUserConfig 写入前校验为 JSON 对象，坏 JSON 一律拒绝落盘——注入管道只消费合法
+		  JSON，该文件永远不把游戏页面弄挂）。
+		  入口与生效：游戏页设置面板"参数调整"（仅运行区 source=game 且游戏定义了 GAME_CONFIG 时
+		  显示；预览/草稿不注入——编辑区版本与保存区参数空间不同步）：编辑 JSON 覆盖（只写想改的
+		  键，其余用游戏默认值）＋"默认参数"只读视图（可发现性）＋"填充全部"（默认值全量+当前覆盖
+		  逐键盖顶）；保存后 reload → HtmlEnhancer 把覆盖注入为 window.__wwConfigOverride（配置层
+		  最先、先于游戏脚本；</script 字面量转义、幂等标记 __wwConfigOverrideLoaded）→ 整页重载
+		  生效（参数在游戏 init 读取一次；对局进度由 ww:save 存档契约自动恢复——改参数几乎无代价）；
+		  清空为 {} 保存即恢复全部默认。沙箱验收不注覆盖——断言回归基准始终是 AI 交付的默认参数，
+		  玩家极端参数不污染 Agent 回合。旧游戏无 GAME_CONFIG 时入口不显示，可对话让 AI 一次性
+		  把参数外置后即获得该能力。
+		参数外置契约·修复轮维护（2026-09-28 落地，写入时刻执行层强制 + 上下文注入）：
+		  - 写入护栏（GameStaticCheck.configContractViolations，GameTools 写 js/入口时预检、
+		    违规致命拒绝且不落盘，与模块导出契约同族；参与条件=回合起点工作区已定义 GAME_CONFIG
+		    ——首次生成轮不参与，并行写入的正常时序不拦）：
+		    ① 悬空引用：工作区任何 GAME_CONFIG.key / 别名引用（var X = window.GAME_CONFIG 后 X.key，
+		       别名按文件局部识别）引用了未定义的键——注释与字符串内容里的点访问不算（扫描前剥离）；
+		       丢键=运行时 undefined（NaN 类靠沙箱事后兜底、颜色类甚至无症状），写入时刻精准拦截；
+		    ② 参数键守恒：以回合起点键集为基准只增不减——删除/改名需用户指令点名键名或授权重做
+		       （configKeyDeletionAuthorized 谓词：GameAgent 以 sanitizedInstruction 包含键名判定，
+		       否定窗口已剔除防"不要删 X"误授权；与断言 id 守恒同语义——参数面板与覆盖依赖键名稳定）；
+		       新增键、调值不受限；改名时"先改 config.js 再同步引用"由报错文案引导；
+		    ③ 值类型纯 JSON：GAME_CONFIG 字面量规范化后仍解析失败（函数/表达式值）即拒——
+		       平台参数面板据此解析默认值表；
+		    键集/引用集不可解析时跳过对应检查（宁可漏报不误伤）；提示词工具纪律同步告知三条规则。
+		  - 玩家覆盖上下文注入（runToolLoop 组装工具上下文时）：编辑已保存游戏且玩家有合法覆盖时，
+		    GameConfigContract.renderOverrideNote 把 user_config.json 渲染为清单注入（键=值逐行列出、
+		    上限 40 项）——覆盖优先于 config.js 默认值，模型看不见会让"调简单点"类修改被覆盖静默吞掉；
+		    清单同时告知"改默认值不影响玩家实际体验""改名/删键须提醒玩家更新覆盖"。
 		→ 运行时报错（格式化回传：file:line + stack + console 片段）再回到Agent Loop 修复
 		→ 运行无报错，用户可选择输入文本改进游戏或报告缺陷，则回到Agent Loop 修复
 		→ 更新 GameSession 并持久化（代码 + rolling summary：
@@ -641,17 +686,18 @@ GameWishingWell/
       │  │  │  ├─ GamePlan.kt            # 策划层：LLM 逐系统阐述具体实现、P0/P1/P2、验收清单
       │  │  │  ├─ GamePrompt.kt          # system 提示词 / 策划上下文 / 代码契约
 	      │  │  │  ├─ GameBundle.kt          # 多文件运行前合并：入口 index.html + 工作区 js/css 相对引用 → 内联为自包含页面（真机/沙箱同管道）
-		      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单/辅助文件轻量校验/超大内联拆分建议）；运行校验由沙箱承担
+	      │  │  │  ├─ GameConfigContract.kt  # 参数外置契约共享常量与解析器（GAME_CONFIG 提取/规范化为 JSON/覆盖模板）：校验器、HtmlEnhancer 注入、参数面板三方同源
+	      │  │  │  ├─ GameValidator.kt       # 轻量产品契约检查（资源自包含/eval 禁令/ww-engine 引擎白名单/参数外置契约/辅助文件轻量校验/超大内联拆分建议）；运行校验由沙箱承担
 	      │  │  │  ├─ GameEngines.kt        # 内置引擎条件注册表（ww-engine 解析/BUNDLED/allowedFor 条件矩阵）
 	      │  │  │  ├─ GameScenario.kt        # 功能断言（场景回归）：scenarios.json 模型/解析清洗/档位门控/eventually 期限（horizon）；写入陷阱三连（恒真/单调上界/姿态基线锚点）
 	      │  │  │  ├─ GameSmokeTest.kt       # WebView 直载确定性 tick 冒烟测试：探针纯测量（EvidenceCollector）+ 轮询驱动/证据解码/引擎注入（裁决在 DeliveryGate）
 	      │  │  │  ├─ DeliveryGate.kt        # 交付门（声明式裁决表）：Evidence → Verdict 纯函数检查表（运行时错误/canvas-alive/像素多样性/方向/角落/可观测性/断言），light=错误行子集；真机事故洞逐行固化回归
-	      │  │  │  ├─ GameStaticCheck.kt     # 跨文件模块导出契约静态预检（写入时刻）：window.X=(function.. 模块的 return 导出表 vs 全工作区 X.fn( 调用点，缺失即拒（丢导出=init 即崩）
+	      │  │  │  ├─ GameStaticCheck.kt     # 写入时刻静态预检：跨文件模块导出契约（X.fn 调用 vs return 导出表，丢导出=init 即崩）＋参数外置契约维护（悬空引用/参数键守恒/值类型纯 JSON）
 	      │  │  │  ├─ RecentInstructionWindow.kt # 最近用户指令窗口：最近 N 条有效指令逐字注入 Agent 上下文（纯确定性轮划分+已交付标记+覆盖声明），工具模式与兼容回环共用
       │  │  │  ├─ GameFileWorkspace.kt   # 编辑区文件沙箱 / 平写覆盖（两区模型：无版本归档；同会话加锁+hash 防并发覆盖；init 清理旧版本应用遗留的 .versions/指针/sha256 簿记）
       │  │  │  ├─ RetryPolicy.kt         # 错误签名哈希与历史记账
       │  │  │  ├─ HtmlExtractor.kt       # 从 LLM 回复中抽 HTML
-	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入（视口修复/错误捕获/内置引擎注入）
+	      │  │  │  ├─ HtmlEnhancer.kt        # WebView 渲染前 HTML 增强注入（视口修复/错误捕获/内置引擎注入/玩家参数覆盖 __wwConfigOverride——先于游戏脚本的配置层）
 	      │  │  │  └─ GenerationForegroundService.kt # 生成期前台服务（dataSync）：后台保活/进度通知/停止入口/wakelock
       │  │  ├─ data/
       │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage
@@ -669,7 +715,7 @@ GameWishingWell/
       │  │     ├─ Container.kt              # 从 Application 获取容器
 		      │  │     ├─ home/HomeScreen.kt        # 我的游戏页（卡片动效运行标识：会话 Agent Loop 运行中显示旋转 logo + 阶段）；草稿卡菜单：文件夹/删除（与成品游戏卡同款）
       │  │     ├─ chat/ChatScreen.kt        # 创作/编辑对话页
-      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复；沉浸式全屏见下；每游戏独立子域假 origin 加载——ww:save 进度存档的隔离与跨重启持久化）
+      │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复；沉浸式全屏见下；每游戏独立子域假 origin 加载——ww:save 进度存档的隔离与跨重启持久化；设置面板含"参数调整"入口——user_config.json 运行时覆盖，见参数外置与玩家调参）
       │  │     ├─ files/FileBrowserScreen.kt # 文件可视系统：文件夹逐级浏览（games/<id> 与草稿 drafts/）+ 文件只读查看器（长按选中复制、顶栏“导出文件”SAF 另存完整内容）
       │  │     ├─ settings/SettingsScreen.kt # 设置页
       │  │     └─ viewmodels/

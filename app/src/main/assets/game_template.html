@@ -21,6 +21,19 @@
 var canvas = document.getElementById('g'), ctx = canvas.getContext('2d');
 var W = 0, H = 0;
 
+// —— 参数外置契约：全部可调参数集中于此，玩家可在平台"参数调整"面板直接修改 ——
+// 值为纯 JSON 类型（数字/字符串/布尔/数组）；逻辑代码经 GAME_CONFIG.xxx 引用，不散写字面量。
+window.GAME_CONFIG = {
+  "paddleWidth": 110,
+  "paddleFollow": 8,
+  "ballRadius": 12,
+  "ballSpeedMin": 130,
+  "ballSpeedMax": 190,
+  "spawnRate": 0.4,
+  "beepFrequency": 660
+};
+Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {}); // 平台参数覆盖（"参数调整"面板注入，必留此行）
+
 // —— 窗口尺寸自适应（含高分屏）——
 function resize(){
   var dpr = window.devicePixelRatio || 1;
@@ -33,7 +46,7 @@ resize();
 
 // —— 游戏状态 ——
 var score = 0, over = false;
-var px = W / 2, py = H - 70, pw = 110, ph = 16;
+var px = W / 2, py = H - 70, pw = window.GAME_CONFIG.paddleWidth, ph = 16;
 var balls = [];
 var touchX = null;
 
@@ -56,11 +69,15 @@ requestAnimationFrame(frame);
 
 function update(dt){
   if (over) return;
-  if (touchX != null) px += (touchX - px) * 8 * dt;
+  if (touchX != null) px += (touchX - px) * window.GAME_CONFIG.paddleFollow * dt;
   px = Math.max(pw/2, Math.min(W - pw/2, px));
 
-  if (Math.random() < 0.4 * dt) {
-    balls.push({x: Math.random()*W, y: -14, r: 12, v: 130 + Math.random()*60});
+  if (Math.random() < window.GAME_CONFIG.spawnRate * dt) {
+    balls.push({
+      x: Math.random()*W, y: -14,
+      r: window.GAME_CONFIG.ballRadius,
+      v: window.GAME_CONFIG.ballSpeedMin + Math.random()*(window.GAME_CONFIG.ballSpeedMax - window.GAME_CONFIG.ballSpeedMin)
+    });
   }
   for (var i = balls.length - 1; i >= 0; i--) {
     var b = balls[i];
@@ -68,7 +85,7 @@ function update(dt){
     if (b.y + b.r >= py - ph/2 && Math.abs(b.x - px) < pw/2 + b.r) {
       score++;
       document.getElementById('score').textContent = score;
-      beep(660);
+      beep(window.GAME_CONFIG.beepFrequency);
       saveProgress(score); // 对局进行中随进度落盘（退出重进从这里继续）
       balls.splice(i, 1);
     } else if (b.y - b.r > H) {

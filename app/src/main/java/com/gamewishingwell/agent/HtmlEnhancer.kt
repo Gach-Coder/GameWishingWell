@@ -15,6 +15,10 @@ package com.gamewishingwell.agent
  *    把 APK assets 里的引擎源码注入 <head>（在游戏脚本之前执行）。
  *    引擎源码经 [engineSourceProvider] 获取——真机由 Application 接入 assets
  *    读取实现，JVM 单测可替换为桩；真实游戏页与沙箱共用本注入管道。
+ * 5. 玩家参数覆盖注入（参数外置契约运行侧）：把 games/<id>/user_config.json 的
+ *    内容作为 window.__wwConfigOverride 注入 <head> 顶部（先于游戏脚本），
+ *    游戏侧 Object.assign(GAME_CONFIG, __wwConfigOverride||{}) 合并行消费它；
+ *    沙箱验收不注入——断言回归基准始终是 AI 交付的默认参数。
  *
  * 只影响 WebView 里渲染的副本，磁盘上保存的原始 HTML 保持不动。
  */
@@ -252,17 +256,38 @@ object HtmlEnhancer {
     private val htmlTagRegex = Regex("<html[^>]*>", RegexOption.IGNORE_CASE)
     private val doctypeRegex = Regex("^\\s*<!DOCTYPE[^>]*>", RegexOption.IGNORE_CASE)
     private const val ENGINE_INJECTED_MARK = "__wwEngineInjected"
+    private const val OVERRIDE_INJECTED_MARK = "__wwConfigOverrideLoaded"
 
-    fun inject(html: String): String {
+    /**
+     * 玩家参数覆盖注入（参数外置契约的运行侧）：把 user_config.json 的内容作为
+     * window.__wwConfigOverride 注入到【游戏脚本之前】——config.js 的合并行
+     * （Object.assign(GAME_CONFIG, __wwConfigOverride || {})）在定义参数时消费它。
+     * [configOverrideJson] 由调用方先行校验（GameConfigContract.isValidOverrideJson），
+     * 这里只做形态兜底与 `</script` 闭合转义；null/非对象静默跳过（= 默认参数运行）。
+     * 沙箱（验收回归）不注入——断言基准始终是 AI 交付的默认参数，不受玩家调整污染。
+     * 幂等由调用方（inject）按整页标记裁决，这里不重复检查。
+     */
+    private fun buildOverrideScript(configOverrideJson: String?): String? {
+        val trimmed = configOverrideJson?.trim() ?: return null
+        if (!trimmed.startsWith("{")) return null
+        val safe = trimmed.replace("</script", "<\\/script")
+        return "<script>/* $OVERRIDE_INJECTED_MARK */\nwindow.${GameConfigContract.OVERRIDE_BRIDGE} = $safe;\n</script>"
+    }
+
+    fun inject(html: String, configOverrideJson: String? = null): String {
         if (html.isBlank()) return html
 
         val needsErrorCatcher = !html.contains("unhandledrejection", ignoreCase = true)
         val needsViewportFix = !html.contains("__wwViewportFixApplied")
         val engineScripts = buildEngineScripts(html)
-        if (!needsErrorCatcher && !needsViewportFix && engineScripts.isEmpty()) return html
+        // 幂等按整页标记裁决（标记在注入块注释里，游戏自身代码不会含有）
+        val overrideScript = if (html.contains(OVERRIDE_INJECTED_MARK)) null else buildOverrideScript(configOverrideJson)
+        if (!needsErrorCatcher && !needsViewportFix && engineScripts.isEmpty() && overrideScript == null) return html
 
         val preludes = buildString {
-            // 引擎最先注入：必须在游戏脚本（以及视口修复/错误捕获之后的游戏逻辑）之前完成定义。
+            // 玩家参数覆盖最先注入（配置层先于一切）；引擎其次——必须在游戏脚本
+            // （以及视口修复/错误捕获之后的游戏逻辑）之前完成定义。
+            overrideScript?.let { append(it).append("\n") }
             engineScripts.forEach { append(it).append("\n") }
             if (needsViewportFix) append(VIEWPORT_PRELUDE).append("\n")
             if (needsErrorCatcher) append(ERROR_PRELUDE).append("\n")

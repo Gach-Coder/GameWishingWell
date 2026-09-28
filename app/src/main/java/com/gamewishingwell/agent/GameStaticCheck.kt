@@ -73,6 +73,61 @@ object GameStaticCheck {
         return keys
     }
 
+    /**
+     * 参数外置契约维护（写入时刻；修复/迭代轮生效——回合起点已定义 GAME_CONFIG 的游戏）：
+     * - 悬空引用：工作区任何 `GAME_CONFIG.key`（或别名 `CFG.key`）引用的键不在定义里。
+     *   丢键 = 运行时 undefined（NaN 类症状只能靠沙箱事后兜底，像素/颜色类甚至无症状），
+     *   写入时刻精准拦截（与模块导出契约同族：调用存在而定义缺失）；
+     * - 参数键守恒：以起点键集为基准，删除/改名需用户指令点名键名或授权重做
+     *   （[isKeyDeletionAuthorized]——与断言 id 守恒同语义：玩家参数面板与
+     *   user_config 覆盖依赖键名稳定）；
+     * - 值类型纯 JSON：GAME_CONFIG 字面量规范化后仍解析失败（函数/表达式值）
+     *   即违规——平台参数面板据此解析默认值表。
+     * 首次生成轮（起点无 GAME_CONFIG）不参与：并行写入的正常时序（先引用后建键）
+     * 不该被拦，结构存在性由验收校验把关。键集/引用集不可解析时跳过对应检查
+     * （宁可漏报不误伤）。
+     */
+    fun configContractViolations(
+        files: Map<String, String>,
+        startFiles: Map<String, String>,
+        isKeyDeletionAuthorized: (String) -> Boolean
+    ): List<String> {
+        val violations = mutableListOf<String>()
+        val participates = startFiles.values.any { GameConfigContract.hasConfigObject(it) }
+        if (participates) {
+            val currentKeys = files.values.mapNotNull { GameConfigContract.extractConfigKeys(it) }
+                .flatten().toSet()
+            // 悬空引用：引用了不存在的键（新增引用先于补键落盘时同样命中——
+            // 报错文案引导"先补 config.js 再写引用"，与导出契约的处理一致）
+            val refs = GameConfigContract.collectConfigRefs(files)
+            val dangling = refs.filterKeys { it !in currentKeys }
+            if (dangling.isNotEmpty()) {
+                violations += "参数外置契约被破坏——悬空引用：GAME_CONFIG 未定义的键被引用：" +
+                    dangling.entries.sortedBy { it.key }
+                        .joinToString("、") { "${it.key}（${it.value.sorted().joinToString("、")} 引用）" } +
+                    "。请先在 js/config.js 补齐参数键（或修正引用处拼写），再落盘引用它的代码"
+            }
+            // 参数键守恒：删除/改名需点名（新增/调值不受限）
+            val startKeys = startFiles.values.mapNotNull { GameConfigContract.extractConfigKeys(it) }
+                .flatten().toSet()
+            val unauthorized = startKeys.filterNot { it in currentKeys || isKeyDeletionAuthorized(it) }
+            if (unauthorized.isNotEmpty()) {
+                violations += "参数外置契约被破坏——参数键只增不减：以下键被删除或改名：" +
+                    unauthorized.sorted().joinToString("、") +
+                    "（玩家参数面板与参数覆盖依赖键名稳定）。新增参数直接追加键、调值不受限；" +
+                    "确需删除或改名，须用户指令明确点名该键名或授权重做；改名时先改 config.js 再同步全部引用"
+            }
+        }
+        // 值类型：字面量存在但规范化后仍非 JSON（函数/表达式值破坏面板解析）
+        files.forEach { (path, content) ->
+            if (GameConfigContract.configLiteralIsJsonCompatible(content) == false) {
+                violations += "参数外置契约被破坏——$path 的 GAME_CONFIG 含非 JSON 值（函数或表达式）。" +
+                    "参数值只能是数字/字符串/布尔/数组/对象（平台参数面板据此解析默认值表）"
+            }
+        }
+        return violations
+    }
+
     /** 从 openBrace（'{' 下标）走平衡花括号，返回匹配 '}' 下标；中途耗尽返回 null。 */
     private fun findBalancedClose(content: String, openBrace: Int): Int? {
         var depth = 0

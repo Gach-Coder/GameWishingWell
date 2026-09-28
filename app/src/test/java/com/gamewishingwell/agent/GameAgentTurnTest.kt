@@ -149,6 +149,8 @@ class GameAgentTurnTest {
     }
 
     private val validHtml = """<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><script>
+window.GAME_CONFIG = { "speed": 10 };
+Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});
 window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };
 function restart(){}
 </script></body></html>"""
@@ -691,7 +693,9 @@ function restart(){}
             })();
         """.trimIndent()
         val touchMissing = touchFull.replace("setUI: setUI, ", "")
-        val mainJs = "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\n" +
+        val mainJs = "window.GAME_CONFIG = { \"speed\": 10 };\n" +
+            "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});\n" +
+            "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\n" +
             "function restart(){}\n" +
             "(function(){ setTimeout(function(){ Input.setUI(document.createElement('canvas')); }, 30); })();"
         val entryHtml = """<!DOCTYPE html><html><head>
@@ -738,7 +742,9 @@ function restart(){}
         val entryHtml = """<!DOCTYPE html><html lang="zh"><head>
 <link rel="stylesheet" href="css/style.css">
 </head><body><script src="js/main.js"></script></body></html>"""
-        val jsContent = "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
+        val jsContent = "window.GAME_CONFIG = { \"speed\": 10 };\n" +
+            "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});\n" +
+            "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
         val cssContent = "body{margin:0;background:#111}"
         fun wcall(path: String, content: String) = ToolCallData(
             "c-${path.hashCode()}-${content.hashCode()}", "writefile",
@@ -810,7 +816,9 @@ function restart(){}
         val entryHtml = """<!DOCTYPE html><html><head>
 <link rel="stylesheet" href="css/style.css">
 </head><body><script src="js/main.js"></script></body></html>"""
-        val jsContent = "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
+        val jsContent = "window.GAME_CONFIG = { \"speed\": 10 };\n" +
+            "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});\n" +
+            "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
         val script = ScriptedLlmClient(
             listOf(
                 // 识别层 Lite 补丁（direct-make 路径的系统参考抽取）
@@ -969,5 +977,111 @@ function restart(){}
         assertTrue(p!!.contains("62300"))
     }
     // 断言对齐提示（alignmentHintFor 3/5 轮阶梯）已随 eventually 断言语义根治而删除：
-    // 失败回报自带字段轨迹与输入点状态，"机制未发生/字段错位"独立成信号，无需按次数升级的判定文案。
+    //  失败回报自带字段轨迹与输入点状态，"机制未发生/字段错位"独立成信号，无需按次数升级的判定文案。
+
+    // ---------- 参数外置契约维护（迭代轮，写入时刻执行层强制 + 覆盖清单注入） ----------
+
+    private fun cfgGuardFixtures(): Array<String> {
+        val cfgFull = "window.GAME_CONFIG = { \"speed\": 3, \"hp\": 100 };\n" +
+            "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});"
+        val cfgLost = "window.GAME_CONFIG = { \"speed\": 3 };\n" +
+            "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});"
+        val cfgTuned = "window.GAME_CONFIG = { \"speed\": 5, \"hp\": 100 };\n" +
+            "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});"
+        return arrayOf(cfgFull, cfgLost, cfgTuned)
+    }
+
+    @Test
+    fun `迭代轮参数键守恒-删键被拒且调值放行`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-cfgguard-${System.nanoTime()}")
+        val (cfgFull, cfgLost, cfgTuned) = cfgGuardFixtures()
+        val mainJs = "var v = window.GAME_CONFIG.speed + window.GAME_CONFIG.hp;\n" +
+            "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
+        val entryHtml = "<!DOCTYPE html><html><head><script src=\"js/config.js\"></script></head>" +
+            "<body><script src=\"js/main.js\"></script></body></html>"
+        fun wcall(path: String, content: String, tag: String) = ToolCallData(
+            tag, "writefile", """{"path":"$path","content":${jsonStr(content)}}"""
+        )
+        val script = ScriptedLlmClient(
+            listOf(
+                // 轮 1：首代生成（js/config.js 参与契约），fast 档直出交付
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse("", toolCalls = listOf(
+                    wcall("js/config.js", cfgFull, "c-cfg1"),
+                    wcall("js/main.js", mainJs, "c-main1"),
+                    wcall("index.html", entryHtml, "c-idx1")
+                )),
+                LlmResponse("完成"),
+                // 轮 2（迭代："调整速度"本地正则 dev 0.9，无 Lite 消耗）：
+                // ① 重写 config.js 删掉 hp 键（指令未点名键名）→ 执行层致命拒绝且不落盘
+                LlmResponse("", toolCalls = listOf(wcall("js/config.js", cfgLost, "c-cfg2"))),
+                // ② 被拒后恢复完整键表并只调 speed 值 → 放行（调值不受限）
+                LlmResponse("", toolCalls = listOf(wcall("js/config.js", cfgTuned, "c-cfg3"))),
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个游戏", qualityTier = "fast")
+        agent.sendUserMessage("调整速度", qualityTier = "fast")
+
+        // 拒绝信息（参数键只增不减 + 点名 hp）回填给了模型
+        assertTrue(
+            "应回填参数键守恒拒绝信息",
+            script.calls.any { (msgs, _) -> msgs.any { it.content.contains("参数键只增不减") && it.content.contains("hp") } }
+        )
+        // 最终落盘：hp 键保留、speed 调值生效（被拒版本未落盘）
+        val final = File(File(dir, "agent/workspace/draft"), "js/config.js").readText()
+        assertTrue(final.contains("\"speed\": 5") && final.contains("\"hp\""))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `迭代轮注入玩家参数覆盖清单`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-turn-cfgovr-${System.nanoTime()}")
+        val (cfgFull, _, cfgTuned) = cfgGuardFixtures()
+        val mainJs = "var v = window.GAME_CONFIG.speed + window.GAME_CONFIG.hp;\n" +
+            "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
+        val entryHtml = "<!DOCTYPE html><html><head><script src=\"js/config.js\"></script></head>" +
+            "<body><script src=\"js/main.js\"></script></body></html>"
+        fun wcall(path: String, content: String, tag: String) = ToolCallData(
+            tag, "writefile", """{"path":"$path","content":${jsonStr(content)}}"""
+        )
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse("", toolCalls = listOf(
+                    wcall("js/config.js", cfgFull, "c-cfg1"),
+                    wcall("js/main.js", mainJs, "c-main1"),
+                    wcall("index.html", entryHtml, "c-idx1")
+                )),
+                LlmResponse("完成"),
+                // 轮 2：入库后工作区随会话身份切换到 game-<id>（草稿工作区不迁移，与真机
+                // 行为一致）——重写全三件套；本轮上下文应包含玩家参数覆盖清单
+                LlmResponse("", toolCalls = listOf(
+                    wcall("js/config.js", cfgTuned, "c-tune-cfg"),
+                    wcall("js/main.js", mainJs, "c-tune-main"),
+                    wcall("index.html", entryHtml, "c-tune-idx")
+                )),
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个游戏", qualityTier = "fast")
+        val meta = agent.saveCurrentGame("测试游戏") ?: throw AssertionError("保存失败")
+        // 玩家经参数面板写入覆盖（同一 filesDir 的仓库实例即可触达同一文件）
+        val ctx = org.mockito.Mockito.mock(android.content.Context::class.java)
+        `when`(ctx.filesDir).thenReturn(dir)
+        GameRepository(ctx).writeUserConfig(meta.id, """{"playerSpeed": 260, "goblinHp": 50}""")
+        agent.sendUserMessage("调整速度", qualityTier = "fast")
+
+        assertTrue(
+            "迭代轮上下文应包含玩家参数覆盖清单",
+            script.calls.any { (msgs, _) ->
+                msgs.any { it.content.contains("玩家参数覆盖") && it.content.contains("playerSpeed = 260") }
+            }
+        )
+        dir.deleteRecursively()
+        Unit
+    }
 }
