@@ -2643,9 +2643,8 @@ class GameAgent(
         editingGameId?.let { editingWorkspaceDir(it) }
             ?: File(appContext.filesDir, "agent/workspace/draft")
 
-    /** 已保存游戏对应的编辑区目录。 */
-    private fun editingWorkspaceDir(gameId: Long): File =
-        File(appContext.filesDir, "agent/workspace/game-$gameId")
+    /** 已保存游戏对应的编辑区目录（单一来源：与游戏包导出/导入的 .ww-workspace 落位同一路径约定）。 */
+    private fun editingWorkspaceDir(gameId: Long): File = repository.editingWorkspaceDir(gameId)
 
     /** 编辑区当前的入口文件内容（无编辑区或未写过文件时为 null）。 */
     private fun editingWorkspaceHtml(gameId: Long): String? =

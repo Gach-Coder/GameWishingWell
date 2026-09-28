@@ -565,4 +565,117 @@ class GameRepositoryTest {
         }
         dir.deleteRecursively()
     }
+
+    @Test
+    fun `导出包含编辑区未保存修改且导入落位复原`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-zipws-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            val meta = repo.saveGame(
+                "塔防", "描述",
+                mapOf("index.html" to "<html>saved-v1</html>", "js/main.js" to "var a=1;"),
+                listOf(ChatMessage("user", "做一个塔防"))
+            )
+            repo.saveGameAgentState(meta.id, """{"gameGenerated":true,"unsavedVersion":true}""")
+            // 编辑区存在未保存的修改（比保存区新）：入口更新 + 新增辅助文件
+            val wsDir = File(dir, "agent/workspace/game-${meta.id}")
+            File(wsDir, "js").mkdirs()
+            File(wsDir, "index.html").writeText("<html>editing-v2</html>")
+            File(wsDir, "js/jump.js").writeText("function jump(){}")
+
+            val zip = ByteArrayOutputStream()
+            assertTrue(repo.exportGameZip(meta.id, zip))
+            val imported = repo.importGameZip(ByteArrayInputStream(zip.toByteArray()))
+            assertNotNull(imported)
+            // 保存区原样复原（仍是入库版本）
+            assertEquals("<html>saved-v1</html>", repo.loadGameHtml(imported!!.id))
+            assertEquals("var a=1;", repo.loadGameFile(imported.id, "js/main.js"))
+            // 编辑区落位到新会话的工作区：未保存的修改随包复原（会话描述与文件一致，
+            // unsavedVersion=true 的现场不再撕裂）
+            val newWs = File(dir, "agent/workspace/game-${imported.id}")
+            assertEquals("<html>editing-v2</html>", File(newWs, "index.html").readText())
+            assertEquals("function jump(){}", File(newWs, "js/jump.js").readText())
+            // 未保存标记随 agent_state 往返：首页"!"语义在导入侧成立
+            assertTrue(repo.loadGameAgentState(imported.id)!!.contains("\"unsavedVersion\""))
+        }
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun `导入初始化缺失的会话簿记与保存点`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-zipinit-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            // 外部手打 zip：只有游戏入口，无任何会话簿记
+            val zip = zipOf("index.html" to "<html>v1</html>")
+            val imported = repo.importGameZip(ByteArrayInputStream(zip))
+            assertNotNull(imported)
+            val gameDir = File(dir, "games/${imported!!.id}")
+            // 按首轮对话环境初始化：空消息列表 + 默认会话状态（GameSession 全字段默认值）
+            assertEquals("[]", File(gameDir, "session.json").readText())
+            assertEquals("{}", File(gameDir, "agent_state.json").readText())
+            // 保存点同步合成（导入=入库语义）：撤销锚点可用，不走"旧版本无保存点"清空对话路径
+            assertEquals("[]", File(gameDir, ".savepoint/session.json").readText())
+            assertEquals("{}", File(gameDir, ".savepoint/agent_state.json").readText())
+            // 初始化结果与装载链路自洽：空对话 + 默认状态可正常读回
+            assertTrue(repo.loadGameSession(imported.id).isEmpty())
+            assertNotNull(repo.loadGameAgentState(imported.id))
+            assertEquals("[]", repo.loadSavepointSession(imported.id) ?: "[]")
+            assertNotNull(repo.loadSavepointAgentState(imported.id))
+        }
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun `导入检测损坏簿记并按缺失初始化`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-zipcorrupt-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            // 会话簿记损坏（导出撕裂写入/外部手改形态）：session 非法 JSON、
+            // agent_state 是数组（须为对象）、保存点成员同污
+            val zip = zipOf(
+                "index.html" to "<html>v1</html>",
+                "session.json" to "{\"oops\"",
+                "agent_state.json" to "[1,2]",
+                ".savepoint/session.json" to "not json at all",
+                ".savepoint/agent_state.json" to "<<<"
+            )
+            val imported = repo.importGameZip(ByteArrayInputStream(zip))
+            assertNotNull(imported)
+            val gameDir = File(dir, "games/${imported!!.id}")
+            // 损坏一律按缺失处理并初始化，不静默降级、不拒整包
+            assertEquals("[]", File(gameDir, "session.json").readText())
+            assertEquals("{}", File(gameDir, "agent_state.json").readText())
+            assertEquals("[]", File(gameDir, ".savepoint/session.json").readText())
+            assertEquals("{}", File(gameDir, ".savepoint/agent_state.json").readText())
+            assertEquals("<html>v1</html>", File(gameDir, "index.html").readText())
+        }
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun `导入为缺失保存点合成导入内容锚点`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "repo-zipsp-${System.nanoTime()}")
+        val repo = repo(dir)
+        runBlocking {
+            // 旧版本应用导出的包（无 .savepoint）：会话与状态完好
+            val messages = """[{"role":"user","content":"做一个塔防"},{"role":"assistant","content":"已交付"}]"""
+            val zip = zipOf(
+                "index.html" to "<html>v1</html>",
+                "session.json" to messages,
+                "agent_state.json" to """{"gameGenerated":true,"qualityTier":"premium"}"""
+            )
+            val imported = repo.importGameZip(ByteArrayInputStream(zip))
+            assertNotNull(imported)
+            val gameDir = File(dir, "games/${imported!!.id}")
+            // 保存点从导入内容合成：撤销锚点=入库时刻现场（消息与状态与导入内容一致）
+            assertEquals(messages, File(gameDir, ".savepoint/session.json").readText())
+            assertEquals(
+                """{"gameGenerated":true,"qualityTier":"premium"}""",
+                File(gameDir, ".savepoint/agent_state.json").readText()
+            )
+            assertEquals(2, repo.loadSavepointSession(imported.id)?.size)
+        }
+        dir.deleteRecursively()
+    }
 }

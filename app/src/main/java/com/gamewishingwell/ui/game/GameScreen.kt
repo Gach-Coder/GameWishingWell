@@ -274,12 +274,7 @@ fun GameScreen(
                 IconButton(onClick = onBack) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = Color.White)
                 }
-                Text(
-                    if (source == "game") "游玩中" else "游戏预览",
-                    color = Color.White,
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.weight(1f)
-                )
+                Spacer(Modifier.weight(1f))
                 IconButton(onClick = {
                     webView?.evaluateJavascript("window.__wwSetPaused && window.__wwSetPaused(true)", null)
                     showSettings = true

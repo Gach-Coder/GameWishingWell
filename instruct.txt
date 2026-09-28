@@ -1,6 +1,6 @@
 ============================================================
  许愿井 GameWishingWell — 安卓 AI 游戏 Agent 平台 · 工程说明
- 更新日期：2026-09-15
+ 更新日期：2026-09-28
 ============================================================
 
 一、项目简介
@@ -8,8 +8,23 @@
 一个安卓端“游戏创作 Agent”平台，底部三个 Tab：我的游戏、创作、设置。
 
 1. “我的游戏（首页）”展示用户已经制作好的游戏，点击即可立即游玩；
-   每张游戏卡片显示：游戏名、用户描述、更新时间，支持：重命名、继续对话编辑、删除、文件夹，
+   每张游戏卡片显示：游戏名、用户描述、更新时间，支持：重命名、继续对话编辑、删除、文件夹、导出zip，
    有未保存草稿时显示“继续上次创作”入口（卡片菜单与成品游戏同款：文件夹（进入草稿文件夹 drafts/）/删除）。
+   游戏包导出/导入（zip 互导自洽，GameRepository.exportGameZip/importGameZip——对话现场复原契约）：
+   - 导出（游戏卡菜单「导出zip」，SAF 另存）：严格打包【该对话的全部文件】——保存区 games/<id> 整体
+     （index.html + js/css 多文件 + scenarios.json + session.json 对话全消息 + agent_state.json 会话状态
+     + .savepoint 撤销锚点 + log/ 回合日志）与编辑区 agent/workspace/game-<id>（未保存的修改，
+     以 .ww-workspace/ 保留前缀入包——unsavedVersion 会话的编辑区比保存区新，缺了它导入后
+     会话描述与实际文件撕裂）；根另附 ww_game.json 清单（标题/描述来自索引，games/<id> 本身不含元数据）；
+   - 导入（首页右下角「导入」按钮，SAF 选 zip）：解包到新 games/<新id>（新 id=全新会话身份），
+     容错外部打包工具的单一顶层目录前缀；完整性检测——session.json/agent_state.json（含 .savepoint 内
+     同构成员）损坏（撕裂写入/外部手改）按缺失处理并 Log 留痕；缺失文件按【首轮对话环境】初始化：
+     session.json=[]（空消息列表）、agent_state.json={}（GameSession 默认值），.savepoint 缺失时以导入
+     （或初始化）后的会话与状态合成保存点（导入=入库语义，入库即冻结撤销锚点，与首次保存同款——
+     撤销不再走“旧版本无保存点”清空对话路径）；.ww-workspace/ 条目落位到 agent/workspace/game-<新id>/
+     （未保存修改随包复原）；缺 index.html/路径逃逸/超 256MB/空 zip 判包非法拒绝导入；
+   - 编辑区路径单一来源：GameRepository.editingWorkspaceDir（GameAgent 委托同一实现，
+     导出/落位与 Agent 实际工作区不会路径漂移）。
    文件可视系统（全程只读浏览）：游戏卡菜单“文件夹”进入 FileBrowserScreen（草稿卡同理进入 drafts/），
    像资源管理器一样逐级浏览该游戏存储文件夹（filesDir/games/<id>，草稿为 filesDir/drafts）——
    点击文件夹进入子目录（.savepoint 保存点、log 回合日志、js/css 等游戏子目录同样可进；
@@ -156,10 +171,8 @@ Agent处理message流程如下：
 		（feature/bug 之分下推给策划层与 Agent Loop：它们看得到代码与用户诉求，判得更准；
 		  new_game vs 迭代由会话级 Game Schema 是否为空判定，同样不靠分类）
 	(区分feature和module，feature包含module，feature可小为一个按钮的样子或位置，module为游戏中某个系统模块例如)
-	→ 识别层：
-		检测 Game Schema JSON 会话级的游戏Json 是否为空：
-			Json为空 → 对话历史不包含游戏 → 默认为首次 dev 对话
-			Json非空 → 对话已经锚定某游戏
+	→ 识别层：（识别用户的特征要求，保证用户明文要求得到满足）
+		首次
 		正则 + Lite LLM 抽取游戏特征（除非用户说明，按该游戏类型的核心+标配系统集合识别），补全或修正 Game Schema JSON 信息
 			（先过 JSON Schema +枚举白名单校验：方向/维度的同义写法先归一化——横屏/横版/landscape→横板、竖屏/portrait→竖版、
 			  2d/二维→2D、伪3d→2.5D、三维→3D——归一化在 Lite LLM 解析出口与 validate 双侧生效；
@@ -642,7 +655,7 @@ GameWishingWell/
 	      │  │  │  └─ GenerationForegroundService.kt # 生成期前台服务（dataSync）：后台保活/进度通知/停止入口/wakelock
       │  │  ├─ data/
       │  │  │  ├─ Game.kt                # GameMeta / GameIndex / ChatMessage
-      │  │  │  ├─ GameRepository.kt      # 保存区与草稿存储（两区模型：保存=编辑区清单整体平写+镜像删除，撤销=保存区清单整体覆盖回编辑区；会话簿记/.savepoint/log 豁免；存量版本簿记随写入清理）
+      │  │  │  ├─ GameRepository.kt      # 保存区与草稿存储（两区模型：保存=编辑区清单整体平写+镜像删除，撤销=保存区清单整体覆盖回编辑区；会话簿记/.savepoint/log 豁免；存量版本簿记随写入清理）；游戏包导出/导入（保存区+编辑区全量打包、完整性检测、缺失簿记按首轮对话环境初始化、保存点合成、编辑区落位）
       │  │  │  ├─ SecurePrefs.kt         # Keystore AES-GCM 加密偏好存储
       │  │  │  └─ SettingsRepository.kt  # LLM 配置 StateFlow 仓库
       │  │  ├─ llm/

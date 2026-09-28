@@ -10,6 +10,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -72,6 +73,29 @@ class GameRepository(private val context: Context) {
 
         /** 导入游戏包的解包总量上限：游戏文件夹全为文本，超限即判包异常，防超大 zip 拖垮内存。 */
         const val IMPORT_SIZE_LIMIT_BYTES = 256L * 1024 * 1024
+
+        /** 会话簿记文件名（games/<id> 与 .savepoint 内同构；GameAgent 装载/落盘同一约定）。 */
+        const val SESSION_FILE = "session.json"
+
+        /** Agent 会话状态文件名（GameSession 的 JSON 序列化；GameAgent 落盘同一约定）。 */
+        const val AGENT_STATE_FILE = "agent_state.json"
+
+        /**
+         * 导出包内【编辑区】条目的保留前缀（.ww-workspace/<相对路径>）：编辑区
+         * agent/workspace/game-<id> 里可能有未保存到保存区的修改（unsavedVersion），
+         * 属于该对话现场的一部分——不随包导出则导入后"会话与状态描述新版、文件是旧版"。
+         * 前缀以 "." 开头，与模型生成的游戏文件路径（index.html/js/css）天然隔离。
+         */
+        const val WORKSPACE_PREFIX = ".ww-workspace"
+
+        /** 编辑区根目录名（agent/workspace；game-<id> 子目录为各会话工作区）。 */
+        private const val WORKSPACE_ROOT = "agent/workspace"
+
+        /** 首轮对话环境的会话簿记初值：空消息列表（GameAgent 首次落盘前的装载兜底同义）。 */
+        const val EMPTY_SESSION_JSON = "[]"
+
+        /** 首轮对话环境的 Agent 状态初值：GameSession 全字段默认值的 JSON 形态。 */
+        const val EMPTY_AGENT_STATE_JSON = "{}"
     }
 
     private val json = Json {
@@ -346,10 +370,14 @@ class GameRepository(private val context: Context) {
     // ---------- 游戏包导出 / 导入（zip 互导自洽） ----------
 
     /**
-     * 游戏卡菜单「导出zip」：把保存区 games/<id> 文件夹【整体】打包写入 [out]
-     * （SAF 目标 Uri 的输出流）。zip 条目相对游戏根目录——index.html / js/css 多文件 /
-     * session.json / agent_state.json / .savepoint / log 全量；根另附 [PACKAGE_MANIFEST]
-     * 清单（标题/描述来自索引）。写入失败或游戏不存在返回 false。
+     * 游戏卡菜单「导出zip」：把该对话的全部文件打包写入 [out]（SAF 目标 Uri 的输出流）。
+     * - 保存区 games/<id> 文件夹【整体】：index.html / js/css 多文件 / session.json /
+     *   agent_state.json / .savepoint / log 全量；
+     * - 编辑区 agent/workspace/game-<id>（若存在）：未保存的修改以 [WORKSPACE_PREFIX]/ 前缀
+     *   随包导出——保证基于导出的导入能复原完整现场（unsavedVersion 的会话其编辑区比保存区新，
+     *   缺了它导入后会话描述与实际文件撕裂）；
+     * - 根另附 [PACKAGE_MANIFEST] 清单（标题/描述来自索引）。
+     * 写入失败或游戏不存在返回 false。
      */
     suspend fun exportGameZip(gameId: Long, out: OutputStream): Boolean =
         withContext(Dispatchers.IO) {
@@ -373,6 +401,19 @@ class GameRepository(private val context: Context) {
                             f.inputStream().use { it.copyTo(zos) }
                             zos.closeEntry()
                         }
+                    // 编辑区（工作区）文件：条目名加保留前缀，与保存区条目同包不同命名空间
+                    val wsDir = editingWorkspaceDir(gameId)
+                    if (wsDir.isDirectory) {
+                        wsDir.walkTopDown()
+                            .filter { it.isFile }
+                            .forEach { f ->
+                                zos.putNextEntry(
+                                    ZipEntry("$WORKSPACE_PREFIX/" + f.relativeTo(wsDir).invariantSeparatorsPath)
+                                )
+                                f.inputStream().use { it.copyTo(zos) }
+                                zos.closeEntry()
+                            }
+                    }
                 }
                 true
             }.onFailure { Log.e(LOG_TAG, "exportGameZip 失败: gameId=$gameId", it) }
@@ -380,10 +421,22 @@ class GameRepository(private val context: Context) {
         }
 
     /**
-     * 首页「导入」按钮：读取 [input] 的 zip（与 [exportGameZip] 同构，容错外部打包工具
-     * 的单一顶层目录前缀），解包到新 games/<新id> 并注册索引，返回新游戏元数据——
-     * 新 id 即全新会话身份，"继续编辑"按现有装载链路从保存区播种工作区，天然自洽。
+     * 导入游戏包：读取 [input] 的 zip（与 [exportGameZip] 同构，容错外部打包工具的单一
+     * 顶层目录前缀），解包到新 games/<新id> 并注册索引，返回新游戏元数据——新 id 即全新
+     * 会话身份，"继续编辑"按现有装载链路从保存区播种工作区，天然自洽。
      * 结构非法（缺 index.html / 路径逃逸 / 超大小上限 / 空 zip）返回 null。
+     *
+     * 完整性检测与缺失初始化（对话现场复原契约）：
+     * - 检测：session.json / agent_state.json（含 .savepoint 内同构成员）必须可解析为对应
+     *   结构，损坏（导出时撕裂写入/外部手改）一律按缺失处理并 Log 记录，不静默降级；
+     * - 初始化：缺失的簿记按【首轮对话环境】落盘补齐——session.json=[]（空消息列表）、
+     *   agent_state.json={}（默认会话状态，GameSession 全字段有默认值）——语义与
+     *   GameAgent.decodeSession(null) 的兜底一致，但直接初始化成完整文件环境；
+     * - 保存点补全：.savepoint 缺失时以导入（或初始化）后的会话与状态合成——导入=入库
+     *   语义，入库即冻结撤销锚点（saveCurrentGame 首次入库同款），撤销不再走
+     *   "旧版本游戏无保存点"的清空对话路径；
+     * - 编辑区落位：[WORKSPACE_PREFIX]/ 前缀条目解包到 agent/workspace/game-<新id>/，
+     *   未保存的修改随包复原（同包校验规则：拒绝逃逸，路径已过 readZipEntries 防线）。
      */
     suspend fun importGameZip(input: InputStream): GameMeta? = withContext(Dispatchers.IO) {
         writeMutex.withLock {
@@ -392,7 +445,15 @@ class GameRepository(private val context: Context) {
                 val manifest = files[PACKAGE_MANIFEST]
                     ?.let { runCatching { json.decodeFromString<GamePackageManifest>(it.toString(Charsets.UTF_8)) }.getOrNull() }
                 // 清单随包只读消费，不落进游戏文件夹（否则会混入游戏文件链路——撤销清单/运行合并素材）
-                val gameFiles = files - PACKAGE_MANIFEST
+                // 编辑区条目分流（.ww-workspace/ 前缀）：不入游戏文件夹，稍后单独落位
+                val wsPrefix = "$WORKSPACE_PREFIX/"
+                val workspaceFiles = files.filterKeys { it.startsWith(wsPrefix) }
+                    .mapKeys { (rel, _) -> rel.removePrefix(wsPrefix) }
+                    .filterKeys { it.isNotEmpty() }
+                // 完整性检测：损坏的会话簿记按缺失处理（初始化阶段补齐）
+                val gameFiles = dropCorruptBookkeeping(
+                    files.filterKeys { it != PACKAGE_MANIFEST && !it.startsWith(wsPrefix) && it != WORKSPACE_PREFIX }
+                )
                 if (gameFiles[ENTRY_HTML] == null) return@runCatching null
                 var id = System.currentTimeMillis()
                 while (File(gamesDir, id.toString()).exists()) id++
@@ -401,6 +462,28 @@ class GameRepository(private val context: Context) {
                     val target = File(dir, rel)
                     target.parentFile?.mkdirs()
                     target.writeBytes(bytes)
+                }
+                // 缺失簿记按首轮对话环境初始化（空消息列表 + 默认会话状态）
+                val sessionFile = File(dir, SESSION_FILE)
+                if (!sessionFile.isFile) sessionFile.writeText(EMPTY_SESSION_JSON, Charsets.UTF_8)
+                val stateFile = File(dir, AGENT_STATE_FILE)
+                if (!stateFile.isFile) stateFile.writeText(EMPTY_AGENT_STATE_JSON, Charsets.UTF_8)
+                // 保存点补全：导入=入库，入库即冻结撤销锚点（与 saveCurrentGame 首次入库同款语义）
+                val spSession = File(File(dir, SAVEPOINT_DIR), SESSION_FILE)
+                val spState = File(File(dir, SAVEPOINT_DIR), AGENT_STATE_FILE)
+                if (!spSession.isFile || !spState.isFile) {
+                    File(dir, SAVEPOINT_DIR).mkdirs()
+                    if (!spSession.isFile) spSession.writeText(sessionFile.readText(Charsets.UTF_8))
+                    if (!spState.isFile) spState.writeText(stateFile.readText(Charsets.UTF_8))
+                }
+                // 编辑区落位：未保存的修改复原到新会话的工作区
+                if (workspaceFiles.isNotEmpty()) {
+                    val wsDir = editingWorkspaceDir(id)
+                    workspaceFiles.forEach { (rel, bytes) ->
+                        val target = File(wsDir, rel)
+                        target.parentFile?.mkdirs()
+                        target.writeBytes(bytes)
+                    }
                 }
                 val meta = GameMeta(
                     id = id,
@@ -415,6 +498,40 @@ class GameRepository(private val context: Context) {
                 .getOrNull()
         }
     }
+
+    /**
+     * 完整性检测：剔除损坏的会话簿记（session.json 必须可解析为消息列表、agent_state.json
+     * 必须可解析为 JSON 对象——含 .savepoint 内同构成员）。剔除即"按缺失处理"，
+     * 由导入流程按首轮对话环境初始化补齐；损坏事实 Log.w 留痕（撕裂写入/外部手改诊断）。
+     */
+    private fun dropCorruptBookkeeping(files: Map<String, ByteArray>): Map<String, ByteArray> {
+        var result = files
+        listOf(
+            SESSION_FILE to { b: ByteArray -> isSessionBytes(b) },
+            AGENT_STATE_FILE to { b: ByteArray -> isAgentStateBytes(b) },
+            "$SAVEPOINT_DIR/$SESSION_FILE" to { b: ByteArray -> isSessionBytes(b) },
+            "$SAVEPOINT_DIR/$AGENT_STATE_FILE" to { b: ByteArray -> isAgentStateBytes(b) }
+        ).forEach { (name, valid) ->
+            val bytes = result[name]
+            if (bytes != null && !valid(bytes)) {
+                Log.w(LOG_TAG, "导入检测到损坏的会话文件，按缺失初始化: $name")
+                result = result - name
+            }
+        }
+        return result
+    }
+
+    /** session.json 完整性：可解析为 ChatMessage 列表（[] 亦合法——首轮空对话即此形态）。 */
+    private fun isSessionBytes(bytes: ByteArray): Boolean =
+        runCatching { json.decodeFromString<List<ChatMessage>>(bytes.toString(Charsets.UTF_8)) }.isSuccess
+
+    /** agent_state.json 完整性：可解析为 JSON 对象（GameSession 全字段默认值，{} 合法）。 */
+    private fun isAgentStateBytes(bytes: ByteArray): Boolean =
+        runCatching { json.decodeFromString<JsonObject>(bytes.toString(Charsets.UTF_8)) }.isSuccess
+
+    /** 编辑区目录（agent/workspace/game-<id>；GameAgent.editingWorkspaceDir 委托此处，单一来源）。 */
+    internal fun editingWorkspaceDir(gameId: Long): File =
+        File(File(context.filesDir, WORKSPACE_ROOT), "game-$gameId")
 
     /**
      * 解包 zip 为「相对路径 → 字节」映射（导入侧私有，防御性解析）：
