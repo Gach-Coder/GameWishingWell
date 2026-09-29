@@ -5,8 +5,16 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
-/** 参数面板的参数档案：合法键集（GAME_CONFIG 顶层键）+ 键 → 行尾注释（检测与默认参数视图用）。 */
-data class ConfigParamInfo(val keys: Set<String>, val docs: Map<String, String>)
+/**
+ * 参数面板列表行：参数名 + 注释 + 默认值与当前生效值（覆盖优先）。
+ * [default] 为 null 表示该键只存在于玩家覆盖（自定义键，不在游戏默认表中）。
+ */
+data class ConfigParam(
+    val name: String,
+    val doc: String,
+    val default: JsonElement?,
+    val effective: JsonElement
+)
 
 /**
  * 参数外置契约（平台侧共享常量与解析器，校验器/注入器/参数面板三方同源）：
@@ -273,6 +281,24 @@ object GameConfigContract {
         extractDefaults(html)?.let { prettyJson.encodeToString(JsonObject.serializer(), it) }
 
     /**
+     * 参数面板直列：默认表按声明序展开（名称/注释/默认值），覆盖逐键盖顶为生效值；
+     * 只存在于覆盖中的自定义键追加在末尾（无注释、默认值未知）。
+     */
+    fun buildParamList(
+        defaults: JsonObject,
+        docs: Map<String, String>,
+        override: JsonObject?
+    ): List<ConfigParam> {
+        val list = defaults.entries.map { (k, v) ->
+            ConfigParam(name = k, doc = docs[k].orEmpty(), default = v, effective = override?.get(k) ?: v)
+        }.toMutableList()
+        override?.keys?.filter { it !in defaults.keys }?.forEach { k ->
+            override[k]?.let { list += ConfigParam(name = k, doc = "", default = null, effective = it) }
+        }
+        return list
+    }
+
+    /**
      * 逐行提取 GAME_CONFIG 参数的行尾注释：键 → 注释文本（`"key": 值, // 注释` 形态；
      * 无注释的键缺席）。数组内层键行无注释不误收；值内含 // 时注释从首个 // 截取（仅展示用，
      * 容差可接受）。
@@ -284,13 +310,6 @@ object GameConfigContract {
 
     fun extractParamDocs(content: String): Map<String, String> =
         paramDocRegex.findAll(content).associate { it.groupValues[1] to it.groupValues[2].trim() }
-
-    /** 默认参数视图渲染：`"键": 值    // 注释`（保留 config.js 声明序，无注释键省略注释段）。 */
-    fun renderDefaults(defaults: JsonObject, docs: Map<String, String>): String =
-        defaults.entries.joinToString("\n") { (k, v) ->
-            val doc = docs[k]
-            "\"$k\": $v" + if (doc.isNullOrEmpty()) "" else "    // $doc"
-        }
 
     /**
      * 参数值输入的宽松解析：先按 JSON 解析（数字/布尔/null/数组/对象都接受），

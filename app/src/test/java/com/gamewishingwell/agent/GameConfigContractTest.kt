@@ -99,7 +99,7 @@ class GameConfigContractTest {
     }
 
     @Test
-    fun `注释提取与默认值渲染`() {
+    fun `注释提取与参数直列构建`() {
         // 带注释样例验证键→行尾注释提取
         val cfg = """
             window.GAME_CONFIG = {
@@ -114,11 +114,19 @@ class GameConfigContractTest {
         assertEquals("名字", d["name"])
         assertEquals("道具表", d["items"])
         assertNull(d["noComment"])
-        // 渲染：默认值 + 行尾注释（无注释键省略注释段）
+        // 参数直列：默认表声明序、注释附带、覆盖盖顶为生效值、自定义覆盖键追加末尾
         val defaults = GameConfigContract.extractDefaults(cfg)!!
-        val rendered = GameConfigContract.renderDefaults(defaults, d)
-        assertTrue(rendered.contains("\"speed\": 260    // 移动速度"))
-        assertTrue(rendered.contains("\"noComment\": true"))
+        val override = GameConfigContract.parseValueOrString("""{"speed": 9, "extra": "自定义"}""")
+            .let { runCatching { kotlinx.serialization.json.Json.parseToJsonElement("""{"speed": 9, "extra": "自定义"}""") as kotlinx.serialization.json.JsonObject }.getOrNull()!! }
+        val list = GameConfigContract.buildParamList(defaults, d, override)
+        assertEquals(listOf("speed", "name", "items", "noComment", "extra"), list.map { it.name })
+        assertEquals("移动速度", list[0].doc)
+        assertEquals("9", (list[0].effective as kotlinx.serialization.json.JsonPrimitive).content)
+        assertEquals("260", (list[0].default as kotlinx.serialization.json.JsonPrimitive).content)
+        assertNull(list[4].default)   // 自定义键无默认值
+        // 无覆盖：生效值=默认值
+        val plain = GameConfigContract.buildParamList(defaults, d, null)
+        assertEquals("260", (plain[0].effective as kotlinx.serialization.json.JsonPrimitive).content)
     }
 
     @Test

@@ -3,7 +3,7 @@ package com.gamewishingwell.ui.viewmodels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.gamewishingwell.agent.AgentHub
-import com.gamewishingwell.agent.ConfigParamInfo
+import com.gamewishingwell.agent.ConfigParam
 import com.gamewishingwell.agent.GameAgent
 import com.gamewishingwell.agent.GameBundle
 import com.gamewishingwell.agent.GameConfigContract
@@ -66,13 +66,9 @@ class GameViewModel(
     private val _configSupported = MutableStateFlow(false)
     val configSupported: StateFlow<Boolean> = _configSupported.asStateFlow()
 
-    /** 默认参数表（GAME_CONFIG 提取＋注释渲染；提取失败为 null＝"默认参数"视图不可用）。 */
-    private val _configDefaults = MutableStateFlow<String?>(null)
-    val configDefaults: StateFlow<String?> = _configDefaults.asStateFlow()
-
-    /** 参数档案（合法键集 + 注释）：编辑器"检测"的校验依据与注释展示来源。 */
-    private val _configInfo = MutableStateFlow<ConfigParamInfo?>(null)
-    val configInfo: StateFlow<ConfigParamInfo?> = _configInfo.asStateFlow()
+    /** 参数直列（面板列表数据）：名称/注释/默认值/生效值，按 config.js 声明序。 */
+    private val _configParams = MutableStateFlow<List<ConfigParam>>(emptyList())
+    val configParams: StateFlow<List<ConfigParam>> = _configParams.asStateFlow()
 
     /** 生效值查找缓存（load 时刷新）：override 优先、default 兜底——"检测"自动填当前值。 */
     private var defaultsObj: JsonObject? = null
@@ -139,13 +135,13 @@ class GameViewModel(
                 overrideObj = validOverride
                     ?.let { runCatching { sessionJson.parseToJsonElement(it) as? JsonObject }.getOrNull() }
                 val docs = GameConfigContract.extractParamDocs(html)
-                _configDefaults.value = defaults?.let { GameConfigContract.renderDefaults(it, docs) }
-                _configInfo.value = defaults?.let { ConfigParamInfo(keys = it.keys, docs = docs) }
+                _configParams.value = defaults
+                    ?.let { GameConfigContract.buildParamList(it, docs, overrideObj) }
+                    ?: emptyList()
             } else {
                 _configOverride.value = null
                 _configSupported.value = false
-                _configDefaults.value = null
-                _configInfo.value = null
+                _configParams.value = emptyList()
                 defaultsObj = null
                 overrideObj = null
             }
@@ -224,13 +220,7 @@ class GameViewModel(
         }
     }
 
-    // ---------- 参数调整面板（参数外置契约·玩家免 LLM 调参·结构化两栏编辑器） ----------
-
-    /** "检测"自动填充的当前生效值：覆盖优先、默认兜底（字符串值免引号展示；非 JsonPrimitive 原样紧凑序列化）。 */
-    fun effectiveParamValue(name: String): String? {
-        val el = overrideObj?.get(name) ?: defaultsObj?.get(name) ?: return null
-        return if (el is JsonPrimitive) el.content else el.toString()
-    }
+    // ---------- 参数调整面板（参数外置契约·玩家免 LLM 调参·直列编辑） ----------
 
     /**
      * "保存并生效"：把暂存的全部更改（键→输入原文）并入既有覆盖（同键盖顶）后整体落盘，

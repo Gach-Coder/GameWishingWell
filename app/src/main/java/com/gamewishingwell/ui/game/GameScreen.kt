@@ -11,6 +11,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +24,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -46,7 +49,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -97,7 +100,7 @@ fun GameScreen(
     // 参数外置契约：覆盖注入（loadHtml 消费）与面板入口显隐（GAME_CONFIG 探测）
     val configOverride by vm.configOverride.collectAsState()
     val configSupported by vm.configSupported.collectAsState()
-    val configDefaults by vm.configDefaults.collectAsState()
+    val configParams by vm.configParams.collectAsState()
     val context = LocalContext.current
     // 保存护栏的 UI 侧：生成中 currentHtml 是未验收的中间版本，此刻入库会把半成品
     // 固化为"已保存版本"（agent 侧 saveCurrentGame 为最终闸门，此处先禁用入口）。
@@ -427,169 +430,158 @@ fun GameScreen(
         )
     }
 
-    // 参数调整编辑器（参数外置契约·结构化两栏）：上栏填参数名点【检测】——合法则展示该参数
-    // 注释并把当前生效值自动填入下栏（覆盖优先、默认兜底）；下栏改新值点【添加更改】入暂存
-    // 清单，可继续检测/添加多条；【保存并生效】把全部更改并入 user_config.json 并整页重载
-    // 生效（参数在游戏 init 读取一次；对局进度由 ww:save 存档契约自动恢复）。
-    // 免 JSON 语法：数值直接填数字、布尔填 true/false、其余按文本原样保存（仓库侧仍校验整体 JSON）。
+
+    // 参数调整编辑器（参数外置契约·直列编辑）：进页即列全部参数（名称/注释/当前生效值，
+    // 覆盖优先）。点任意行内联改值（输入框+确定/取消），可连续修改多项——已改行高亮并可 ↺
+    // 撤销单项；底部【保存并生效】把全部修改并入 user_config.json 并整页重载生效（参数在游戏
+    // init 读取一次；对局进度由 ww:save 存档契约自动恢复）。免 JSON 语法：数字直接填、布尔
+    // true/false、其余按文本原样（parseValueOrString 宽松解析，仓库侧仍校验整体 JSON）。
     if (showConfigEditor) {
-        var cfgName by remember { mutableStateOf("") }
-        var cfgValue by remember { mutableStateOf("") }
-        var cfgCheckNote by remember { mutableStateOf<String?>(null) }
-        var cfgCheckOk by remember { mutableStateOf(false) }
+        val pending = remember { mutableStateMapOf<String, String>() }
+        var editingName by remember { mutableStateOf<String?>(null) }
+        var editingValue by remember { mutableStateOf("") }
         var cfgError by remember { mutableStateOf<String?>(null) }
-        var showDefaultsView by remember { mutableStateOf(false) }
-        val pending = remember { mutableStateListOf<Pair<String, String>>() }
-        val paramInfo by vm.configInfo.collectAsState()
+
+        fun displayValue(el: kotlinx.serialization.json.JsonElement?): String = when (el) {
+            null -> ""
+            is kotlinx.serialization.json.JsonPrimitive -> el.content
+            else -> el.toString()
+        }
 
         AlertDialog(
             onDismissRequest = { showConfigEditor = false },
             title = { Text("参数调整") },
             text = {
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    if (showDefaultsView) {
+                Column {
+                    Text(
+                        if (pending.isEmpty()) {
+                            "点参数行直接修改数值，可连续修改多项后一次保存生效。" +
+                                "数值直接填数字，布尔填 true/false，其余按文本原样填写。"
+                        } else {
+                            "待保存修改 ${pending.size} 项（高亮行，↺ 撤销单项，重置修改全清）。"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.size(4.dp))
+                    if (configParams.isEmpty()) {
                         Text(
-                            "默认参数（只读，来自游戏配置）",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(Modifier.size(6.dp))
-                        Text(
-                            configDefaults ?: "（默认参数解析失败：仍可按参数名直接添加更改）",
-                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                            "参数列表解析失败：该游戏的配置不可解析，无法列出参数。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
                         )
                     } else {
+                        LazyColumn(Modifier.fillMaxWidth()) {
+                            items(configParams, key = { it.name }) { p ->
+                                val edited = pending[p.name]
+                                if (editingName == p.name) {
+                                    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                                        Text(
+                                            p.name + if (p.doc.isNotEmpty()) " · ${p.doc}" else "",
+                                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
+                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            OutlinedTextField(
+                                                value = editingValue,
+                                                onValueChange = {
+                                                    editingValue = it
+                                                    cfgError = null
+                                                },
+                                                singleLine = true,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            TextButton(onClick = {
+                                                if (editingValue.isNotBlank()) {
+                                                    pending[p.name] = editingValue.trim()
+                                                }
+                                                editingName = null
+                                            }) { Text("确定") }
+                                            TextButton(onClick = { editingName = null }) { Text("取消") }
+                                        }
+                                    }
+                                } else {
+                                    Row(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                editingName = p.name
+                                                editingValue = edited ?: displayValue(p.effective)
+                                            }
+                                            .padding(vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(Modifier.weight(1f)) {
+                                            Text(
+                                                p.name,
+                                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                                color = if (edited != null) MaterialTheme.colorScheme.primary
+                                                else MaterialTheme.colorScheme.onSurface
+                                            )
+                                            if (p.doc.isNotEmpty()) {
+                                                Text(
+                                                    p.doc,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    maxLines = 1
+                                                )
+                                            }
+                                        }
+                                        Text(
+                                            edited ?: displayValue(p.effective),
+                                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                            color = if (edited != null) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        if (edited != null) {
+                                            TextButton(onClick = { pending.remove(p.name) }) { Text("↺") }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cfgError?.let {
+                        Spacer(Modifier.size(4.dp))
                         Text(
-                            "上栏填参数名点【检测】，下栏改值后【添加更改】；可连续添加多条，最后【保存并生效】。" +
-                                "数值直接填数字，布尔填 true/false，其余按文本原样填写。",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            it,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.labelSmall
                         )
-                        Spacer(Modifier.size(6.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            OutlinedTextField(
-                                value = cfgName,
-                                onValueChange = {
-                                    cfgName = it
-                                    cfgCheckOk = false
-                                    cfgCheckNote = null
-                                },
-                                label = { Text("参数名") },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Spacer(Modifier.size(8.dp))
-                            OutlinedButton(onClick = {
-                                val name = cfgName.trim()
-                                val info = paramInfo
-                                when {
-                                    info == null ->
-                                        { cfgCheckOk = false; cfgCheckNote = "参数表解析失败，无法校验参数名" }
-                                    name.isEmpty() ->
-                                        { cfgCheckOk = false; cfgCheckNote = "请先填写参数名" }
-                                    name !in info.keys -> {
-                                        cfgCheckOk = false
-                                        cfgCheckNote = "「$name」不是该游戏的参数（点【默认参数】可查看全部参数名）"
-                                    }
-                                    else -> {
-                                        cfgCheckOk = true
-                                        val doc = info.docs[name]
-                                        cfgCheckNote = "✓ " + if (doc.isNullOrEmpty()) "（无注释）" else doc
-                                        cfgValue = vm.effectiveParamValue(name) ?: ""
-                                    }
-                                }
-                            }) { Text("检测") }
-                        }
-                        cfgCheckNote?.let {
-                            Spacer(Modifier.size(4.dp))
-                            Text(
-                                it,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (cfgCheckOk) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
-                            )
-                        }
-                        Spacer(Modifier.size(6.dp))
-                        OutlinedTextField(
-                            value = cfgValue,
-                            onValueChange = {
-                                cfgValue = it
-                                cfgError = null
-                            },
-                            label = { Text("新数值（检测后自动填当前值）") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Spacer(Modifier.size(6.dp))
-                        TextButton(
-                            enabled = cfgCheckOk && cfgValue.isNotBlank(),
-                            onClick = {
-                                val name = cfgName.trim()
-                                pending.removeAll { it.first == name }
-                                pending.add(name to cfgValue.trim())
-                                cfgName = ""
-                                cfgValue = ""
-                                cfgCheckOk = false
-                                cfgCheckNote = null
-                            }
-                        ) { Text("添加更改") }
-                        if (pending.isNotEmpty()) {
-                            Spacer(Modifier.size(4.dp))
-                            Text(
-                                "当前更改（${pending.size} 项，未保存）",
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                            pending.forEach { (k, v) ->
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        "$k = $v",
-                                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    TextButton(onClick = { pending.removeAll { it.first == k } }) {
-                                        Text("移除", style = MaterialTheme.typography.labelSmall)
-                                    }
-                                }
-                            }
-                        }
-                        cfgError?.let {
-                            Spacer(Modifier.size(4.dp))
-                            Text(
-                                it,
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        }
                     }
                 }
             },
             confirmButton = {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (showDefaultsView) {
-                        TextButton(onClick = { showDefaultsView = false }) { Text("返回编辑") }
-                    } else {
-                        TextButton(onClick = { showDefaultsView = true }) { Text("默认参数") }
-                        Button(
-                            enabled = pending.isNotEmpty(),
-                            onClick = {
-                                val changes = pending.toList()
-                                vm.saveUserConfigChanges(changes) { ok ->
-                                    if (ok) {
-                                        showConfigEditor = false
-                                        closeSettings()
-                                        Toast.makeText(
-                                            context, "已保存 ${changes.size} 项更改，重载后生效", Toast.LENGTH_SHORT
-                                        ).show()
-                                    } else {
-                                        cfgError = "保存失败：更改未落盘，请重试"
-                                    }
+                // 底部同一排：重置修改 / 保存并生效 / 关闭
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        enabled = pending.isNotEmpty(),
+                        onClick = {
+                            pending.clear()
+                            editingName = null
+                        }
+                    ) { Text("重置修改") }
+                    Button(
+                        enabled = pending.isNotEmpty(),
+                        onClick = {
+                            val changes = pending.toList()
+                            vm.saveUserConfigChanges(changes) { ok ->
+                                if (ok) {
+                                    showConfigEditor = false
+                                    closeSettings()
+                                    Toast.makeText(
+                                        context, "已保存 ${changes.size} 项更改，重载后生效", Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    cfgError = "保存失败：更改未落盘，请重试"
                                 }
                             }
-                        ) { Text("保存并生效") }
-                    }
+                        }
+                    ) { Text("保存并生效") }
+                    TextButton(onClick = { showConfigEditor = false }) { Text("关闭") }
                 }
-            },
-            dismissButton = {
-                TextButton(onClick = { showConfigEditor = false }) { Text("关闭") }
             }
         )
     }
