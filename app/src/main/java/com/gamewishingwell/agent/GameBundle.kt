@@ -25,7 +25,12 @@ object GameBundle {
         val doc = runCatching { Jsoup.parse(entryHtml) }.getOrNull() ?: return entryHtml
 
         var changed = false
-        // <script src="相对路径"> → 内联脚本内容（保持元素顺序，加载语义不变）
+        // <script src="相对路径"> → 内联脚本内容（保持元素顺序，加载语义不变）。
+        // 内联尾部追加 //# sourceURL=<原路径>：WebView 的 window.onerror / 控制台
+        // 报错据此报出虚拟文件名与【相对该文件的行号】——否则报错行号指向内联后的
+        // 整页 HTML，模型无法定位（实测一个 missing ) 语法错在 460KB 文件里盲搜
+        // 近 50 分钟、跨 3 个回合两次被用户打断）。行注释只追加在脚本末尾，不改
+        // 变脚本语义；真实游戏页与沙箱共用本管道，同样受益。
         doc.select("script[src]").forEach { el ->
             val src = el.attr("src").trim()
             if (!isLocalRef(src)) return@forEach
@@ -34,7 +39,7 @@ object GameBundle {
             el.removeAttr("defer")
             el.removeAttr("async")
             el.empty()
-            el.appendChild(DataNode(escapeScriptClose(content)))
+            el.appendChild(DataNode(escapeScriptClose(content) + "\n//# sourceURL=$src"))
             changed = true
         }
         // <link rel="stylesheet" href="相对路径"> → 内联样式

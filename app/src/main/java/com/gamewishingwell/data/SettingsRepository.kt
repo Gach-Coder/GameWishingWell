@@ -13,7 +13,13 @@ data class LlmSettings(
     val model: String = "",
     val systemPrompt: String = "",
     /** 模型思考能力开关：默认关闭。关闭时请求不启用模型思考输出。 */
-    val thinkingEnabled: Boolean = false
+    val thinkingEnabled: Boolean = false,
+    /**
+     * 交付后自动保存（方案 A，默认开）：已入库游戏会话的每个成功回合（沙箱通过
+     * 交付）自动执行保存——编辑区整体覆盖保存区 + 冻结保存点，撤销随之变为
+     * "回到上一交付"（逐回合粒度）。草稿首存（命名/入库）仍为手动。
+     */
+    val autoSaveOnDelivery: Boolean = true
 )
 
 class SettingsRepository(context: Context) {
@@ -54,7 +60,8 @@ class SettingsRepository(context: Context) {
             baseUrl = secure.getString("base_url") ?: preset.baseUrl,
             model = model,
             systemPrompt = secure.getString("system_prompt") ?: "",
-            thinkingEnabled = secure.getString("thinking_enabled")?.toBoolean() ?: false
+            thinkingEnabled = secure.getString("thinking_enabled")?.toBoolean() ?: false,
+            autoSaveOnDelivery = secure.getString("auto_save_on_delivery")?.toBoolean() ?: true
         )
     }
 
@@ -72,6 +79,7 @@ class SettingsRepository(context: Context) {
         secure.putString("model", normalized.model)
         secure.putString("system_prompt", normalized.systemPrompt)
         secure.putString("thinking_enabled", normalized.thinkingEnabled.toString())
+        secure.putString("auto_save_on_delivery", normalized.autoSaveOnDelivery.toString())
         _settings.value = normalized
     }
 
@@ -82,6 +90,12 @@ class SettingsRepository(context: Context) {
     fun updateThinking(enabled: Boolean) {
         secure.putString("thinking_enabled", enabled.toString())
         _settings.value = _settings.value.copy(thinkingEnabled = enabled)
+    }
+
+    /** 仅更新交付后自动保存开关（设置页 Switch 即时生效，同 [updateThinking] 模式）。 */
+    fun updateAutoSaveOnDelivery(enabled: Boolean) {
+        secure.putString("auto_save_on_delivery", enabled.toString())
+        _settings.value = _settings.value.copy(autoSaveOnDelivery = enabled)
     }
 
     fun isConfigured(): Boolean {

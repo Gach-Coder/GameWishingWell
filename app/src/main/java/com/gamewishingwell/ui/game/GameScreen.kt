@@ -11,7 +11,6 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,8 +23,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -41,6 +38,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -49,7 +47,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -57,7 +54,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import android.os.Build
 import android.view.WindowManager
@@ -88,7 +84,9 @@ fun GameScreen(
     gameId: Long,
     onBack: () -> Unit,
     onEdit: (Long?) -> Unit,
-    onHome: () -> Unit
+    onHome: () -> Unit,
+    /** 首页卡片菜单「清除存档」入口：进页首次加载完成后清 ww:save 并重载（全新开局）。 */
+    clearSave: Boolean = false
 ) {
     val container = rememberContainer()
     val vm: GameViewModel = viewModel(
@@ -97,10 +95,9 @@ fun GameScreen(
     val html by vm.html.collectAsState()
     val jsError by vm.jsError.collectAsState()
     val loadedGameId by vm.loadedGameId.collectAsState()
-    // 参数外置契约：覆盖注入（loadHtml 消费）与面板入口显隐（GAME_CONFIG 探测）
+    // 参数外置契约：覆盖注入（loadHtml 消费）；WW_SETTINGS 自定义设置项（设置面板渲染）
     val configOverride by vm.configOverride.collectAsState()
-    val configSupported by vm.configSupported.collectAsState()
-    val configParams by vm.configParams.collectAsState()
+    val gameSettings by vm.gameSettings.collectAsState()
     val context = LocalContext.current
     // 保存护栏的 UI 侧：生成中 currentHtml 是未验收的中间版本，此刻入库会把半成品
     // 固化为"已保存版本"（agent 侧 saveCurrentGame 为最终闸门，此处先禁用入口）。
@@ -114,7 +111,8 @@ fun GameScreen(
     var loadedOverride by remember { mutableStateOf<String?>(null) }
     var showSaveDialog by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
-    var showConfigEditor by remember { mutableStateOf(false) }
+    // 首页「清除存档」的一次性指令：首次页面加载完成后执行并自清（重载不再触发）
+    var pendingClearSave by remember { mutableStateOf(clearSave) }
     var volume by remember { mutableStateOf(0.8f) }
     var loadDone by remember { mutableStateOf(false) }
 
@@ -187,21 +185,6 @@ fun GameScreen(
         loadedOverride = overrideJson
     }
 
-    // 清除存档（平台通用，不依赖游戏配合）：删 ww:save 契约键后整页重载——比 restart()
-    // 更彻底（restart 只重置本局，内存中的最高分等跨局状态保留；重载后从空存档全新开局）。
-    val clearSaveAndRestart: () -> Unit = {
-        val view = webView
-        val h = loadedHtml
-        val ov = loadedOverride
-        view?.evaluateJavascript(
-            "(function(){try{localStorage.removeItem('ww:save');}catch(e){}})()"
-        ) { _ ->
-            if (h != null) loadHtml(view, h, ov)
-        }
-        closeSettings()
-        Toast.makeText(context, "已清除存档", Toast.LENGTH_SHORT).show()
-    }
-
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (loadDone && html == null) {
             // 游戏已被删除或草稿不存在
@@ -242,7 +225,22 @@ fun GameScreen(
                             return true
                         }
                     }
-                    webViewClient = WebViewClient()
+                    // 首页「清除存档」的一次性执行点：首次页面加载完成后清 ww:save 并整页
+                    // 重载（重载后从空存档全新开局）；flag 先自清防重入，重载的 onPageFinished
+                    // 不再触发。clearSave 路由参数只在从首页菜单进入时为 true。
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, url: String?) {
+                            if (!pendingClearSave || url.isNullOrBlank() || loadedHtml == null) return
+                            pendingClearSave = false
+                            view.evaluateJavascript(
+                                "(function(){try{localStorage.removeItem('ww:save');}catch(e){}})()"
+                            ) { _ ->
+                                val h = loadedHtml
+                                if (h != null) loadHtml(view, h, loadedOverride)
+                                Toast.makeText(context, "已清除存档，全新开局", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
                     webView = this
                 }
             },
@@ -373,22 +371,60 @@ fun GameScreen(
                         valueRange = 0f..1.5f
                     )
                     Spacer(Modifier.size(4.dp))
+                    // ② 游戏自定义设置项（WW_SETTINGS 契约，Agent 对话可增删）：平台渲染，
+                    // 即改即存——写参数覆盖并整页重载生效（游戏逻辑读 GAME_CONFIG[key] 消费）。
+                    if (gameSettings.isNotEmpty()) {
+                        Text(
+                            "游戏设置",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        gameSettings.forEach { opt ->
+                            val current = vm.effectiveParamValue(opt.key)
+                            when (opt.type) {
+                                "toggle" -> Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(opt.label, style = MaterialTheme.typography.bodyMedium)
+                                    Switch(
+                                        checked = current == "true",
+                                        onCheckedChange = { on ->
+                                            vm.saveUserConfigChanges(
+                                                listOf(opt.key to if (on) "true" else "false")
+                                            ) { }
+                                        }
+                                    )
+                                }
+                                "choice" -> Column(Modifier.fillMaxWidth()) {
+                                    Text(opt.label, style = MaterialTheme.typography.bodyMedium)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        opt.options.forEach { o ->
+                                            val label = if (o is kotlinx.serialization.json.JsonPrimitive) o.content else o.toString()
+                                            val selected = label == current
+                                            TextButton(onClick = {
+                                                vm.saveUserConfigChanges(listOf(opt.key to label)) { }
+                                            }) {
+                                                Text(
+                                                    label,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = if (selected) MaterialTheme.colorScheme.primary
+                                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Spacer(Modifier.size(8.dp))
+                    }
                     Text(
-                        "重新游戏只重置本局（保留存档）；清除存档会删除最高分等跨局记录并重开。首次保存命名入库，之后保存直接覆盖（保持原名），改名可在首页进行。",
+                        "重新游戏只重置本局（保留存档）。首次保存命名入库，之后保存直接覆盖（保持原名），改名可在首页进行。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    Spacer(Modifier.size(8.dp))
-                    // 参数调整入口（参数外置契约）：仅运行区（game）且游戏定义了
-                    // GAME_CONFIG 时显示——玩家免 LLM 直接改参数（user_config.json）。
-                    if (source == "game" && configSupported) {
-                        TextButton(onClick = { showConfigEditor = true }) {
-                            Text("参数调整")
-                        }
-                    }
-                    TextButton(onClick = clearSaveAndRestart) {
-                        Text("清除存档并重开", color = MaterialTheme.colorScheme.error)
-                    }
                 }
             },
             confirmButton = {
@@ -430,161 +466,6 @@ fun GameScreen(
         )
     }
 
-
-    // 参数调整编辑器（参数外置契约·直列编辑）：进页即列全部参数（名称/注释/当前生效值，
-    // 覆盖优先）。点任意行内联改值（输入框+确定/取消），可连续修改多项——已改行高亮并可 ↺
-    // 撤销单项；底部【保存并生效】把全部修改并入 user_config.json 并整页重载生效（参数在游戏
-    // init 读取一次；对局进度由 ww:save 存档契约自动恢复）。免 JSON 语法：数字直接填、布尔
-    // true/false、其余按文本原样（parseValueOrString 宽松解析，仓库侧仍校验整体 JSON）。
-    if (showConfigEditor) {
-        val pending = remember { mutableStateMapOf<String, String>() }
-        var editingName by remember { mutableStateOf<String?>(null) }
-        var editingValue by remember { mutableStateOf("") }
-        var cfgError by remember { mutableStateOf<String?>(null) }
-
-        fun displayValue(el: kotlinx.serialization.json.JsonElement?): String = when (el) {
-            null -> ""
-            is kotlinx.serialization.json.JsonPrimitive -> el.content
-            else -> el.toString()
-        }
-
-        AlertDialog(
-            onDismissRequest = { showConfigEditor = false },
-            title = { Text("参数调整") },
-            text = {
-                Column {
-                    Text(
-                        if (pending.isEmpty()) {
-                            "点参数行直接修改数值，可连续修改多项后一次保存生效。" +
-                                "数值直接填数字，布尔填 true/false，其余按文本原样填写。"
-                        } else {
-                            "待保存修改 ${pending.size} 项（高亮行，↺ 撤销单项，重置修改全清）。"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.size(4.dp))
-                    if (configParams.isEmpty()) {
-                        Text(
-                            "参数列表解析失败：该游戏的配置不可解析，无法列出参数。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    } else {
-                        LazyColumn(Modifier.fillMaxWidth()) {
-                            items(configParams, key = { it.name }) { p ->
-                                val edited = pending[p.name]
-                                if (editingName == p.name) {
-                                    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
-                                        Text(
-                                            p.name + if (p.doc.isNotEmpty()) " · ${p.doc}" else "",
-                                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
-                                        )
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            OutlinedTextField(
-                                                value = editingValue,
-                                                onValueChange = {
-                                                    editingValue = it
-                                                    cfgError = null
-                                                },
-                                                singleLine = true,
-                                                modifier = Modifier.weight(1f)
-                                            )
-                                            TextButton(onClick = {
-                                                if (editingValue.isNotBlank()) {
-                                                    pending[p.name] = editingValue.trim()
-                                                }
-                                                editingName = null
-                                            }) { Text("确定") }
-                                            TextButton(onClick = { editingName = null }) { Text("取消") }
-                                        }
-                                    }
-                                } else {
-                                    Row(
-                                        Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                editingName = p.name
-                                                editingValue = edited ?: displayValue(p.effective)
-                                            }
-                                            .padding(vertical = 4.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(Modifier.weight(1f)) {
-                                            Text(
-                                                p.name,
-                                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                                                color = if (edited != null) MaterialTheme.colorScheme.primary
-                                                else MaterialTheme.colorScheme.onSurface
-                                            )
-                                            if (p.doc.isNotEmpty()) {
-                                                Text(
-                                                    p.doc,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                    maxLines = 1
-                                                )
-                                            }
-                                        }
-                                        Text(
-                                            edited ?: displayValue(p.effective),
-                                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                                            color = if (edited != null) MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                        if (edited != null) {
-                                            TextButton(onClick = { pending.remove(p.name) }) { Text("↺") }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    cfgError?.let {
-                        Spacer(Modifier.size(4.dp))
-                        Text(
-                            it,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.labelSmall
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                // 底部同一排：重置修改 / 保存并生效 / 关闭
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    TextButton(
-                        enabled = pending.isNotEmpty(),
-                        onClick = {
-                            pending.clear()
-                            editingName = null
-                        }
-                    ) { Text("重置修改") }
-                    Button(
-                        enabled = pending.isNotEmpty(),
-                        onClick = {
-                            val changes = pending.toList()
-                            vm.saveUserConfigChanges(changes) { ok ->
-                                if (ok) {
-                                    showConfigEditor = false
-                                    closeSettings()
-                                    Toast.makeText(
-                                        context, "已保存 ${changes.size} 项更改，重载后生效", Toast.LENGTH_SHORT
-                                    ).show()
-                                } else {
-                                    cfgError = "保存失败：更改未落盘，请重试"
-                                }
-                            }
-                        }
-                    ) { Text("保存并生效") }
-                    TextButton(onClick = { showConfigEditor = false }) { Text("关闭") }
-                }
-            }
-        )
-    }
 
     // 首次保存（未命名草稿）命名框：默认名取会话首条用户消息前 20 字。
     if (showSaveDialog) {

@@ -64,6 +64,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.gamewishingwell.agent.GameSession
 import com.gamewishingwell.agent.IntentConfirmation
 import com.gamewishingwell.agent.QualityTier
+import com.gamewishingwell.agent.ResumeCardPayload
 import com.gamewishingwell.data.ChatMessage
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.ChatViewModel
@@ -73,7 +74,8 @@ import com.gamewishingwell.ui.viewmodels.ChatViewModel
 fun ChatScreen(
     gameId: Long?,
     resumeDraft: Boolean = false,
-    onPlay: () -> Unit,
+    /** 立即游玩：参数=是否对齐保存区（true=与首页同源加载；false=编辑区预览最新修改）。 */
+    onPlay: (alignedToSavedArea: Boolean) -> Unit,
     onOpenSettings: () -> Unit,
     onSaved: () -> Unit
 ) {
@@ -84,6 +86,7 @@ fun ChatScreen(
         factory = viewModelFactory { initializer { ChatViewModel(container.agentHub, gameId, resumeDraft) } }
     )
     val session by vm.session.collectAsState()
+    val repoSettings by container.settingsRepository.settings.collectAsState()
     val context = LocalContext.current
 
     // 游戏制作成功后，输入框提示语切换为“继续改进”语义
@@ -98,6 +101,12 @@ fun ChatScreen(
     var showSaveDialog by remember { mutableStateOf(false) }
     // 撤销确认：丢弃未保存的修改不可恢复，须二次确认。
     var showUndoDialog by remember { mutableStateOf(false) }
+    // 撤销目标版号（保存点冻结的 deliveredVersion）：弹窗打开时异步装载，
+    // 显示"将回到第 N 版"；无保存点/旧格式保存点为 null（不展示版号）。
+    var undoTargetVersion by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(showUndoDialog) {
+        if (showUndoDialog) vm.loadUndoTargetVersion { undoTargetVersion = it }
+    }
     // 确认卡质量档位的屏幕级持有：修正回合重建卡片时不丢失用户已选择的档位；
     // 新的首张确认卡（非重组）出现时清空，避免跨局残留。
     var pendingTier by remember { mutableStateOf<String?>(null) }
@@ -174,7 +183,21 @@ fun ChatScreen(
                 ) { reversedIndex ->
                     val index = lastIndex - reversedIndex
                     val msg = session.messages[index]
-                    if (msg.isConfirmCard) {
+                    if (msg.isResumeCard) {
+                        // 续跑卡片：停止时追加的「中断点 + 继续按钮」消息；按钮仅在
+                        // 会话仍持有对应的可续跑状态时可用（历史卡片只读回显）
+                        val payload = ResumeCardPayload.fromCardContent(msg.content)
+                        if (payload != null) {
+                            ResumeTurnCard(
+                                payload = payload,
+                                active = !session.isGenerating &&
+                                    session.resumableTurn?.instruction == payload.instruction,
+                                onResume = { vm.resumeInterruptedTurn() }
+                            )
+                        } else {
+                            MessageBubble(msg)
+                        }
+                    } else if (msg.isConfirmCard) {
                         val card = IntentConfirmation.fromCardContent(msg.content)
                         if (card != null) {
                             IntentConfirmationCard(
@@ -195,11 +218,17 @@ fun ChatScreen(
                 }
             }
             if (session.currentHtml != null && !session.isGenerating && session.error == null && session.pendingConfirmation == null) {
+                // 两入口对齐判据：已入库 + 无未保存新版本 + 无停止中断的未交付修改
+                // ＝保存区与编辑区一致，立即游玩直连运行区（与首页同源：同 HTML/参数/存档）
+                val playAligned = gameId != null && !session.unsavedVersion && session.resumableTurn == null
                 ActionBar(
                     lastWarning = session.lastWarning,
                     // 撤销＝保存的逆操作（保存区覆盖编辑区+上下文回滚），只对已保存游戏的编辑会话有意义
                     canUndo = gameId != null,
-                    onPlay = onPlay,
+                    onPlay = { onPlay(playAligned) },
+                    // 保存按钮：草稿（首存命名）或关闭了交付自动保存的用户才需要；
+                    // 已入库 + 自动保存开启时每次交付即固化，隐藏冗余入口
+                    showSave = gameId == null || !repoSettings.autoSaveOnDelivery,
                     // 仅首次保存询问命名（未命名草稿）；已命名游戏直接覆盖保持原名，改名在首页。
                     onSave = {
                         vm.saveGame(
@@ -309,11 +338,19 @@ fun ChatScreen(
     }
 
     if (showUndoDialog) {
+        // 版号后缀：保存点带版号时明确"回到第 N 版"，与交付消息的「第 N 版」对上号
+        val verSuffix = undoTargetVersion?.let { "（第 $it 版）" } ?: ""
         AlertDialog(
             onDismissRequest = { showUndoDialog = false },
-            title = { Text("撤销未保存的修改") },
+            title = { Text(if (repoSettings.autoSaveOnDelivery) "撤销到上一版本$verSuffix" else "撤销未保存的修改") },
             text = {
-                Text("保存区（上次保存的版本）将覆盖编辑区，本次保存之后的修改与对话记录会被丢弃。此操作不可恢复。")
+                Text(
+                    if (repoSettings.autoSaveOnDelivery) {
+                        "已开启「交付后自动保存」：保存点在每个成功回合后刷新，本操作将回到上一交付版本$verSuffix（上一个成功回合），其后的修改与对话记录会被丢弃。此操作不可恢复。"
+                    } else {
+                        "保存区（上次保存的版本$verSuffix）将覆盖编辑区，本次保存之后的修改与对话记录会被丢弃。此操作不可恢复。"
+                    }
+                )
             },
             confirmButton = {
                 TextButton(onClick = {
@@ -321,7 +358,7 @@ fun ChatScreen(
                     vm.undoToSaved { ok ->
                         Toast.makeText(
                             context,
-                            if (ok) "已撤销到上次保存的版本" else "当前没有可撤销的修改",
+                            if (ok) "已撤销到上次保存的版本$verSuffix" else "当前没有可撤销的修改",
                             Toast.LENGTH_SHORT
                         ).show()
                     }
@@ -374,14 +411,15 @@ private fun TypingBubble(stage: String, streamPreview: String? = null) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            // 阶段条下方的三行流预览（临时动态"打字机"）：只在 SSE 接收期间
+            // 阶段条下方的流预览（临时动态"打字机"）：只在 SSE 接收期间
             // 非空（Agent 侧节流写入、流结束即清空）；兼容回环的整 HTML 流不回显。
+            // 6 行：推理模型的思考流是工具模式多数轮的唯一可见产物，3 行太碎。
             if (!streamPreview.isNullOrBlank()) {
                 Text(
                     streamPreview,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                    maxLines = 3,
+                    maxLines = 6,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.padding(top = 2.dp)
                 )
@@ -629,13 +667,39 @@ private fun IntentConfirmationCard(
     }
 }
 
+/** 停止中断的续跑卡片：中断轮次/耗时说明 + 「继续」按钮（断点恢复，非重做）。 */
+@Composable
+private fun ResumeTurnCard(
+    payload: ResumeCardPayload,
+    active: Boolean,
+    onResume: () -> Unit
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(12.dp)) {
+            Text(payload.message, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.size(8.dp))
+            Button(onClick = onResume, enabled = active) {
+                Icon(Icons.Filled.PlayArrow, contentDescription = null)
+                Spacer(Modifier.width(4.dp))
+                Text("继续")
+            }
+        }
+    }
+}
+
 @Composable
 private fun ActionBar(
     lastWarning: String?,
     canUndo: Boolean,
     onPlay: () -> Unit,
     onSave: () -> Unit,
-    onUndo: () -> Unit
+    onUndo: () -> Unit,
+    /** 保存按钮显隐：交付自动保存开启的已入库游戏不需要手动保存（真需求只剩草稿首存命名与关闭自动保存的用户）。 */
+    showSave: Boolean = true
 ) {
     Column(
         Modifier
@@ -661,8 +725,12 @@ private fun ActionBar(
                 Spacer(Modifier.width(4.dp))
                 Text("立即游玩")
             }
-            FilledTonalButton(onClick = onSave, modifier = Modifier.weight(1f)) {
-                Text("保存")
+            // 保存按钮条件显隐：自动保存开启时已入库游戏的每次交付都已固化，
+            // 手动保存冗余（还会与撤销锚点语义打架）；草稿首存与关闭自动保存时保留
+            if (showSave) {
+                FilledTonalButton(onClick = onSave, modifier = Modifier.weight(1f)) {
+                    Text("保存")
+                }
             }
             // 撤销＝保存的逆操作：保存区覆盖编辑区、上下文回滚到保存点；草稿会话无保存点不显示
             if (canUndo) {

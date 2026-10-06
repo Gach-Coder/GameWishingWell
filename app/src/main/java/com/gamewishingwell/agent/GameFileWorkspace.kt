@@ -118,6 +118,16 @@ class GameFileWorkspace(private val rootDir: File) {
         return FileManifest(root = rootDir.absolutePath, files = files)
     }
 
+    /**
+     * 工作区相对路径清单（只走目录树不读内容）：写入前预检等"只要路径列表"的
+     * 廉价形态——manifest 每次读全部文件 bytes 算哈希，路径用途用它纯属浪费。
+     */
+    fun listPaths(): List<String> =
+        rootDir.walkTopDown()
+            .filter { it.isFile && it.name != POINTER_FILE && ".versions" !in it.path }
+            .map { it.relativeTo(rootDir).invariantSeparatorsPath }
+            .toList()
+
     private suspend fun writeLocked(relativePath: String, content: String, expectedHash: String?): WorkspaceFile? {
         val file = resolve(relativePath) ?: return null
         file.parentFile?.mkdirs()

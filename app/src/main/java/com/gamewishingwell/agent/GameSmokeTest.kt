@@ -162,7 +162,19 @@ object SmokeTestProbe {
               // init 在 setTimeout 里抛 Input.setUI is not a function，探针只挂了
               // console 钩子而看不见，崩溃版从像素门的 DOM 文本豁免钻过交付门）。
               window.addEventListener('error', function(e){
-                window.__wwSmokeResult.errors.push('uncaught: ' + String((e && e.message) || e || 'unknown-error'));
+                // 位置信息必须保留（filename/lineno/colno）：内联脚本带 //# sourceURL=<原路径>
+                // 标注（GameBundle.inline），报错即「文件:行:列」直达源文件——只有 message
+                // 时模型只能对大文件盲搜（实测 missing ) 盲修近 50 分钟）。
+                var loc = '';
+                try {
+                  if (e && e.target && e.target.tagName && !e.message) {
+                    // 资源加载失败（img/script 等）走 target 分支，无行号
+                    loc = ' <' + e.target.tagName + ' src="' + String(e.target.src || e.target.href || '') + '">';
+                  } else if (e && (e.filename || e.lineno)) {
+                    loc = ' @ ' + String(e.filename || 'inline') + ':' + (e.lineno || 0) + (e.colno ? ':' + e.colno : '');
+                  }
+                } catch (e2) {}
+                window.__wwSmokeResult.errors.push('uncaught: ' + String((e && e.message) || e || 'unknown-error') + loc);
               });
               window.addEventListener('unhandledrejection', function(e){
                 window.__wwSmokeResult.errors.push('unhandledrejection: ' + String((e && e.reason) || e || 'unknown-rejection'));
@@ -996,7 +1008,14 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
                                 // 浏览器干预告警（passive preventDefault 等）不算游戏错误：
                                 // 与真实异常同通道但语义不同，采集侧即分流（见 BrowserInterventions）。
                                 if (msg.isNotBlank() && !msg.startsWith("[游戏错误]") && !BrowserInterventions.isIntervention(msg)) {
-                                    synchronized(consoleErrors) { consoleErrors += msg.take(200) }
+                                    // 附 sourceId:lineNumber（内联脚本带 sourceURL 标注时即
+                                    // 「原文件:行号」）——与 uncaught 捕获同等的定位信息
+                                    val src = consoleMessage.sourceId() ?: ""
+                                    val line = consoleMessage.lineNumber()
+                                    val located = if (line > 0) {
+                                        "$msg @ ${src.substringAfterLast('/')}:${line}"
+                                    } else msg
+                                    synchronized(consoleErrors) { consoleErrors += located.take(200) }
                                 }
                             }
                             return true
@@ -1146,7 +1165,7 @@ class AndroidSmokeTestRunner(private val appContext: Context) : SmokeTestRunner 
         const val LIGHT_TIMEOUT_MS = 30_000L
         // deep（精品档）额外跑 restart() 复跑半程（合计约 36 批次）。
         const val DEEP_TIMEOUT_MS = 110_000L
-        const val FIRST_POLL_DELAY_MS = 1_200L
+        const val FIRST_POLL_DELAY_MS = 800L
         // 冒烟期轮询兼帧驱动：每次轮询调用 __wwPump() 推进 4 批帧（FRAMES_PER_POLL）——
         // 后台 WebView 的 evaluateJavascript 回调延迟可达数百毫秒，多帧合并把往返次数从 24 降到 6；
         // 常规 24 帧约 2~6s、deep 约 3~8s，不受离屏定时器节流影响。

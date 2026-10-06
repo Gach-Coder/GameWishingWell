@@ -19,6 +19,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -66,18 +67,31 @@ class AnthropicClient(
             val system = messages.filter { it.role == "system" }.joinToString("\n\n") { it.content }
             val normalized = normalizeAlternation(convertToBlocks(messages.filterNot { it.role == "system" }))
 
+            // Prompt caching：system 与 tools 在回合内逐轮完全稳定，标记 ephemeral
+            // 断点后供应商按缓存命中计费/预填——否则每轮都对 ~8k token 的系统提示
+            // 全量 prefill（33 轮回合的首字延迟大头之一）。system 用块数组形态携带
+            // cache_control（官方 API 契约；不稳定网关不识别块数组时按 API 错误重试）。
+            val systemBlocks = buildJsonArray {
+                add(buildJsonObject {
+                    put("type", "text")
+                    put("text", system)
+                    putJsonObject("cache_control") { put("type", "ephemeral") }
+                })
+            }
             val requestBody = Json.encodeToString(
                 AnthropicChatRequest(
                     model = model,
                     max_tokens = maxTokens,
                     stream = true,
-                    system = system,
+                    system = systemBlocks,
                     messages = normalized,
-                    tools = tools.map { t ->
+                    tools = tools.mapIndexed { i, t ->
                         AnthropicToolSpec(
                             name = t.name,
                             description = t.description,
-                            input_schema = Json.parseToJsonElement(t.parameters)
+                            input_schema = Json.parseToJsonElement(t.parameters),
+                            // 最后一个工具打第二个断点：tools 块（系统提示之前的稳定前缀）一并进缓存
+                            cache_control = if (i == tools.lastIndex) AnthropicCacheControl("ephemeral") else null
                         )
                     },
                     thinking = if (thinkingEnabled) {
@@ -304,7 +318,16 @@ class AnthropicClient(
     private data class AnthropicToolSpec(
         val name: String,
         val description: String,
-        val input_schema: JsonElement
+        val input_schema: JsonElement,
+        /** Prompt caching 断点（仅最后一个工具携带；null=省略字段）。 */
+        val cache_control: AnthropicCacheControl? = null
+    )
+
+    @Serializable
+    private data class AnthropicCacheControl(
+        // 无默认值：默认 Json（encodeDefaults=false）会省略带默认值的字段，
+        // 空对象 {} 不是合法的 cache_control
+        val type: String
     )
 
     @Serializable
@@ -312,7 +335,7 @@ class AnthropicClient(
         val model: String,
         val max_tokens: Int,
         val stream: Boolean,
-        val system: String = "",
+        val system: JsonElement,
         val messages: List<AnthropicMessage>,
         val tools: List<AnthropicToolSpec> = emptyList(),
         val thinking: AnthropicThinkingConfig? = null

@@ -72,6 +72,16 @@ class ChatViewModel(
         viewModelScope.launch { onDone(agent.undoToSaved()) }
     }
 
+    /** 撤销目标版号（撤销确认弹窗显示"将回到第 N 版"用）；无保存点/旧格式为 null。 */
+    fun loadUndoTargetVersion(onLoaded: (Int?) -> Unit) {
+        viewModelScope.launch { agent.awaitReady(); onLoaded(agent.undoTargetVersion()) }
+    }
+
+    /** 续跑卡片「继续」按钮：携带原指令从中断处恢复被停止的 Agent Loop 回合。 */
+    fun resumeInterruptedTurn() {
+        viewModelScope.launch { agent.awaitReady(); agent.resumeInterruptedTurn() }
+    }
+
     /** 确认门入口；[uncheckedModules] 为卡片上取消勾选、玩家不希望实现的系统；
      *  [qualityTier] 为玩家选择的质量档位（fast/light/balanced/premium，默认均衡）；
      *  [orientation]/[dimension] 为卡片上的画面形态选择器（识别错了直接改）。 */

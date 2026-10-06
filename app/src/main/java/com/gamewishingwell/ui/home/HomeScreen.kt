@@ -26,10 +26,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -74,6 +76,7 @@ import com.gamewishingwell.data.GameRepository
 import com.gamewishingwell.ui.WwExportIcon
 import com.gamewishingwell.ui.WwImportIcon
 import com.gamewishingwell.ui.files.WwFolderIcon
+import com.gamewishingwell.ui.game.ConfigEditorDialog
 import com.gamewishingwell.ui.rememberContainer
 import com.gamewishingwell.ui.viewmodels.HomeViewModel
 import kotlinx.coroutines.launch
@@ -87,7 +90,9 @@ fun HomeScreen(
     onOpenGame: (Long) -> Unit,
     onEditGame: (Long) -> Unit,
     onContinueDraft: () -> Unit,
-    onOpenFiles: (Long) -> Unit
+    onOpenFiles: (Long) -> Unit,
+    /** 卡片菜单「清除存档」：进游戏页自动清 ww:save 并重载（跨局记录一并归零）。 */
+    onClearSaveGame: (Long) -> Unit = {}
 ) {
     val container = rememberContainer()
     val vm: HomeViewModel = viewModel(
@@ -97,6 +102,10 @@ fun HomeScreen(
     val hasDraft by vm.hasDraft.collectAsState()
     val runState by vm.runState.collectAsState()
     val diskUnsaved by vm.diskUnsaved.collectAsState()
+    val configParams by vm.configParams.collectAsState()
+
+    // 卡片菜单「参数调整」：共享直列编辑器（数据由 HomeViewModel 装载保存区参数表）
+    var configGameId by remember { mutableStateOf<Long?>(null) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -217,11 +226,17 @@ fun HomeScreen(
                             meta = meta,
                             runningStage = runState.gameStages[meta.id],
                             unsaved = runState.gameUnsaved.contains(meta.id) || diskUnsaved.games.contains(meta.id),
+                            interrupted = runState.gameInterrupted.contains(meta.id) || diskUnsaved.interrupted.contains(meta.id),
                             onClick = { onOpenGame(meta.id) },
                             onEdit = { onEditGame(meta.id) },
                             onDelete = { vm.deleteGame(meta.id) },
                             onRename = { vm.renameGame(meta.id, it) },
                             onFiles = { onOpenFiles(meta.id) },
+                            onParams = {
+                                configGameId = meta.id
+                                vm.openConfigEditor(meta.id)
+                            },
+                            onClearSave = { onClearSaveGame(meta.id) },
                             onExportZip = {
                                 pendingExportGameId = meta.id
                                 exportZipLauncher.launch(zipFileNameFor(meta.title))
@@ -231,6 +246,23 @@ fun HomeScreen(
                 }
             }
         }
+    }
+    // 参数调整编辑器（卡片菜单入口）：共享直列组件；保存写入 user_config——首页无活动
+    // 页面，不做整页重载，下次进入游戏注入生效。
+    configGameId?.let { gid ->
+        ConfigEditorDialog(
+            params = configParams,
+            onSave = { changes ->
+                vm.saveUserConfigChanges(gid, changes) { ok ->
+                    Toast.makeText(
+                        context,
+                        if (ok) "已保存 ${changes.size} 项更改，下次进入游戏生效" else "保存失败：更改未落盘，请重试",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            },
+            onDismiss = { configGameId = null }
+        )
     }
 }
 
@@ -347,16 +379,35 @@ private fun GameCard(
     meta: GameMeta,
     runningStage: String?,
     unsaved: Boolean,
+    interrupted: Boolean,
     onClick: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onRename: (String) -> Unit,
     onFiles: () -> Unit,
+    onParams: () -> Unit,
+    onClearSave: () -> Unit,
     onExportZip: () -> Unit
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
     var renameOpen by remember { mutableStateOf(false) }
+    var confirmClearSave by remember { mutableStateOf(false) }
+
+    // 清除存档确认框：跨局记录（最高分等）一并归零，属破坏性操作先确认
+    if (confirmClearSave) {
+        AlertDialog(
+            onDismissRequest = { confirmClearSave = false },
+            title = { Text("清除存档") },
+            text = { Text("确定清除「${meta.title}」的存档吗？进行中的对局与最高分等跨局记录将一并归零，进入游戏后全新开局。") },
+            confirmButton = {
+                TextButton(onClick = { confirmClearSave = false; onClearSave() }) { Text("清除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClearSave = false }) { Text("取消") }
+            }
+        )
+    }
 
     Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -379,11 +430,31 @@ private fun GameCard(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
-                Text(
-                    formatTime(meta.updatedAt),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        formatTime(meta.updatedAt),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    // 成品版号（每次成功交付 +1，随保存固化进索引）；中断态=「第 N+ 版」
+                    // 角标（保存区仍是第 N 版，编辑区有未交付修改，续跑或重做后消失）
+                    if (meta.deliveredVersion > 0) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            if (interrupted) "第 ${meta.deliveredVersion}+ 版" else "第 ${meta.deliveredVersion} 版",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (interrupted) MaterialTheme.colorScheme.tertiary
+                            else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else if (interrupted) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "有未交付修改",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.tertiary
+                        )
+                    }
+                }
             }
             // 运行中=小动态 logo；结束但有未保存新版本=同色 "!"（保存后消失）；
             // 不展示任何状态文字，占位最小化不挤标题。
@@ -410,6 +481,16 @@ private fun GameCard(
                         text = { Text("继续编辑") },
                         leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
                         onClick = { menuOpen = false; onEdit() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("参数调整") },
+                        leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+                        onClick = { menuOpen = false; onParams() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("清除存档") },
+                        leadingIcon = { Icon(Icons.Filled.Refresh, contentDescription = null) },
+                        onClick = { menuOpen = false; confirmClearSave = true }
                     )
                     DropdownMenuItem(
                         text = { Text("重命名") },

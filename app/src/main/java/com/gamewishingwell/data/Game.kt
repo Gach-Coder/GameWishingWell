@@ -8,7 +8,12 @@ data class GameMeta(
     val title: String,
     val description: String = "",
     val createdAt: Long,
-    val updatedAt: Long
+    val updatedAt: Long,
+    /**
+     * 保存区当前的成品版号（每次成功交付 +1，保存时随索引固化）：首页卡片据此显示
+     * 「第 N 版」。手动保存不计数（沿用会话语义）；导入/旧索引缺省 0（不显示）。
+     */
+    val deliveredVersion: Int = 0
 )
 
 @Serializable
@@ -76,9 +81,12 @@ data class ChatMessage(
     companion object {
         /** 确认门卡片消息：content 为 IntentConfirmation 的精简 JSON，随聊天流持久化。 */
         const val ROLE_CONFIRM_CARD = "confirm_card"
+        /** 续跑卡片消息：content 为 ResumeCardPayload 的 JSON（停止时追加，「继续」按钮恢复中断回合）。 */
+        const val ROLE_RESUME_CARD = "resume_card"
         /** 工具结果消息的 role；仅存在于 Agent Loop 内部上下文，不入聊天流。 */
         const val ROLE_TOOL = "tool"
     }
 
     val isConfirmCard: Boolean get() = role == ROLE_CONFIRM_CARD
+    val isResumeCard: Boolean get() = role == ROLE_RESUME_CARD
 }

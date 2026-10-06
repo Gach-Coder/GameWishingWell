@@ -78,7 +78,9 @@ fun WishwellApp() {
                     onOpenGame = { id -> navController.navigate("game?source=game&gameId=$id") },
                     onEditGame = { id -> navController.navigate("chat?gameId=$id") },
                     onContinueDraft = { navController.navigate("chat?draft=true") },
-                    onOpenFiles = { id -> navController.navigate("files?gameId=$id") }
+                    onOpenFiles = { id -> navController.navigate("files?gameId=$id") },
+                    // 卡片菜单「清除存档」：进游戏页自动清 ww:save 并重载（全新开局）
+                    onClearSaveGame = { id -> navController.navigate("game?source=game&gameId=$id&clearSave=true") }
                 )
             }
             composable(
@@ -93,27 +95,35 @@ fun WishwellApp() {
                 ChatScreen(
                     gameId = gameId,
                     resumeDraft = resumeDraft,
-                    onPlay = {
-                        // 立即游玩 = 预览当前编辑会话（编辑区）的最新版本：
-                        // 编辑区与运行区相互独立，未经保存按钮写入的修改不在运行区。
-                        navController.navigate("game?source=preview&gameId=${gameId ?: -1L}")
+                    onPlay = { alignedToSavedArea ->
+                        // 两入口对齐：已入库游戏在"保存区与编辑区一致"（无未保存新版本、
+                        // 无停止中断的未交付修改）时，立即游玩直连运行区（source=game）——
+                        // 与首页进入同一份 HTML、同一参数覆盖注入、同一存档 origin。
+                        // 不一致时（中断待续跑/未保存/草稿）回退编辑区预览，播最新修改。
+                        navController.navigate(
+                            if (alignedToSavedArea) "game?source=game&gameId=$gameId"
+                            else "game?source=preview&gameId=${gameId ?: -1L}"
+                        )
                     },
                     onOpenSettings = { navController.navigate("settings") },
                     onSaved = { navController.popBackStack("home", false) }
                 )
             }
             composable(
-                route = "game?source={source}&gameId={gameId}",
+                route = "game?source={source}&gameId={gameId}&clearSave={clearSave}",
                 arguments = listOf(
                     navArgument("source") { type = NavType.StringType; defaultValue = "draft" },
-                    navArgument("gameId") { type = NavType.LongType; defaultValue = -1L }
+                    navArgument("gameId") { type = NavType.LongType; defaultValue = -1L },
+                    navArgument("clearSave") { type = NavType.BoolType; defaultValue = false }
                 )
             ) { entry ->
                 val source = entry.arguments?.getString("source") ?: "draft"
                 val gameId = entry.arguments?.getLong("gameId") ?: -1L
+                val clearSave = entry.arguments?.getBoolean("clearSave") ?: false
                 GameScreen(
                     source = source,
                     gameId = gameId,
+                    clearSave = clearSave,
                     onBack = { navController.popBackStack() },
                     onEdit = { id ->
                         if (id != null && id > 0) {

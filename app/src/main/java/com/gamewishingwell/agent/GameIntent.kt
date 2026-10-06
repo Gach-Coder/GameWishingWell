@@ -36,53 +36,40 @@ data class IntentDecision(
 
 /**
  * 意图层：区分“要让游戏变化（dev）”和“纯文本问答（chat）”这一个问题。
- * 默认偏 dev：dev 误判成 chat 会让用户的开发请求被一句回复打发（致命），
- * chat 误判成 dev 只多花一次识别层调用然后回退聊天（温和）。
+ * 判定只走 LLM 单次调用（[liteLlmPrompt] + [parseLiteLlmReply]）——历史版本曾用
+ * 正则关键词先行短路（dev 动词表/聊天句式/否定窗口/元问题特征四组正则），但正则
+ * 无法区分“关闭弹窗”是诉求还是被谈论的对象、也无法覆盖口语化表达，误判的代价
+ * 是整轮 Agent Loop 白跑或开发请求被一句回复打发。正则已全部删除；
+ * [fallback] 仅在 LLM 不可用/输出不可解析时兜底——默认偏 dev：dev 误判成 chat
+ * 会让用户的开发请求被一句回复打发（致命），chat 误判成 dev 只多花一轮识别
+ * 然后回退聊天（温和）。
  */
 object IntentLayer {
-    /** 强烈的“制作/新建游戏”指令：命中即 dev。 */
-    private val createGamePattern = Regex(
-        "(做一个?|制作|创建|生成|开发|设计|写一个?|来一个?|来个|给我做一个?|帮我做一个?|我想要|想要|要一个).{0,12}(游戏|小游戏|玩法|关卡|系统|功能|代码|版本|难度|计分|音游|2D|2.5D|3D|横板|横版|竖版|竖屏|横屏)"
-    )
 
-    /** 追加/改进/调整类开发指令（含口语化的修复诉求——修复不再单独分类）：dev。 */
-    private val featureCommandPattern = Regex(
-        "(加一个?|加个|增加|添加|新增|加上|改成?|修改|调整|优化|继续|迭代|重做|换一个?|换个|升级|修复|修一下|修个|简单一点|难一点|快点|慢点).{0,12}(游戏|小游戏|玩法|关卡|系统|功能|代码|版本|难度|分数|计分|音效|音乐|背景|颜色|金币|敌人|道具|技能|商店|连击|生命|操作|手感|节奏|速度|2D|2.5D|3D|横板|横版|竖版|竖屏|横屏)?"
-    )
+    /** LLM 意图判定的兜底结果（LLM 失败/低置信/不可解析时）：按 dev 处理。 */
+    fun fallback(reason: String = "意图识别不可用，按开发意图处理"): IntentDecision =
+        IntentDecision(
+            intent = IntentDecision.INTENT_DEV,
+            confidence = 0.5,
+            reason = reason
+        )
 
     /**
-     * 纯聊天/平台问句：必须整句以问候或平台问法开头才判 chat。
-     * 不做“短消息 + 疑问前缀”这类宽松匹配——那会把“能不能简单一点”这类
-     * 开发诉求误判成 chat 且以 0.9 置信度短路掉 LLM 复核；模糊短消息
-     * 一律落入默认 dev 分支交给 Lite LLM 判断。
+     * 开发动词快速通道（仅已锚定游戏的会话使用，跳过意图二分类的 LLM 往返省 ~3s/回合）：
+     * 指令以明确的开发/修改动词开头且不是疑问句 → 直接判 dev。只向 dev 方向短路——
+     * 白名单不命中或疑似提问（句尾问号）一律照走 LLM 分类，误判面收敛在
+     * "把一个 chat 问题判成 dev"（迭代循环一轮内即可自我纠正为纯文本答复）。
      */
-    private val chatOnlyPattern = Regex(
-        "^(你好|您好|hi|hello|在吗|你是谁|你能做什么|你会什么|怎么用|使用说明|谢谢|感谢|再见|帮助|介绍|什么是|为什么|能不能教我|教我)[?？。!！\\s]*$"
+    private val devVerbStartRegex = Regex(
+        "^(新增|加入|添加|加上|补充|修改|更改|调整|删|移除|去掉|修复|优化|重构|实现|支持|配置|" +
+            "更新|替换|完善|美化|强化|削弱|放大|缩小|固定|隐藏|显示|开启|关闭|禁用|启用|" +
+            "恢复|重做|导入|加|改|修)一下?"
     )
 
-    /** 纯正则意图分类；低置信度时由 Lite LLM 复核。 */
-    fun inferLocally(userText: String): IntentDecision {
-        val text = userText.trim()
-        val develop = createGamePattern.containsMatchIn(text) || featureCommandPattern.containsMatchIn(text)
-        val chatOnly = chatOnlyPattern.containsMatchIn(text)
-
-        return when {
-            develop -> IntentDecision(
-                intent = IntentDecision.INTENT_DEV,
-                confidence = 0.9,
-                reason = "命中开发指令（制作/追加/改进/调整/修复游戏）"
-            )
-            chatOnly -> IntentDecision(
-                intent = IntentDecision.INTENT_CHAT,
-                confidence = 0.9,
-                reason = "命中纯聊天/平台问句"
-            )
-            else -> IntentDecision(
-                intent = IntentDecision.INTENT_DEV,
-                confidence = 0.55,
-                reason = "未命中聊天句式，默认按开发意图处理，由识别层复核"
-            )
-        }
+    fun devVerbFastPath(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty() || t.endsWith("？") || t.endsWith("?")) return false
+        return devVerbStartRegex.containsMatchIn(t)
     }
 
     /** 意图层 Lite LLM 提示词：只做 dev / chat 二分类。 */
@@ -95,7 +82,7 @@ object IntentLayer {
           "reason": "简短原因"
         }
         - dev：用户想创建游戏，或对现有游戏做任何改动（追加/改进/调整/修复异常均算，可读写游戏文件）；
-        - chat：用户只是聊天、寒暄、询问平台能力，或问一个不希望改动游戏的普通问题（不改任何文件，纯文本回复）。
+        - chat：用户只是聊天、寒暄、询问平台能力，或问一个不希望改动游戏的普通问题（不改任何文件，可只读查询游戏代码后作答，纯文本回复）。
         用户消息：$userText
     """.trimIndent()
 

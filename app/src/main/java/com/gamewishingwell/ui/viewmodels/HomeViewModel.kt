@@ -3,13 +3,21 @@ package com.gamewishingwell.ui.viewmodels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.gamewishingwell.agent.AgentHub
+import com.gamewishingwell.agent.ConfigParam
+import com.gamewishingwell.agent.GameBundle
+import com.gamewishingwell.agent.GameConfigContract
 import com.gamewishingwell.agent.SessionRunState
 import com.gamewishingwell.data.GameMeta
 import com.gamewishingwell.data.GameRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import java.io.InputStream
 import java.io.OutputStream
 
@@ -33,7 +41,12 @@ class HomeViewModel(
      *  （draftStage / gameStages[id] 非空即该会话 Agent Loop 进行中）。 */
     val runState: StateFlow<SessionRunState> = hub.runState
 
-    data class DiskUnsaved(val draft: Boolean = false, val games: Set<Long> = emptySet())
+    data class DiskUnsaved(
+        val draft: Boolean = false,
+        val games: Set<Long> = emptySet(),
+        /** 停止中断（有未交付修改）的游戏：冷启动扫描，hub 装载后由 runState 接管。 */
+        val interrupted: Set<Long> = emptySet()
+    )
 
     init { refresh() }
 
@@ -41,7 +54,11 @@ class HomeViewModel(
         viewModelScope.launch {
             _games.value = repository.listGames()
             _hasDraft.value = repository.hasDraft()
-            _diskUnsaved.value = DiskUnsaved(repository.hasDraftUnsaved(), repository.listUnsavedGameIds())
+            _diskUnsaved.value = DiskUnsaved(
+                repository.hasDraftUnsaved(),
+                repository.listUnsavedGameIds(),
+                repository.listInterruptedGameIds()
+            )
         }
     }
 
@@ -86,5 +103,58 @@ class HomeViewModel(
         val meta = repository.importGameZip(input)
         if (meta != null) refresh()
         return meta
+    }
+
+    // ---------- 参数调整（首页卡片菜单入口，参数外置契约·共享编辑器数据源） ----------
+
+    private val json = Json { ignoreUnknownKeys = true }
+
+    /** 当前打开参数调整的游戏的参数直列（名称/注释/生效值，覆盖优先）。 */
+    private val _configParams = MutableStateFlow<List<ConfigParam>>(emptyList())
+    val configParams: StateFlow<List<ConfigParam>> = _configParams.asStateFlow()
+
+    /** 卡片菜单「参数调整」：装载该游戏保存区的参数直列（与游戏页同一提取管道：
+     *  入口+辅助文件内联合并 → GAME_CONFIG 提取 → 注释/覆盖盖顶）。 */
+    fun openConfigEditor(gameId: Long) {
+        viewModelScope.launch {
+            _configParams.value = withContext(Dispatchers.IO) {
+                val html = repository.loadGameHtml(gameId)
+                    ?: return@withContext emptyList()
+                val files = repository.loadGameTextFiles(gameId)
+                val merged = GameBundle.inline(html) { rel -> files[rel] }
+                val defaults = GameConfigContract.extractDefaults(merged)
+                val docs = GameConfigContract.extractParamDocs(merged)
+                val override = repository.readUserConfig(gameId)
+                    ?.takeIf { GameConfigContract.isValidOverrideJson(it) }
+                    ?.let { runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+                defaults?.let { GameConfigContract.buildParamList(it, docs, override) } ?: emptyList()
+            }
+        }
+    }
+
+    /**
+     * 首页编辑器「保存并生效」：更改并入既有覆盖（同键盖顶）写入 user_config——
+     * 下次进入游戏即注入生效（首页无活动页面，不做整页重载）。
+     */
+    fun saveUserConfigChanges(gameId: Long, changes: List<Pair<String, String>>, onDone: (Boolean) -> Unit) {
+        if (changes.isEmpty()) {
+            onDone(false)
+            return
+        }
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                val merged = LinkedHashMap<String, JsonElement>()
+                repository.readUserConfig(gameId)
+                    ?.takeIf { GameConfigContract.isValidOverrideJson(it) }
+                    ?.let { runCatching { json.parseToJsonElement(it) as? JsonObject }.getOrNull() }
+                    ?.forEach { (k, v) -> merged[k] = v }
+                changes.forEach { (k, raw) ->
+                    if (k.isNotBlank()) merged[k.trim()] = GameConfigContract.parseValueOrString(raw)
+                }
+                repository.writeUserConfig(gameId, JsonObject(merged).toString())
+            }
+            if (ok) openConfigEditor(gameId)   // 刷新直列（生效值=新覆盖）
+            onDone(ok)
+        }
     }
 }

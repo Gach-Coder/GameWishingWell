@@ -40,6 +40,11 @@ class SettingsViewModel(
         repository.updateThinking(enabled)
     }
 
+    /** 交付后自动保存开关即时持久化（同 Switch 语义）。 */
+    fun setAutoSaveOnDelivery(enabled: Boolean) {
+        repository.updateAutoSaveOnDelivery(enabled)
+    }
+
     fun test(s: LlmSettings) {
         viewModelScope.launch {
             _testing.value = true

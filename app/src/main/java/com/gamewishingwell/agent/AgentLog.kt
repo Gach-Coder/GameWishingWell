@@ -1,6 +1,8 @@
 package com.gamewishingwell.agent
 
+import java.io.BufferedWriter
 import java.io.File
+import java.io.FileWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -21,6 +23,12 @@ import java.util.Locale
  * 记录内容：每轮 LLM 调用、工具调用与观察、产品契约/沙箱校验细节、升级提示、
  * 退出原因等（含 UI 纪律禁止展示的错误原文，因此仅限本地文件）。
  * 写入是 best-effort：任何日志失败都被吞掉，绝不影响 Agent Loop 本身。
+ *
+ * 性能：回合内持有常开 [BufferedWriter]（原实现每行 appendText 都开关一次文件，
+ * 一回合几百行 × 1~3ms 的开闭上消耗在协程内同步发生）；每行写入后立即 flush——
+ * 回合进行中（交付前）日志文件即实时可见，中途拉取分析、进程被杀都不丢已写行
+ * （flush 只是一次本地 write 系统调用，远低于逐行开关文件，也远低于 LLM 轮次本身）。
+ * endTurn 冲刷关闭。
  */
 class AgentLog {
 
@@ -29,27 +37,47 @@ class AgentLog {
     private val fileFmt = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
 
     @Volatile
-    private var current: File? = null
+    private var pendingFile: File? = null
 
-    /** 回合开始：在 [turnDir]（游戏文件夹的 log/ 目录）下创建本回合专属日志文件并打开。 */
+    @Volatile
+    private var writer: BufferedWriter? = null
+
+    /** 回合开始：在 [turnDir]（游戏文件夹的 log/ 目录）下登记本回合专属日志文件。
+     *  文件本身惰性创建（首次写入才落盘）——保持"零写入回合不产生文件"的磁盘语义。 */
     fun beginTurn(turnDir: File) {
-        val file = runCatching {
+        val f = runCatching {
             turnDir.mkdirs()
             uniqueLogFile(turnDir)
         }.getOrNull() ?: return
-        synchronized(lock) { current = file }
+        synchronized(lock) {
+            runCatching { writer?.close() }
+            writer = null
+            pendingFile = f
+        }
     }
 
-    /** 回合收尾：关闭当前文件；此后的日志写入被丢弃，等待下一回合的新文件。 */
+    /** 回合收尾：冲刷并关闭当前文件；此后的日志写入被丢弃，等待下一回合的新文件。 */
     fun endTurn() {
-        synchronized(lock) { current = null }
+        synchronized(lock) {
+            runCatching { writer?.flush() }
+            runCatching { writer?.close() }
+            writer = null
+            pendingFile = null
+        }
     }
 
     fun log(scope: String, message: String) {
-        val f = current ?: return
+        val line = "${lineFmt.format(Date())} [$scope] $message\n"
         try {
             synchronized(lock) {
-                f.appendText("${lineFmt.format(Date())} [$scope] $message\n", Charsets.UTF_8)
+                val w = writer ?: pendingFile?.let { f ->
+                    // 首次写入才打开常开 writer（此后整回合复用，不再逐行开关文件）
+                    BufferedWriter(FileWriter(f, true)).also { writer = it; pendingFile = null }
+                } ?: return
+                w.write(line)
+                // 逐行冲刷：回合进行中日志即落盘可见（此前缓冲到 endTurn 才冲刷，
+                // 交付前文件一直空白，且进程被杀丢整段缓冲）
+                w.flush()
             }
         } catch (_: Exception) {
             // 日志失败不影响主流程

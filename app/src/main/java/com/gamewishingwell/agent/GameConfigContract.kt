@@ -6,6 +6,20 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 /**
+ * 游戏自定义设置项（WW_SETTINGS 声明，平台游戏设置面板渲染，即改即存走参数覆盖管道）：
+ * [key] 必须是 GAME_CONFIG 的参数键（当前值=覆盖优先）；[type]=toggle（布尔开关）/
+ * choice（[options] 候选值，任意 JSON 标量）；玩家更改即写 user_config 并整页重载生效。
+ * Agent 对话可增删条目——"设置页增加/删除 xx 选项"即改 WW_SETTINGS（新选项同时在
+ * GAME_CONFIG 建键并让逻辑消费它），提示词契约见 GamePrompt 参数外置契约条目。
+ */
+data class GameSettingOption(
+    val key: String,
+    val label: String,
+    val type: String,
+    val options: List<JsonElement>
+)
+
+/**
  * 参数面板列表行：参数名 + 注释 + 默认值与当前生效值（覆盖优先）。
  * [default] 为 null 表示该键只存在于玩家覆盖（自定义键，不在游戏默认表中）。
  */
@@ -310,6 +324,49 @@ object GameConfigContract {
 
     fun extractParamDocs(content: String): Map<String, String> =
         paramDocRegex.findAll(content).associate { it.groupValues[1] to it.groupValues[2].trim() }
+
+    private val settingsAssignRegex = Regex("""(?:window\.)?WW_SETTINGS\s*=\s*\[""")
+
+    /** 合并视图中是否声明了 WW_SETTINGS（游戏设置面板自定义区块的显隐依据）。 */
+    fun hasSettingsSchema(html: String): Boolean = settingsAssignRegex.containsMatchIn(html)
+
+    /**
+     * 提取 WW_SETTINGS 自定义设置项声明：无赋值返回 null；括号不闭合/不可解析返回 null
+     * （面板不渲染自定义区，宁可漏报不误伤）；条目缺 key 的跳过，label 缺省用 key，
+     * type 缺省 toggle，options 缺省空数组（toggle 无需候选）。
+     */
+    fun extractSettings(html: String): List<GameSettingOption>? {
+        val m = settingsAssignRegex.find(html) ?: return null
+        val open = m.range.last // '['
+        var depth = 0
+        var i = open
+        var close = -1
+        while (i < html.length) {
+            when (val c = html[i]) {
+                '[' -> depth++
+                ']' -> {
+                    depth--
+                    if (depth == 0) close = i
+                }
+                '"', '\'', '`' -> i = skipString(html, i)
+            }
+            if (close >= 0) break
+            i++
+        }
+        if (close < 0) return null
+        val normalized = normalizeToJson(html.substring(open, close + 1)) ?: return null
+        val arr = runCatching {
+            json.parseToJsonElement(normalized) as? kotlinx.serialization.json.JsonArray
+        }.getOrNull() ?: return null
+        return arr.mapNotNull { el ->
+            val obj = el as? JsonObject ?: return@mapNotNull null
+            val key = (obj["key"] as? JsonPrimitive)?.content ?: return@mapNotNull null
+            val label = (obj["label"] as? JsonPrimitive)?.content ?: key
+            val type = (obj["type"] as? JsonPrimitive)?.content ?: "toggle"
+            val options = (obj["options"] as? kotlinx.serialization.json.JsonArray)?.toList() ?: emptyList()
+            GameSettingOption(key = key, label = label, type = type, options = options)
+        }
+    }
 
     /**
      * 参数值输入的宽松解析：先按 JSON 解析（数字/布尔/null/数组/对象都接受），

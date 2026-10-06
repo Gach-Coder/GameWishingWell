@@ -92,7 +92,10 @@ fun SettingsScreen() {
         baseUrl = baseUrl,
         model = model,
         systemPrompt = systemPrompt,
-        thinkingEnabled = thinkingEnabled
+        thinkingEnabled = thinkingEnabled,
+        // 自动保存不在本页表单里（专属 Switch 即时持久化）：随仓库当前值透传，
+        // "保存设置"不得把它重置回默认。
+        autoSaveOnDelivery = settings.autoSaveOnDelivery
     )
 
     Scaffold(
@@ -274,6 +277,25 @@ fun SettingsScreen() {
                         // 其余字段（Key/Base URL/模型名/系统提示词）仍走"保存设置"按钮。
                         vm.setThinkingEnabled(it)
                     }
+                )
+            }
+
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("交付后自动保存", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "开启后：已入库游戏的每个成功回合自动保存（撤销随之变为\"回到上一交付\"，逐回合粒度）；" +
+                            "草稿首次保存仍需手动命名。关闭后保持手动保存语义。切换立即生效。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = settings.autoSaveOnDelivery,
+                    onCheckedChange = { vm.setAutoSaveOnDelivery(it) }
                 )
             }
 

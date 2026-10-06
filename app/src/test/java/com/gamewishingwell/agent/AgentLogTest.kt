@@ -46,6 +46,24 @@ class AgentLogTest {
     }
 
     @Test
+    fun `回合进行中日志逐行实时落盘（endTurn 前即可见）`() {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agentlog-live-${System.nanoTime()}")
+        val log = AgentLog()
+        log.beginTurn(File(dir, "log"))
+        log.log("draft", "round 1: textLen=0 toolCalls=[readfile]")
+        // 不 endTurn（回合仍在进行中）：此前实现缓冲到回合收尾才冲刷，
+        // 交付前文件一直空白——逐行 flush 后应立即可读
+        val files = File(dir, "log").listFiles { f -> f.name.endsWith(".log") }.orEmpty()
+        assertEquals(1, files.size)
+        val content = files[0].readText(Charsets.UTF_8)
+        assertTrue("回合中应已可见", content.contains("round 1: textLen=0"))
+        log.log("draft", "round 2: textLen=0 toolCalls=[editfile]")
+        assertTrue("后续行同样实时追加", files[0].readText(Charsets.UTF_8).contains("round 2"))
+        log.endTurn()
+        dir.deleteRecursively()
+    }
+
+    @Test
     fun `回合外与目录被删后静默跳过不抛异常`() {
         val dir = File(System.getProperty("java.io.tmpdir"), "agentlog-${System.nanoTime()}")
         val log = AgentLog()

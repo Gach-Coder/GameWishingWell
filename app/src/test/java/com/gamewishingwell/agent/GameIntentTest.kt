@@ -6,35 +6,43 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+/**
+ * 意图层测试：判定只走 LLM（inferLocally 正则已删除——正则无法区分"关闭弹窗"
+ * 是诉求还是被谈论的对象，误判代价是整轮 Agent Loop 白跑或开发请求被打发）。
+ * 这里锁定：LLM 回复解析、历史标签归一、低置信拒绝，以及兜底恒偏 dev。
+ */
 class GameIntentTest {
 
     @Test
-    fun `意图层输出 dev chat 两个意图`() {
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("做一个打地鼠游戏").intent)
-        assertEquals(IntentDecision.INTENT_CHAT, IntentLayer.inferLocally("你好").intent)
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("加个连击计分").intent)
-        // 修复类词汇不再参与路由：文本报告的异常统一按 dev 走正常管线，
-        // 快车道由会话状态（运行时错误签名）推导，不靠猜文本。
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("游戏报错了，点开始没反应，修复一下").intent)
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("修复bug").intent)
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("闪退了帮我修修").intent)
-        // 制作新游戏的指令优先于修复词：“修汽车”是游戏内容，不是修 bug
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("做一个修汽车的装修游戏").intent)
-        assertTrue(IntentLayer.inferLocally("修复bug").isDevelop)
-        assertFalse(IntentLayer.inferLocally("你好").isDevelop)
-        // 短问句陷阱：开发诉求不得被疑问前缀误判成 chat 并以高置信度短路
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("能不能简单一点").intent)
-        assertEquals(IntentDecision.INTENT_DEV, IntentLayer.inferLocally("再难一点").intent)
-
+    fun `LLM 回复解析 dev 与 chat`() {
         val parsed = IntentLayer.parseLiteLlmReply("""{"intent":"chat","confidence":0.9,"reason":"问候"}""")
         assertEquals(IntentDecision.INTENT_CHAT, parsed?.intent)
         assertTrue(parsed?.isChat == true)
+        assertFalse(parsed?.isDevelop == true)
+        val dev = IntentLayer.parseLiteLlmReply("""{"intent":"dev","confidence":0.95,"reason":"要做游戏"}""")
+        assertEquals(IntentDecision.INTENT_DEV, dev?.intent)
+        assertTrue(dev?.isDevelop == true)
         // 历史标签归一：旧三分类的 fix_bug / 旧二分类的 develop 都表示“要动游戏” → dev
         assertEquals(IntentDecision.INTENT_DEV, IntentLayer.parseLiteLlmReply("""{"intent":"fix_bug","confidence":0.9}""")?.intent)
         assertEquals(IntentDecision.INTENT_DEV, IntentLayer.parseLiteLlmReply("""{"intent":"develop","confidence":0.9}""")?.intent)
         assertNull(IntentLayer.parseLiteLlmReply("""{"intent":"外星意图","confidence":0.9}"""))
-        // LLM 自报低置信度视为不可信，回落本地默认（dev）
+        // LLM 自报低置信度视为不可信（调用方回落 dev 兜底）
         assertNull(IntentLayer.parseLiteLlmReply("""{"intent":"chat","confidence":0.3}"""))
+        // Markdown 围栏与前后噪声容忍
+        assertEquals(
+            IntentDecision.INTENT_CHAT,
+            IntentLayer.parseLiteLlmReply("```json\n{\"intent\":\"chat\",\"confidence\":0.9}\n```")?.intent
+        )
+    }
+
+    @Test
+    fun `兜底恒偏 dev 且低置信`() {
+        // LLM 不可用/输出不可解析时的兜底：dev（dev 误判成 chat 致命——开发请求被
+        // 一句回复打发；chat 误判成 dev 温和——多一轮识别即回退聊天）、低置信不短路。
+        val fb = IntentLayer.fallback()
+        assertEquals(IntentDecision.INTENT_DEV, fb.intent)
+        assertTrue(fb.isDevelop)
+        assertTrue("兜底置信度必须低于 LLM 判定，不构成高置信短路：conf=${fb.confidence}", fb.confidence < 0.8)
     }
 
     @Test

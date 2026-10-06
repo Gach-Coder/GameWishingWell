@@ -34,6 +34,12 @@ window.GAME_CONFIG = {
 };
 Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {}); // 平台参数覆盖（"参数调整"面板注入，必留此行）
 
+// 游戏自定义设置项（平台"游戏设置"面板渲染，玩家更改即写参数覆盖并重载生效）：
+// key 必须是 GAME_CONFIG 已有参数键；toggle=布尔开关，choice=候选值数组。
+window.WW_SETTINGS = [
+  { "key": "spawnRate", "label": "球生成频率", "type": "choice", "options": [0.2, 0.4, 0.8] }
+];
+
 // —— 窗口尺寸自适应（含高分屏）——
 function resize(){
   var dpr = window.devicePixelRatio || 1;

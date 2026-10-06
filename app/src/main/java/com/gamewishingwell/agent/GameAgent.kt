@@ -37,6 +37,8 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.IOException
@@ -71,6 +73,16 @@ data class GameSession(
     val decisionLog: List<String> = emptyList(),
     /** 每通过校验的版本快照（可回滚），记录文件名与内容哈希。 */
     val snapshots: List<String> = emptyList(),
+    /**
+     * 交付版号：每次成功交付（ACCEPTED）+1，随会话持久化。手动保存不计数；
+     * 撤销回到保存点时随之回滚（保存点在交付自动保存时冻结，锚定同号版本）。
+     * 交付消息以「第 N 版」展示，撤销提示显示将回到的版号。旧会话缺省 0。
+     */
+    val deliveredVersion: Int = 0,
+    /** 当前回合已运行轮次（Agent Loop 内每轮递增；停止时据此报告"第 x 轮处中断"）。 */
+    val currentTurnRounds: Int = 0,
+    /** 可续跑的中断回合（停止时冻结；「继续」按钮据此恢复；任何新回合开始即清除）。 */
+    val resumableTurn: ResumableTurn? = null,
     val schemaVersion: Int = 2,
     /** 质量档位（确认门四挡 fast/light/balanced/premium），默认均衡：驱动档位提示词、自检轮数与沙箱深度。 */
     val qualityTier: String = QualityTier.BALANCED,
@@ -83,6 +95,43 @@ data class GameSession(
 ) {
     /** 兼容旧会话：持久化标志为 false 但已存在游戏代码时，同样视为已生成。 */
     fun effectiveGameGenerated(): Boolean = gameGenerated || !currentHtml.isNullOrBlank()
+}
+
+/** 中断回合快照：停止键冻结原指令与进度，「继续」按钮据此在中断处恢复。 */
+@Serializable
+data class ResumableTurn(
+    val instruction: String,
+    val rounds: Int,
+    val elapsedMs: Long
+)
+
+/** 聊天流中的续跑卡片（resume_card 消息 content 的编码；UI 据此渲染文本与「继续」按钮）。 */
+@Serializable
+data class ResumeCardPayload(
+    val instruction: String,
+    val message: String
+) {
+    companion object {
+        private val cardJson = Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = false }
+
+        fun content(turn: ResumableTurn, hasPlayableHtml: Boolean, deliveredVersion: Int = 0): String {
+            val dur = formatAgentDuration(turn.elapsedMs)
+            // 中断态下首页进入的仍是保存区成品（第 N 版）；本页立即游玩为编辑区最新修改
+            val verNote = if (deliveredVersion > 0) "（当前成品：第 $deliveredVersion 版）" else ""
+            val message = if (hasPlayableHtml) {
+                "已停止，本次 Agent Loop 第 ${turn.rounds} 轮处中断，耗时 $dur。$verNote" +
+                    "可以来测试你的游戏，或点击「继续」按钮，即在本中断处继续完成交付。"
+            } else {
+                "已停止，本次 Agent Loop 第 ${turn.rounds} 轮处中断，耗时 $dur。" +
+                    "点击「继续」按钮，即在本中断处继续完成本次制作。"
+            }
+            return cardJson.encodeToString(ResumeCardPayload.serializer(), ResumeCardPayload(turn.instruction, message))
+        }
+
+        fun fromCardContent(content: String): ResumeCardPayload? = runCatching {
+            cardJson.decodeFromString(ResumeCardPayload.serializer(), content)
+        }.getOrNull()
+    }
 }
 
 object AgentStage {
@@ -380,6 +429,17 @@ class GameAgent(
     private var activeGenerationJob: Job? = null
 
     /**
+     * 停止请求的越窗暂存：回合入口先置 isGenerating=true、随后才 launch 并注册 Job，
+     * 两步之间存在窗口（含"发送即落盘"的 IO 挂起点）——窗口内按停止键时
+     * activeGenerationJob 尚为 null，取消被静默丢弃，回合照常启动且此后无人能停
+     * （实测确定性挂死：停止后首个 LLM 调用永远等待）。stopGeneration 在该窗口
+     * 置位本标记，[trackGenerationJob] 注册 Job 后立即消费并取消；markTurnStart
+     * 清除陈旧标记，防止残留请求误杀后续回合。
+     */
+    @Volatile
+    private var stopRequestedBeforeJobTracked = false
+
+    /**
      * 回合计时打点：在四个回合入口（发送消息/确认门确认/报障修复/再试一次）起算，
      * 回复（成功/失败/聊天）结算附带"本轮耗时"。确认门等待用户思考的时间不计入
      * （确认时重新打点）；0 表示未打点（防御，按不足 1 秒展示）。
@@ -388,7 +448,14 @@ class GameAgent(
     private var turnStartedAtMs: Long = 0L
 
     private fun markTurnStart() {
+        // 新回合开始：清除可能残留的越窗停止请求（上一回合若在注册前被请求停止
+        // 却未走到 launch，标记不应波及本回合）。
+        stopRequestedBeforeJobTracked = false
         turnStartedAtMs = System.currentTimeMillis()
+        // 新回合开始即作废旧的中断续跑点（用户已选择发新指令而非点「继续」）
+        if (_session.value.resumableTurn != null || _session.value.currentTurnRounds != 0) {
+            _session.update { it.copy(resumableTurn = null, currentTurnRounds = 0) }
+        }
         // 每个用户回合一个新日志文件（游戏文件夹 log/yyyyMMdd_HHmmss.log）：
         // 只能由回合入口创建，回合外不建不写；删除只随游戏删除顺带发生。
         agentLog.beginTurn(turnLogDir())
@@ -447,11 +514,24 @@ class GameAgent(
         /** 会话内版本快照的保留上限：防 agent_state.json 无限膨胀（每次成功回合只追加不清理）。 */
         const val MAX_SNAPSHOTS = 50
 
+        /** 长回合阈值：工具循环轮次达到该值起，阶段条附"本轮已 N 轮，可随时停止"。 */
+        const val LONG_TURN_ROUNDS = 15
+
         /**
          * LLM 网络重试的递增退避表（5/15/30/60s）：表长即重试次数（首次 + 4 次重试 = 5 次尝试）。
          * 后台瞬断（射频切换/Doze 间隙/网关限流）恢复常需 30~60s，短退避跨不过窗口。
          */
         val LLM_RETRY_BACKOFF_MS = longArrayOf(5_000L, 15_000L, 30_000L, 60_000L)
+
+        /** 整读全文在历史中的最大"躺平"轮数：超过即折叠为指针（防每轮 prefill 复利膨胀）。 */
+        const val FULL_READ_FOLD_AFTER_ROUNDS = 6
+
+        /**
+         * 连续只读轮达到该数即关闭 quiet（恢复思考）：quiet 省钱的前提是机械轮，
+         * 连续多轮纯读说明模型在开放侦查中挣扎——恰是需要思考判断"信息是否足够"
+         * 的场景（实测 20261003_201230 回合全程 quiet，24 轮 grep 零落盘）。
+         */
+        const val QUIET_STRUGGLE_ROUNDS = 3
 
         /** SSE 流预览（阶段条下方三行打字机）的更新节流间隔。 */
         const val STREAM_PREVIEW_INTERVAL_MS = 400L
@@ -530,6 +610,13 @@ class GameAgent(
         runCatching { GenerationForeground.start(appContext) }
             .onFailure { alog("前台服务启动失败（后台保活降级，后台网络可能受限）：${it.message}") }
         activeGenerationJob = job
+        if (stopRequestedBeforeJobTracked) {
+            // 消费越窗停止请求：注册即取消——协程体尚未推进（或刚起步），
+            // 停止语义在注册窗口前后保持一致。
+            stopRequestedBeforeJobTracked = false
+            alog("consume deferred STOP: cancel turn job right after tracking")
+            job.cancel()
+        }
         job.invokeOnCompletion {
             if (activeGenerationJob === job) activeGenerationJob = null
             // 回合收尾关闭本回合日志文件：此后同一实例的零散日志丢弃（无全局日志）
@@ -559,12 +646,21 @@ class GameAgent(
      * 停止键：随时中断当前 Agent Loop。
      * 中断后保留最近一次已抽取出的 HTML 候选（如果有），玩家可立即尝试游玩；
      * 该候选可能尚未通过基础校验，运行错误属于正常现象。
+     * 工具循环已推进（第 N 轮）时追加续跑卡片（resume_card）：报告中断轮次与耗时，
+     * 「继续」按钮携带原指令从中断处恢复（工作区文件保留中断前全部修改）；
+     * 意图识别/确认门等前置阶段停止无"交付中断"语义，维持纯提示。
      */
     fun stopGeneration() {
         val current = _session.value
         val job = activeGenerationJob
         if (!current.isGenerating) return
         alog("STOP by user")
+        val rounds = current.currentTurnRounds
+        val elapsedMs = turnElapsedMs()
+        val instruction = current.messages.lastOrNull { it.isUser }?.content?.trim()
+        val resumable = if (rounds > 0 && !instruction.isNullOrBlank()) {
+            ResumableTurn(instruction, rounds, elapsedMs)
+        } else null
         if (job?.isActive == true) {
             job.cancel()
             // cancel 异步生效：回合协程在"最后一次 ensureActive 之后"飞行中的进度
@@ -577,18 +673,37 @@ class GameAgent(
                     ) s.copy(agentStage = AgentStage.INTERRUPTED) else s
                 }
             }
+        } else if (job == null) {
+            // 回合 Job 尚未注册（入口置 isGenerating=true → 发送即落盘 IO → launch
+            // 之间的窗口）：此刻无从取消，暂存停止请求，trackGenerationJob 注册后
+            // 立即消费——否则该回合将在无人可停的状态下继续跑（停止被静默丢弃）。
+            stopRequestedBeforeJobTracked = true
+            alog("STOP in pre-tracking window: request deferred until job registration")
         }
         activeGenerationJob = null
         _session.update { s ->
+            val resumeCard = resumable?.let {
+                ChatMessage(
+                    role = ChatMessage.ROLE_RESUME_CARD,
+                    content = ResumeCardPayload.content(
+                        it,
+                        hasPlayableHtml = s.currentHtml != null,
+                        deliveredVersion = s.deliveredVersion
+                    )
+                )
+            }
             s.copy(
+                messages = if (resumeCard != null) s.messages + resumeCard else s.messages,
                 isGenerating = false,
                 agentStage = AgentStage.INTERRUPTED,
                 error = null,
                 streamPreview = null,
+                currentTurnRounds = 0,
+                resumableTurn = resumable,
                 lastWarning = if (s.currentHtml != null) {
-                    "已中断。你可以试玩当前版本，或继续描述需求。"
+                    "已中断。你可以试玩当前版本，或点击「继续」按钮完成交付。"
                 } else {
-                    "已中断。请继续描述你的需求。"
+                    "已中断。可点击「继续」按钮继续，或继续描述你的需求。"
                 }
             )
         }
@@ -596,6 +711,33 @@ class GameAgent(
         // 首回合被停止的草稿若不在此落盘，重启后对话丢失、首页卡片消失。
         // agentScope 可能已被 shutdown 取消——取消态下 launch 静默不执行，无害。
         agentScope.launch { runCatching { persistSessionMessages(_session.value) } }
+    }
+
+    /**
+     * 续跑卡片「继续」按钮：恢复被停止中断的回合。工作区文件保留了中断前的
+     * 全部修改，以「原指令 + 续做语境」重进 Agent Loop（先核对完成度，再补完
+     * 剩余工作，走正常验收交付）——等价于在断点处继续，而非从零重做。
+     */
+    suspend fun resumeInterruptedTurn() {
+        val info = _session.value.resumableTurn ?: return
+        if (_session.value.isGenerating) return
+        alog("resume interrupted turn: rounds=${info.rounds} elapsedMs=${info.elapsedMs}")
+        _session.update {
+            it.copy(
+                resumableTurn = null,
+                isGenerating = true,
+                error = null,
+                agentStage = AgentStage.CODE_GENERATION
+            )
+        }
+        markTurnStart()
+        val instruction = "继续完成刚才被中断的任务（原指令如下）。工作区文件已保留中断前的全部修改：" +
+            "请先用 listfiles/grepfile 对照原指令核对当前完成度，然后继续完成剩余工作并交付，" +
+            "不要重做已完成的修改。\n${info.instruction}"
+        val job = trackGenerationJob(agentScope.launch {
+            runTurnSafely { runUserTurn(instruction, null, null, null) }
+        })
+        job.join()
     }
 
     // ---------- 会话管理 ----------
@@ -681,8 +823,11 @@ class GameAgent(
         val before = _session.value
         if (before.isGenerating) return
         if (clearDraft) repository.clearDraft()
-        val signatures = withContext(Dispatchers.IO) { loadGlobalErrorSignatures() }
-        if (commitSessionIfUntouched(before) { GameSession(knownErrors = signatures) }) {
+        // 会话级 knownErrors 不再从全局库播种（跨游戏污染修复）：全局 error_signatures.json
+        // 汇集所有游戏的错误历史，原样种进新会话会把塔防等无关游戏的签名带进本游戏的
+        // agent_state（实测 2.5D RPG 会话里混入塔防冒烟签名）。全局库降级为纯档案，
+        // 由 saveGlobalErrorSignatures 合并维护，与会话状态互不传染。
+        if (commitSessionIfUntouched(before) { GameSession() }) {
             editingGameId = null
         }
     }
@@ -920,7 +1065,10 @@ class GameAgent(
             "报错涉及文件：${implicatedFiles.joinToString("、")}。修复请聚焦这些文件及其直接引用的模块，无关文件不要改动。\n"
         } else ""
         val instruction = "游戏运行时报错，请精准修复该错误（修改范围契约：只改与报错直接相关的代码，" +
-            "其余一切游戏特性保持原样，不做任何额外改动）：\n$scopeHint$jsError"
+            "其余一切游戏特性保持原样，不做任何额外改动）：\n$scopeHint$jsError\n" +
+            "修复完成后：若该错误可用确定性操作序列复现（如特定 UI 操作/特定状态触发），请在 scenarios.json " +
+            "追加一条对应断言场景（沿用现有格式与 id 命名风格，只增不删）防同类回归；无法确定性复现则跳过，" +
+            "不要为此编造脆弱断言。"
         val messages = s.messages + ChatMessage("user", instruction)
         // schema 推导与其它回合同源：gameSchema → 旧版会话兼容推导 → 兜底空 Schema。
         val schema = legacyAnchoredSchema(s) ?: GameSchema(confidence = 1.0)
@@ -996,8 +1144,15 @@ class GameAgent(
             }
         )
         if (editingId != null) {
-            repository.overwriteGameFiles(editingId, files, s.messages, cleanTitle)
+            // 上一版撤销锚点（必须在覆盖保存区之前抓取）：旧保存区文件 = 上一交付版本
+            // 的全量，连同旧保存点一起轮转进 .savepoint_prev——单保存点会随本次保存
+            // 刷新为当前版，不轮转则"撤销到上一版本"无锚可回（目标=当前版=恒无操作）。
+            val prevFiles = repository.savedGameFilePaths(editingId).mapNotNull { rel ->
+                repository.loadGameFile(editingId, rel)?.let { rel to it }
+            }.toMap()
+            repository.overwriteGameFiles(editingId, files, s.messages, cleanTitle, deliveredVersion = s.deliveredVersion)
             persistAgentState(editingId, savedState)
+            repository.rotateSavepointToPrev(editingId, prevFiles)
             repository.writeSavepoint(editingId, s.messages, sessionJson.encodeToString(savedState))
             _session.update { it.copy(unsavedVersion = false) }
             return repository.listGames().firstOrNull { it.id == editingId }
@@ -1006,7 +1161,7 @@ class GameAgent(
             it.isUser && !it.content.contains("推荐的游戏框架")
         }?.content?.trim()?.replace(Regex("\\s+"), " ")?.take(60) ?: ""
         // 草稿分支 cleanTitle 必非空（空标题已回退 defaultTitle），?: 仅满足类型
-        val meta = repository.saveGame(cleanTitle ?: defaultTitle(s), description, files, s.messages)
+        val meta = repository.saveGame(cleanTitle ?: defaultTitle(s), description, files, s.messages, deliveredVersion = s.deliveredVersion)
         editingGameId = meta.id
         // 身份升级通知（AgentHub 重挂键位）：同一实例以 game-<id> 续作，草稿键位让位。
         onAdoptedGameId?.invoke(meta.id)
@@ -1041,6 +1196,51 @@ class GameAgent(
         try {
             withContext(Dispatchers.IO) {
                 val savedHtml = repository.loadGameHtml(editingId) ?: return@withContext
+                // 自动保存模式：撤销 = 回到上一交付版本（.savepoint_prev 锚点——旧保存区
+                // 文件 + 旧保存点会话，在每次保存时轮转产生）。单保存点路径下保存点恒为
+                // 当前交付版，撤销目标与当前版相同即恒为无操作（实测失效）；prev 槽缺失
+                // （首次交付后/旧数据升级）时落到下方"回到保存点"的既有路径。
+                if (settingsRepository.settings.value.autoSaveOnDelivery) {
+                    val prevState = repository.loadPrevSavepointAgentState(editingId)
+                    val prevFiles = repository.loadPrevSavepointFiles(editingId)
+                    if (prevState != null && prevFiles.isNotEmpty()) {
+                        var restored = decodeSession(prevState)
+                        repository.loadPrevSavepointSession(editingId)?.takeIf { it.isNotEmpty() }?.let { sp ->
+                            restored = restored.copy(messages = sp)
+                        }
+                        val verNote = restored.deliveredVersion.takeIf { it > 0 }?.let { "（第 $it 版）" } ?: ""
+                        // 三处一致地回到上一版：工作区 + 保存区 + 会话。只回滚工作区会出现
+                        // "编辑区上一版、游戏库还是当前版"的撕裂（撤销后立即杀进程重进，
+                        // 装载的是保存区当前版，撤销等于没发生）。
+                        restoreWorkspaceFromFiles(prevFiles)
+                        repository.overwriteGameFiles(
+                            editingId, prevFiles, restored.messages,
+                            deliveredVersion = restored.deliveredVersion.takeIf { it > 0 }
+                        )
+                        restored = restored.copy(
+                            messages = restored.messages + ChatMessage(
+                                "assistant", "已撤销到上一交付版本$verNote。之后的对话与修改已丢弃，可继续描述需求。"
+                            )
+                        )
+                        val finalState = restored.copy(
+                            currentHtml = prevFiles[GameFileWorkspaceEntryPoint.DEFAULT] ?: savedHtml,
+                            isGenerating = false,
+                            error = null,
+                            agentStage = AgentStage.IDLE,
+                            unsavedVersion = false,
+                            lastWarning = "已撤销到上一交付版本$verNote。"
+                        )
+                        repository.promotePrevSavepoint(editingId)
+                        // 撤销后的会话（含撤销提示）写回保存点：否则保存点仍是晋升来的
+                        // 旧会话（无提示），下一次撤销的比对恒判"有变化"而误报可撤销。
+                        repository.writeSavepoint(
+                            editingId, finalState.messages, sessionJson.encodeToString(finalState)
+                        )
+                        changed = true
+                        committed = commitSessionIfUntouched(before) { finalState }
+                        return@withContext
+                    }
+                }
                 restoreWorkspaceFromSaved(editingId)
                 val hasSavepoint = repository.loadSavepointAgentState(editingId) != null
                 var restored: GameSession
@@ -1063,12 +1263,14 @@ class GameAgent(
                 }
                 changed = restored.messages != before.messages || before.currentHtml != savedHtml
                 if (changed) {
+                    // 撤销目标版号：保存点冻结的 deliveredVersion（= 交付自动保存时的版号）
+                    val verNote = restored.deliveredVersion.takeIf { it > 0 }?.let { "（第 $it 版）" } ?: ""
                     val note = if (hasSavepoint) {
-                        ChatMessage("assistant", "已撤销未保存的修改，回到上次保存的版本。")
+                        ChatMessage("assistant", "已撤销未保存的修改，回到上次保存的版本$verNote。")
                     } else {
                         ChatMessage(
                             "assistant",
-                            "已回到上次保存的版本。该游戏由旧版本应用保存（无保存点），此前的对话记录已随撤销清空；" +
+                            "已回到上次保存的版本$verNote。该游戏由旧版本应用保存（无保存点），此前的对话记录已随撤销清空；" +
                                 "游戏文件已恢复为保存区版本，可继续描述需求修改。"
                         )
                     }
@@ -1079,7 +1281,10 @@ class GameAgent(
                     isGenerating = false,
                     error = null,
                     agentStage = AgentStage.IDLE,
-                    lastWarning = if (changed) "已撤销未保存的修改，回到上次保存的版本。" else null
+                    lastWarning = if (changed) {
+                        val vNote = restored.deliveredVersion.takeIf { it > 0 }?.let { "（第 $it 版）" } ?: ""
+                        "已撤销未保存的修改，回到上次保存的版本$vNote。"
+                    } else null
                 )
                 // 乐观提交：读文件期间用户发起了新回合（引用已变化）则放弃会话回滚，
                 // 避免吞掉其消息与生成状态；工作区文件已恢复无害——回合会用
@@ -1098,17 +1303,45 @@ class GameAgent(
     }
 
     /**
+     * 撤销目标版号（撤销确认弹窗展示用）：保存点冻结的 deliveredVersion——
+     * 交付自动保存开启时即"上一交付版本"的版号。无保存点或旧格式保存点（字段
+     * 缺省 0）返回 null，UI 不展示版号后缀。
+     */
+    suspend fun undoTargetVersion(): Int? {
+        val id = editingGameId ?: return null
+        // 自动保存模式下撤销目标是【上一交付】版本（.savepoint_prev 冻结的版号）；
+        // prev 缺失（首次交付后/旧数据）或手动保存模式下为当前保存点版号（既有语义）。
+        if (settingsRepository.settings.value.autoSaveOnDelivery) {
+            repository.loadPrevSavepointAgentState(id)?.let { sp ->
+                decodeSession(sp).deliveredVersion.takeIf { it > 0 }?.let { return it }
+            }
+        }
+        val sp = repository.loadSavepointAgentState(id) ?: return null
+        return decodeSession(sp).deliveredVersion.takeIf { it > 0 }
+    }
+
+    /**
      * 保存区文件整体覆盖编辑区工作区（"撤销"＝保存版→编辑版的相互覆盖，与"保存"
-     * 互为逆操作）：以 [GameRepository.savedGameFilePaths] 的递归清单为准（多文件
-     * 形态含 js/css 子目录）——保存区不存在的编辑区文件（未保存修改新增的
-     * scenarios.json 等）一并清除；所有文件经工作区版本化写入（归档统一根 .versions，
-     * 版本簿记不因覆盖路径旁路而失真）。旧实现只取根级文件名，撤回会误删全部
-     * 子目录文件且不恢复（单文件时代遗留）。
+     * 互为逆操作）。旧实现只取根级文件名，撤回会误删全部子目录文件且不恢复
+     * （单文件时代遗留）；现为 [restoreWorkspaceFromFiles] 的保存区特化。
      */
     private suspend fun restoreWorkspaceFromSaved(gameId: Long) {
-        val root = editingWorkspaceDir(gameId)
+        val saved = repository.savedGameFilePaths(gameId).mapNotNull { rel ->
+            repository.loadGameFile(gameId, rel)?.let { rel to it }
+        }.toMap()
+        restoreWorkspaceFromFiles(saved)
+    }
+
+    /**
+     * 文件集整体覆盖编辑区工作区：以 [files] 键集为准——工作区中多余的游戏文件
+     * （未保存修改新增的 scenarios.json 等）一并清除；所有文件经工作区版本化写入
+     * （归档统一根 .versions，版本簿记不因覆盖路径旁路而失真）。撤销到上一交付
+     * 版本（.savepoint_prev 的文件快照）与回到保存区共用本路径。
+     */
+    private suspend fun restoreWorkspaceFromFiles(files: Map<String, String>) {
+        val root = editingWorkspaceDir(editingGameId ?: return)
         val workspace = GameFileWorkspace(root)
-        val savedPaths = repository.savedGameFilePaths(gameId).toSet()
+        val targetPaths = files.keys
         root.walkTopDown()
             .filter { it.isFile }
             .map { it.relativeTo(root).invariantSeparatorsPath }
@@ -1116,9 +1349,8 @@ class GameAgent(
                 rel != GameFileWorkspace.POINTER_FILE &&
                     !rel.startsWith(".versions/") && !rel.contains("/.versions/")
             }
-            .forEach { rel -> if (rel !in savedPaths) workspace.delete(rel) }
-        savedPaths.forEach { rel ->
-            val content = repository.loadGameFile(gameId, rel) ?: return@forEach
+            .forEach { rel -> if (rel !in targetPaths) workspace.delete(rel) }
+        files.forEach { (rel, content) ->
             val current = workspace.read(rel)
             when {
                 current == null -> workspace.writeInitial(rel, content)
@@ -1193,8 +1425,19 @@ class GameAgent(
                     reason = "确认门待确认期间的文本输入一律视为修正"
                 )
             } else {
-                _session.update { it.copy(agentStage = AgentStage.INTENT) }
-                classifyIntent(instruction, llm)
+                // 开发动词快速通道（仅已锚定游戏：dev 路由即 iterateDirect/修复快车道）：
+                // 明确修改动词开头的指令跳过二分类的 LLM 往返，每回合省 ~3 秒
+                val fastDev = hasAnchoredGame(s) && IntentLayer.devVerbFastPath(instruction)
+                if (fastDev) {
+                    IntentDecision(
+                        intent = IntentDecision.INTENT_DEV,
+                        confidence = 0.99,
+                        reason = "开发动词白名单快速通道（跳过意图分类调用）"
+                    )
+                } else {
+                    _session.update { it.copy(agentStage = AgentStage.INTENT) }
+                    classifyIntent(instruction, llm)
+                }
             }
             alog("intent=${intent.intent} conf=${intent.confidence} reason=${intent.reason}")
             currentCoroutineContext().ensureActive()
@@ -1322,10 +1565,11 @@ class GameAgent(
         }
     }
 
-    /** 意图层：正则优先，低置信度时用 Lite LLM 复核 new_feature / fix_bug / chat。 */
+    /** 意图层：LLM 单次判定 dev / chat（正则先行已删除——误判代价是整轮白跑或开发
+     *  请求被打发）。LLM 失败/低置信/不可解析时回落 dev：dev 误判成 chat 致命，
+     *  chat 误判成 dev 温和（多一轮识别即回退聊天）。 */
     private suspend fun classifyIntent(userText: String, llm: LlmClient): IntentDecision {
-        val local = IntentLayer.inferLocally(userText)
-        if (local.confidence >= 0.8) return local
+        _session.update { it.copy(agentStage = "意图识别中") }
         val reply = try {
             collectTextReply(
                 llm,
@@ -1339,7 +1583,8 @@ class GameAgent(
         } catch (_: Exception) {
             null
         }
-        return IntentLayer.parseLiteLlmReply(reply ?: "") ?: local
+        return IntentLayer.parseLiteLlmReply(reply ?: "")
+            ?: IntentLayer.fallback("意图识别 LLM 不可用或输出不可解析（reply=${reply?.take(60)}），按开发意图处理")
     }
 
     /** 会话是否已锚定一个游戏（有代码 / Game Schema / 设计稿 / 编辑中的已保存游戏）。 */
@@ -1472,20 +1717,22 @@ class GameAgent(
         // 对话——rolling summary 只描述游戏不描述聊天，缺它时多轮问答的第二问
         // 会丢失第一问的上下文。
         val summary = s.rollingSummary.takeIf { it.isNotBlank() }
-        val reply = try {
-            collectTextReply(
-                llm,
-                listOf(
-                    ChatMessage("system", GamePrompt.chatSystemPrompt(summary)),
-                    *chatHistoryMessages(s.messages),
-                    ChatMessage("user", instruction)
-                )
-            )
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            failTurn(LlmFailureClassifier.userMessage(e) ?: "回复失败，请重试。", internalDetail = "对话 LLM 调用失败：${e.message}")
-            return
+        val baseMessages = listOf(ChatMessage("system", GamePrompt.chatSystemPrompt(summary))) +
+            chatHistoryMessages(s.messages).toList() +
+            ChatMessage("user", instruction)
+        // 已锚定游戏的 chat 允许只读查阅工作区后作答（"计分逻辑在哪"需要读代码）；
+        // 只读硬保障双层：LLM 请求只带读类工具 spec + executor readOnly 拒绝一切写工具。
+        val reply = if (hasAnchoredGame(s)) {
+            chatReplyWithReadonlyTools(s, baseMessages, llm)
+        } else {
+            try {
+                collectTextReply(llm, baseMessages)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failTurn(LlmFailureClassifier.userMessage(e) ?: "回复失败，请重试。", internalDetail = "对话 LLM 调用失败：${e.message}")
+                return
+            }
         }
         val text = HtmlExtractor.nonCodeText(reply).ifBlank { "（空回复）" }
         val next = updateSession { s ->
@@ -1500,6 +1747,65 @@ class GameAgent(
             )
         }
         persistSessionMessages(next)
+    }
+
+    /** chat 只读工具循环的轮次上限：问答查询远比开发轻，超限强制收笔直接回答。 */
+    private val CHAT_TOOL_ROUNDS = 6
+
+    /**
+     * chat 会话的只读工具循环：最多 [CHAT_TOOL_ROUNDS] 轮 listfiles/readfile/grepfile/
+     * outline 查阅工作区，模型停止调用工具即以其正文作答；轮次用尽注入收笔指令。
+     * 阶段条与 dev 循环同款细粒度格式（第 N 轮 - 正在思考 / 工具 <参数>）。
+     */
+    private suspend fun chatReplyWithReadonlyTools(
+        s: GameSession,
+        baseMessages: List<ChatMessage>,
+        llm: LlmClient
+    ): String {
+        val workspace = GameFileWorkspace(gameWorkspaceDir())
+        seedWorkspace(workspace, s.currentHtml)
+        val executor = GameToolExecutor(workspace, readOnly = true)
+        val readToolSpecs = GameTools.specs().filter {
+            it.name in setOf(GameTools.LIST_FILES, GameTools.READ_FILE, GameTools.GREP_FILE, GameTools.OUTLINE)
+        }
+        val messages = (baseMessages + ChatMessage(
+            "user",
+            "（可选用只读工具查阅当前游戏工作区后再回答：listfiles 看清单、readfile 读内容、" +
+                "grepfile 搜内容、outline 看符号地图。禁止修改任何文件；无需查阅时直接回答。）"
+        )).toMutableList()
+        var round = 0
+        while (round < CHAT_TOOL_ROUNDS) {
+            round++
+            currentCoroutineContext().ensureActive()
+            _session.update { it.copy(agentStage = "第 $round 轮 - 正在思考") }
+            val resp = callLlm(llm, messages, readToolSpecs, stageLabel = "第 $round 轮 - 正在思考")
+            if (resp.toolCalls.isEmpty()) {
+                alog("chat reply: rounds=$round (readonly tools)")
+                return resp.text
+            }
+            messages += ChatMessage("assistant", resp.text, toolCalls = resp.toolCalls)
+            for (call in resp.toolCalls) {
+                currentCoroutineContext().ensureActive()
+                val targetPath = runCatching {
+                    (Json.parseToJsonElement(call.arguments.ifBlank { "{}" }) as? JsonObject)
+                        ?.get("path")?.let { el -> (el as? JsonPrimitive)?.content }
+                }.getOrNull()
+                _session.update {
+                    it.copy(agentStage = "第 $round 轮 - ${call.name}${targetPath?.let { p -> " <$p>" } ?: ""}")
+                }
+                val outcome = executor.execute(call)
+                alog("chat tool ${call.name}: ok=${outcome.ok} obs=${outcome.observation.take(160)}")
+                messages += ChatMessage(ChatMessage.ROLE_TOOL, outcome.observation, toolCallId = outcome.callId)
+            }
+        }
+        _session.update { it.copy(agentStage = "整理回答") }
+        val final = callLlm(
+            llm,
+            messages + ChatMessage("user", "（查询轮次已用完，请基于已获取的信息直接回答，不再调用工具。）"),
+            emptyList(),
+            stageLabel = "整理回答"
+        )
+        return final.text
     }
 
     /**
@@ -1698,7 +2004,11 @@ class GameAgent(
                 "游戏已按你的要求更新，并通过沙箱运行验证。点击「立即游玩」确认效果；如遇问题或想继续调整，随时告诉我。"
             }
         }
-        val assistantText = summaryBody + "（${RecentInstructionWindow.TURN_DELIVERED_MARK} ${accepted.rounds} 轮，耗时 ${formatAgentDuration(elapsedMs)}）"
+        // 交付版号：本次交付即第 N 版（旧会话从 0 起，首次交付为第 1 版）。
+        // 手动保存不计数；保存点在交付自动保存时冻结同号版号，撤销即回到该版。
+        val deliveredVersion = _session.value.deliveredVersion + 1
+        val assistantText = summaryBody +
+            "（第 $deliveredVersion 版 · ${RecentInstructionWindow.TURN_DELIVERED_MARK} ${accepted.rounds} 轮，耗时 ${formatAgentDuration(elapsedMs)}）"
         val summary = buildRollingSummary(plan, accepted.report, accepted.html)
         currentCoroutineContext().ensureActive()
         alog("turn reply: rounds=${accepted.rounds} elapsedMs=$elapsedMs")
@@ -1712,7 +2022,11 @@ class GameAgent(
                 error = null,
                 agentStage = AgentStage.DONE,
                 pendingConfirmation = null,
-                lastWarning = run {
+                lastWarning = if (accepted.metricsNote?.startsWith("软着陆交付") == true) {
+                    // 熔断保工作交付（salvageFusedTurn）：未走完整验收的事实必须对用户
+                    // 可见——区别于正常交付的"已通过自动检查"，提醒立即试玩确认。
+                    "收尾超时已自动保存：本轮修改未经完整验收，建议立即试玩确认效果。"
+                } else {
                     // UI 零技术细节：不给用户展示校验 warning 原文（DOM id/资源缺失等
                     // 是内部检查项，修复是 Agent 职责），只保留结果性提示。
                     "已通过自动检查，建议实际试玩确认效果。"
@@ -1720,6 +2034,7 @@ class GameAgent(
                 rollingSummary = summary,
                 fileManifest = workspace.manifest(),
                 designPlan = plan,
+                deliveredVersion = deliveredVersion,
                 knownIssues = accepted.report.warnings.map { "${it.category}:${it.message}" },
                 // 成功回合把"未消化的运行时错误"整体清空（lastError 与签名成对置空），
                 // 修复快车道判据不再被陈旧签名污染；快照滚动保留上限条防会话无限膨胀。
@@ -1734,6 +2049,17 @@ class GameAgent(
             )
         }
         persistSession(next)
+        // 交付后自动保存（方案 A，默认开）：仅已入库会话（game-<id>）——编辑区整体
+        // 覆盖保存区 + 冻结保存点，unsavedVersion 清零。草稿首存（命名/入库身份升级）
+        // 仍为手动；失败/中断回合不触发（未交付不固化）。内联等待而非 fire-and-forget：
+        // 保存完成先于回合结束，下一回合（或撤销）不会与保存并发读写工作区。
+        // 撤销语义随之变化：保存点每次交付都刷新，"撤销"= 回到上一交付（逐回合粒度）。
+        // 自动保存失败绝不失败回合（保存是交付的增强，不是交付的一部分）。
+        if (editingGameId != null && settingsRepository.settings.value.autoSaveOnDelivery) {
+            runCatching { saveCurrentGame(title = null) }
+                .onSuccess { alog("auto-save on delivery: games/$editingGameId 已同步（撤销锚点已刷新）") }
+                .onFailure { alog("auto-save on delivery 失败（交付不受影响）: ${it.message}") }
+        }
     }
 
     /**
@@ -1825,30 +2151,117 @@ class GameAgent(
         val smokeFailMsgIdx = mutableListOf<Int>()
         var readfileCalls = 0
         var sandboxAttempts = 0
+        // 健康度干预（累计侦查口径）：连续口径由失速跟踪器管辖（每 8 轮催促/24 轮熔断），
+        // 但"读一轮宣告一轮"的交错会重置连续计数——累计口径补这个盲区。
+        var readOnlyRounds = 0
+        var reconAdvisedOnce = false
+        // 侦查硬性上限的一次性标记（第 8 只读轮触发最后通牒，见循环内注释）
+        var reconUltimatumOnce = false
+        // 侦查占比总闸的一次性标记（累计口径，见循环内注释）：开局 advisory/ultimatum
+        // 只覆盖首改前（!mutatedOnce），连续口径又被写入轮穿插清零——锯齿形态的纯侦查
+        // 回合曾是四层防线的共同盲区。
+        var reconRatioAdvisedOnce = false
+        // 连续只读轮（连续口径；累计口径 readOnlyRounds 不随写入清零）：quiet 覆盖与
+        // 门禁宽限的触发信号——写入后即恢复正常计费/反馈策略。
+        var consecutiveReadOnly = 0
+        // 侦查工具门禁：ultimatum 被无视（宽限一轮后仍纯读）即从工具清单摘除读取类
+        // 工具并在执行层直接拒绝，直到发生一次写入。文本级 ultimatum 对弱指令跟随
+        // 模型约束力≈0（实测 20261003_201230 回合被无视 16 轮、48 次 grep 零落盘、
+        // 24 轮熔断全废）——机制门禁是唯一可靠干预。
+        var reconToolsGated = false
+        var reconUltimatumRound = 0
         // 已记录的 readfile 结果在消息历史中的下标：文件一旦被修改即失效，
         // 替换为过期提示——既防上下文膨胀（每读一次多几万 token 拷贝），
         // 也防模型拿旧拷贝当编辑依据导致 old_string 失配、浪费轮次。
         val readResultMarks = mutableListOf<Pair<Int, String>>()
+        // 整读结果的老化簿记（消息下标, 路径, 轮次）：整读全文常驻后续所有轮次，
+        // 每轮 prefill 复利变贵——超过 [FULL_READ_FOLD_AFTER_ROUNDS] 轮未被引用
+        // （未修改未重读）即折叠为指针（写入折叠只覆盖"文件变了"这一种失效）。
+        val fullReadAges = mutableListOf<Triple<Int, String, Int>>()
+
+        // editfile 失配风暴防线（实测 20260930_042436 回合 41 轮失配 83 次、成功仅 8）：
+        // 同轮并行 editfile 共享同一份文件快照，前一个改动使后面的 old_string 过期、
+        // 连锁失配——同文件后续编辑在本轮直接短路；跨轮连续 2 轮失配注入强制重读指令
+        // （模型拿"记忆中的代码"反复盲试，错误提示要求重读它不执行）。
+        var editMissRounds = 0
+
+        /**
+         * 熔断保工作软着陆（局部挂起函数，供三处熔断点共用）：本轮已发生成功写入
+         * （mutatedOnce）后的空转/宣告熔断不再整轮作废。背景：实测 20261001_200232
+         * 回合 27 个写入轮全部成功（28 处 editfile 落盘、每次写入的静态校验全过），
+         * 仅因收尾复核连续 24 轮纯读触发侦查熔断，"未交付不固化"使全部修改随下一次
+         * 撤销全部丢失（用户被迫从导出包的 .ww-workspace 镜像手工找回）。
+         *
+         * 策略：当前工作区经静态校验（与宣告验收同一裁决）无 error 即带警告交付——
+         * 走既有 Accepted 管道（syncWorkspaceToPublished + 摘要 + 交付自动保存：
+         * 修改固化进保存区、撤销锚点刷新），轻量冒烟结果附进警告与总结，"未走完整
+         * 验收"的事实如实告知用户。静态校验带 error（真带病，交付反而掩盖问题）或
+         * 入口缺失返回 null，由调用方走原失败路径；纯空转（从未写入，没有可保的
+         * 工作）同样返回 null——原"未推进/换模型"语义保持不变。
+         */
+        suspend fun salvageFusedTurn(fuseReason: String): GenOutcome.Accepted? {
+            if (!mutatedOnce) return null
+            val html = workspace.read(GameFileWorkspaceEntryPoint.DEFAULT) ?: run {
+                alog("salvage aborted: entry html missing")
+                return null
+            }
+            val report = GameValidator.validate(
+                GameBundle.inline(html) { rel -> workspaceRead(rel) },
+                allowedEngines,
+                localFileExists = { rel -> workspaceFileExists(rel) },
+                inlineView = true,
+                requireConfigContract = firstGeneration
+            )
+            if (report.hasErrors) {
+                alog("salvage aborted: ${report.errors.size} static errors")
+                return null
+            }
+            val lightSmoke = runCatching {
+                runSmokeTest(html, landscape = false, files = { rel -> workspaceRead(rel) }, light = true)
+            }.getOrNull()
+            val smokeErrs = lightSmoke?.errors
+                ?.filter { it.isNotBlank() && it != "smoke-timeout" && it != "冒烟测试超时" }
+                .orEmpty()
+                .take(5)
+            val warn = buildString {
+                append("收尾超时已自动保存全部修改：本轮未走完整验收")
+                if (smokeErrs.isNotEmpty()) append("，轻量检测有待确认项：").append(smokeErrs.joinToString("；").take(240))
+                append("。建议立即试玩确认效果。")
+            }
+            alog("salvage: fuse after writes -> deliver (rounds=$round, smokeErrs=${smokeErrs.size}) reason=$fuseReason")
+            _session.update { it.copy(lastWarning = warn) }
+            return GenOutcome.Accepted(
+                html,
+                "（系统提示：$warn 修改已保存为基础，请试玩验证；如有问题直接描述需求，我会在此基础上继续修复。）",
+                round,
+                report,
+                "软着陆交付：$fuseReason（本轮已有写入，跳过完整验收保工作）"
+            )
+        }
 
         while (true) {
             round++
             currentCoroutineContext().ensureActive()
-            val file = GameFileWorkspaceEntryPoint.DEFAULT
-            // 轮次动词按入口文件当前是否已存在判定（而非回合级 firstGeneration）：
-            // 同一回合内首次写入 index.html 之后的轮次都是 editfile 增量修改，应显示"正在修改"。
-            val fileExists = workspace.read(file) != null
-            val genStage = if (fileExists) {
-                "第 $round 轮 - 代码修改中（工具模式）：正在修改 $file"
-            } else {
-                "第 $round 轮 - 代码生成中（工具模式）：正在生成 $file"
-            }
-            _session.update { it.copy(agentStage = genStage) }
+            // 轮次进度同步进会话（停止键据此报告"第 x 轮处中断"并支持续跑）
+            _session.update { it.copy(currentTurnRounds = round) }
+            // 轮次回显：思考期只标"正在思考"（流式阶段条自动追加"已接收 N 字符"→
+            // "第 N 轮 - 正在思考 已接收 xxx 字符"）；具体读写哪个文件由工具行的
+            // "工具 <参数>"呈现——不在此预填文件名（历史缺陷：恒定显示 index.html，
+            // 实际在改 js/main.js 时误导用户）。
+            val genStage = "第 $round 轮 - 正在思考"
+            // 长回合用户可见性（阶段条允许轮次计数）：轮次已多时向用户显式交出
+            // "随时停止"的决策依据——停止键一直显示已运行时长，这里补轮次维度。
+            val stageLabelFull = if (round >= LONG_TURN_ROUNDS) "$genStage（本轮已 $round 轮，可随时停止）" else genStage
+            _session.update { it.copy(agentStage = stageLabelFull) }
 
             // 修复态轮次选择：修复轮全程 + 失败反馈/自检轮之后的那个回合用关思考客户端
             //（定位+小编辑为主，思考轮 3~4 倍时延在此性价比最低）；其余回合尊重用户思考开关。
             if (quietRound && round > 1) alog("quiet round (thinking off)")
+            // 侦查门禁期只提供写入类工具：读取既不可能被调用（specs 缺席），
+            // 幻觉调用也会在执行层被拒（双保险见下方执行分支）。
+            val roundTools = if (reconToolsGated) GameTools.writeOnlySpecs() else GameTools.specs()
             val resp = try {
-                callLlm(if (quietRound) llmQuiet else llm, messages, GameTools.specs(), stageLabel = genStage)
+                callLlm(if (quietRound) llmQuiet else llm, messages, roundTools, stageLabel = genStage)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -2025,12 +2438,16 @@ class GameAgent(
                                     // （修改文件/修改断言并说明理由/再空转即终止），第 3 次熔断。
                                     // 实测该病理曾 6 连空转烧 184k 字符分析文本（08:40 回合），
                                     // 同签名升级提示与 24 轮无修改熔断均接不住。
-                                    when (val stall = stallTracker.noteDeclarationRejected()) {
-                                        is StallAction.Fuse -> {
-                                            alog("declaration-stall fuse: ${stall.internalReason}")
-                                            failTurn(USER_MSG_CHANGE_MODEL, internalDetail = stall.internalReason)
-                                            return GenOutcome.Failed
-                                        }
+                    when (val stall = stallTracker.noteDeclarationRejected()) {
+                        is StallAction.Fuse -> {
+                            alog("declaration-stall fuse: ${stall.internalReason}")
+                            // 静态校验能过的工作区保工作交付（运行时错误进警告）；
+                            // 校验也带病则维持原失败——宣告熔断的典型场景是
+                            // "验证失败而不行动"，带 error 的版本交付无意义。
+                            salvageFusedTurn(stall.internalReason)?.let { return it }
+                            failTurn(USER_MSG_CHANGE_MODEL, internalDetail = stall.internalReason)
+                            return GenOutcome.Failed
+                        }
                                         is StallAction.Steer -> {
                                             alog("declaration-stall steer: x${stall.count}")
                                             _session.update { it.copy(agentStage = "校验中：连续宣告未通过，正在要求落盘修改") }
@@ -2079,11 +2496,14 @@ class GameAgent(
                                     appendEscalation(messages, maxRepeat, "沙箱运行", stubbornDetail)
                                     // 失败反馈附工作区清单：模型不必再用 listfiles 探测状态
                                     // （实测一次死循环回合里 31 个 listfiles 轮全是这类信息补全）。
+                                    // 改动摘要（vs 回合起点）：帮模型区分"存量 bug"与
+                                    // "本轮自己引入的回归"——实测删弹窗回合大改 index.html 后
+                                    // 布局断言失败，模型却在 main.js 里继续找原因。
                                     val manifestNote = runCatching {
                                         "；当前工作区：" + workspace.manifest().files
                                             .joinToString("、") { it.path }
                                             .take(240)
-                                    }.getOrDefault("")
+                                    }.getOrDefault("") + executor.turnChangeSummary()
                                     val scenarioHint = when {
                                         // 断言错位定向指令（连败 ≥ 阈值）：多次修改无效时大概率断言与
                                         // 游戏设计错位而非实现 bug——把"盲调参数"压缩为一轮三选一决策
@@ -2229,6 +2649,7 @@ class GameAgent(
                     when (val stall = stallTracker.noteDeclarationRejected()) {
                         is StallAction.Fuse -> {
                             alog("declaration-stall fuse (static): ${stall.internalReason}")
+                            salvageFusedTurn(stall.internalReason)?.let { return it }
                             failTurn(USER_MSG_CHANGE_MODEL, internalDetail = stall.internalReason)
                             return GenOutcome.Failed
                         }
@@ -2276,11 +2697,68 @@ class GameAgent(
             // 必须是连续无工具（readfile 一轮夹在两次纯文本之间不算）。
             messages += ChatMessage("assistant", resp.text, toolCalls = resp.toolCalls)
             var mutatedThisRound = false
+            // 同轮内已失配的文件集合：并行 editfile 共享同一快照，前面的失配说明模型
+            // 对该文件现状的认知已过期，同轮后续对该文件的编辑没有执行意义。
+            val failedEditPaths = mutableSetOf<String>()
+            var editMissThisRound = false
+            var editOkThisRound = false
             for (call in resp.toolCalls) {
                 currentCoroutineContext().ensureActive()
-                _session.update { it.copy(agentStage = "工具执行中：${call.name}") }
-                val outcome = executor.execute(call)
+                // 细粒度回显：阶段条带轮次与工具目标（path 参数），读工具显示目标文件、
+                // 写工具完成后短暂显示"已写入 xxx"——用户看得见 Agent 在读哪/改哪，
+                // 而不是一串匿名的"工具执行中：readfile"。
+                val targetPath = runCatching {
+                    (Json.parseToJsonElement(call.arguments.ifBlank { "{}" }) as? JsonObject)
+                        ?.get("path")?.let { el -> (el as? JsonPrimitive)?.content }
+                }.getOrNull()
+                _session.update {
+                    it.copy(agentStage = "第 $round 轮 - ${call.name}${targetPath?.let { p -> " <$p>" } ?: ""}")
+                }
+                val outcome = when {
+                    // 侦查门禁的执行层兜底：specs 已摘除读取类工具，但模型仍可能幻觉
+                    // 调用（不读 specs 的名字照发）——直接拒绝，不执行。
+                    reconToolsGated && call.name in GameTools.READ_TOOL_NAMES -> {
+                        alog("recon gate: reject ${call.name} #${call.id}")
+                        ToolOutcome(
+                            callId = call.id,
+                            name = call.name,
+                            ok = false,
+                            mutated = false,
+                            html = null,
+                            report = null,
+                            observation = "（侦查门禁：读取类工具已停用——侦查超限且仍未落盘。请基于上下文中已有的" +
+                                "定位结果与文件地图直接执行 editfile/writefile 完成修改；信息确实不足时按最接近的理解" +
+                                "做最小修改并交付，验证反馈会指出偏差。发生一次写入后读取类工具立即恢复。）"
+                        )
+                    }
+                    call.name == GameTools.EDIT_FILE && targetPath != null && targetPath in failedEditPaths -> {
+                        alog("editfile short-circuit: $targetPath 前序同轮编辑已失配，跳过 #${call.id}")
+                        ToolOutcome(
+                            callId = call.id,
+                            name = call.name,
+                            ok = false,
+                            mutated = false,
+                            html = null,
+                            report = null,
+                            observation = "本轮前序 editfile 对 $targetPath 已失配（文件内容与你的上下文不一致），" +
+                                "本次编辑已跳过。请下一轮先 readfile $targetPath 目标区段（或按失配回传的最相近候选修正 old_string），" +
+                                "再基于当前原文重新编辑。",
+                            path = targetPath,
+                            editMiss = true
+                        )
+                    }
+                    else -> executor.execute(call)
+                }
                 if (outcome.name == GameTools.READ_FILE) readfileCalls++
+                if (outcome.ok && outcome.workspaceTouched && outcome.path != null) {
+                    _session.update { it.copy(agentStage = "第 $round 轮 - 已写入 <${outcome.path}>") }
+                }
+                if (outcome.editMiss) {
+                    editMissThisRound = true
+                    failedEditPaths += outcome.path ?: GameFileWorkspaceEntryPoint.DEFAULT
+                }
+                if (outcome.name == GameTools.EDIT_FILE && outcome.ok) editOkThisRound = true
+
                 // 空转计数看"是否写入过任何文件"（含 scenarios.json 与 js/css 辅助文件）；
                 // currentHtml 发布只由入口文件（index.html）变更触发——辅助文件内容不是
                 // HTML，发布会顶掉可玩版本；读结果过期按写入路径精确进行（见循环末尾）。
@@ -2304,6 +2782,31 @@ class GameAgent(
                 )
                 if (outcome.ok && outcome.name == GameTools.READ_FILE) {
                     readResultMarks += messages.lastIndex to (outcome.path ?: GameFileWorkspaceEntryPoint.DEFAULT)
+                    if (outcome.fullRead) {
+                        fullReadAges += Triple(messages.lastIndex, outcome.path ?: GameFileWorkspaceEntryPoint.DEFAULT, round)
+                    }
+                }
+                // 陈旧整读折叠：整读全文在历史里躺超过 N 轮（未修改未重读）即折叠为
+                // 指针——80K 字符全文常驻会让后续每轮 prefill 复利变贵；折叠同时解除
+                // 执行器的整读去重标记（否则再整读只回"上文已有"的空指针）。
+                if (fullReadAges.isNotEmpty()) {
+                    val aged = fullReadAges.filter { round - it.third >= FULL_READ_FOLD_AFTER_ROUNDS }
+                    if (aged.isNotEmpty()) {
+                        for ((i, p, _) in aged) {
+                            if (i < messages.size) {
+                                messages[i] = ChatMessage(
+                                    ChatMessage.ROLE_TOOL,
+                                    "（此文件早前的整读全文已折叠以控制上下文。文件此后未变更；" +
+                                        "如需原文请重新 readfile（整读或按行号切片）。）",
+                                    toolCallId = messages[i].toolCallId
+                                )
+                            }
+                        }
+                        aged.forEach { executor.releaseFullRead(it.second) }
+                        readResultMarks.removeAll(readResultMarks.filter { m -> aged.any { it.first == m.first } })
+                        fullReadAges.removeAll(aged)
+                        alog("folded ${aged.size} stale full-read result(s) at round $round")
+                    }
                 }
                 // 写入让同路径的历史 readfile 结果过期：折叠为提示，避免历史里堆积
                 // 多份完整文件拷贝（上下文膨胀）并误导后续 old_string。按路径精确过期——
@@ -2319,14 +2822,98 @@ class GameAgent(
                             )
                         }
                         readResultMarks.removeAll(expired)
+                        // 同一消息的整读老化簿记一并出簿（内容已被上面替换为过期指针）
+                        fullReadAges.removeAll(fullReadAges.filter { a -> expired.any { it.first == a.first } })
                     }
                 }
             }
             lastReport?.takeIf { it.hasErrors }?.let { recordKnownErrors(it) }
             // 轮次结局分类（Mutated/Recon）交由失速跟踪器统一裁决：侦查空转沿用
             // 24 轮熔断 + 每 8 轮催促；任何写入同时清零被驳回宣告链（行动即出狱）。
+            if (!mutatedThisRound) readOnlyRounds++
+            // 侦查占比干预（累计口径，一次性）：连续口径被"读取轮与宣告轮交错"重置时，
+            // 整回合仍可能在纯侦查——实测删弹窗回合开局 11 轮纯读（约 4.5 分钟）才
+            // 做第一次修改，期间的 8 轮催促被模型无视后没有任何更早的干预。
+            if (!reconAdvisedOnce && readOnlyRounds >= 5 && !mutatedOnce) {
+                reconAdvisedOnce = true
+                alog("recon advisory at round $round (read-only $readOnlyRounds rounds)")
+                messages += ChatMessage(
+                    "user",
+                    "（侦查提醒：已 $readOnlyRounds 轮只读未做任何修改，每轮都是一次完整的模型往返。" +
+                        "定位请优先 grepfile（按符号名/元素 id/文案搜索，一轮即得文件与行号）或参照上下文中的" +
+                        "文件地图，readfile 只取目标区段——不要为定位而通读大文件；拿到目标即可给出最小修改并执行。）"
+                )
+            }
+            // 侦查硬性上限（一次性，第 8 轮起）：失速跟踪器每 8 轮的常规催促语气太软，
+            // 实测 20261003_003854 回合被无视后模型继续纯读到第 16 轮（约 5 分钟）才动手。
+            // 达到阈值即下最后通牒：要么立即写入，要么用 outline 一轮拿地图后下一轮必须写入。
+            if (!reconUltimatumOnce && readOnlyRounds >= 8 && !mutatedOnce) {
+                reconUltimatumOnce = true
+                reconUltimatumRound = round
+                alog("recon ultimatum at round $round (read-only $readOnlyRounds rounds)")
+                _session.update { it.copy(agentStage = "代码生成中：侦查超限，要求立即落盘修改") }
+                messages += ChatMessage(
+                    "user",
+                    "（侦查超限：已连续 $readOnlyRounds 轮只读、本回合零修改。从下一轮起禁止再发起纯读取轮——" +
+                        "基于已掌握的信息直接执行 editfile/writefile 完成修改；仅当定位仍完全不明确时，" +
+                        "允许用 outline 拿一次符号地图，再下一轮必须写入。再出现纯读取轮，读取类工具将被停用直至写入。" +
+                        "信息足够好就动手，细节可在验证反馈中迭代。）"
+                )
+            }
+            // 侦查占比总闸（累计口径，一次性）：开局干预只覆盖首改前，连续口径被"写入轮
+            // 穿插"反复清零——实测 123 轮回合以"读 10 轮→改 1 轮→再读 15 轮"的锯齿
+            // 形态穿过全部防线自然跑完（20260930_205005，26.5 分钟）。累计占比是最后
+            // 闸门：轮数已多且只读占大头时，要求此后每轮必须携带写入。
+            if (!reconRatioAdvisedOnce && mutatedOnce && round > 30 && readOnlyRounds * 10 > round * 7) {
+                reconRatioAdvisedOnce = true
+                alog("recon ratio advisory at round $round (read-only $readOnlyRounds/$round)")
+                _session.update { it.copy(agentStage = "代码生成中：侦查占比过高，要求收敛落盘") }
+                messages += ChatMessage(
+                    "user",
+                    "（侦查占比超限：本回合已 $round 轮，其中 $readOnlyRounds 轮只读未修改，每轮都是一次完整的模型往返。" +
+                        "从下一轮起每轮必须至少包含一次 writefile/editfile 落盘——定位就用手头信息与上下文文件地图，" +
+                        "不足时 outline 一轮补齐；再出现纯读取轮将按当前进度强制收笔交付。）"
+                )
+            }
+            // 侦查工具门禁激活（一次性）：ultimatum 发出后宽限一轮（对齐其"允许 outline
+            // 一次"的措辞），再出现纯读取轮即摘除读取类工具。激活与恢复都在轮末判定：
+            // 任何写入立即恢复读取——门禁惩罚的是"拒绝落盘的纯侦查"，不惩罚正常流程。
+            if (!reconToolsGated && reconUltimatumOnce && round > reconUltimatumRound &&
+                !mutatedOnce && !mutatedThisRound
+            ) {
+                reconToolsGated = true
+                alog("recon gate ON at round $round (ultimatum at $reconUltimatumRound defied)")
+                _session.update { it.copy(agentStage = "代码生成中：侦查超限，读取工具已停用直至落盘") }
+                messages += ChatMessage(
+                    "user",
+                    "（侦查门禁已生效：侦查超限后仍未落盘，读取类工具（grepfile/readfile/listfiles/outline）已被停用。" +
+                        "请立即基于上下文中已有的定位结果执行 editfile/writefile；信息确实不足时按最接近的理解做最小修改并交付，" +
+                        "验证反馈会指出偏差。发生一次写入后读取类工具自动恢复。）"
+                )
+            }
+            // 连续只读口径维护（写入清零；累计口径 readOnlyRounds 只增不减）+ 门禁恢复
+            if (mutatedThisRound) {
+                consecutiveReadOnly = 0
+                if (reconToolsGated) {
+                    reconToolsGated = false
+                    alog("recon gate OFF at round $round (write occurred, read tools restored)")
+                }
+            } else {
+                consecutiveReadOnly++
+            }
+            // 挣扎时恢复思考：quiet 的性价比前提是"机械轮"（有明确错误文本的修复/反馈
+            // 轮），连续只读的开放侦查恰是需要思考判断"信息是否足够"的轮次——无思考
+            // 的侦查退化为反射式工具变体（实测 20261003_201230 回合全程 quiet，24 轮
+            // grep 零落盘）。连续只读达阈值即关 quiet；写入后每轮的 quiet 基线重置照旧。
+            if (quietRound && consecutiveReadOnly >= QUIET_STRUGGLE_ROUNDS) {
+                quietRound = false
+                alog("quiet off: struggling recon ($consecutiveReadOnly consecutive read-only rounds), thinking restored")
+            }
             when (val stall = stallTracker.noteToolRound(mutated = mutatedThisRound)) {
                 is StallAction.Fuse -> {
+                    // 已有写入的侦查熔断先尝试保工作交付（见 salvageFusedTurn 注释）；
+                    // 纯空转（从未写入）维持原硬失败。
+                    salvageFusedTurn(stall.internalReason)?.let { return it }
                     failTurn(USER_MSG_CHANGE_MODEL, internalDetail = stall.internalReason)
                     return GenOutcome.Failed
                 }
@@ -2336,9 +2923,37 @@ class GameAgent(
                             agentStage = "代码生成中：已连续 ${stall.count} 轮没有文件修改，正在催促模型落盘"
                         )
                     }
-                    messages += ChatMessage("user", "已连续 ${stall.count} 轮没有文件修改。请直接完成 writefile / editfile 修改，或停止调用工具并输出最终总结。")
+                    messages += ChatMessage(
+                        "user",
+                        if (mutatedOnce)
+                            "已连续 ${stall.count} 轮没有文件修改。本轮此前的修改均已写入保存、不会丢失。" +
+                                "若需求已达成，请立即停止调用工具并输出最终总结结束本轮（继续纯读复核会被强制收笔保存）；" +
+                                "只有确需继续修改时才再读取文件。"
+                        else
+                            "已连续 ${stall.count} 轮没有文件修改。请直接完成 writefile / editfile 修改，或停止调用工具并输出最终总结。"
+                    )
                 }
                 StallAction.None -> {}
+            }
+
+            // 跨轮失配计数：本轮有成功编辑即出狱；连续 2 轮失配注入强制重读指令
+            //（实测模型对"请先 readfile"的普通错误提示不执行，需用户级消息打断盲试循环；
+            // 阈值 3→2：20261003_003854 回合里 100% 相似候选提示被连续无视 3 轮才转向，
+            // 白烧约 2 分钟——第 2 轮即打断）。
+            if (editOkThisRound) editMissRounds = 0
+            else if (editMissThisRound) {
+                editMissRounds++
+                if (editMissRounds >= 2) {
+                    alog("edit-miss steer: $editMissRounds consecutive rounds")
+                    _session.update { it.copy(agentStage = "代码生成中：连续失配，要求先重读目标文件") }
+                    messages += ChatMessage(
+                        "user",
+                        "（连续 $editMissRounds 轮 editfile 失配：你引用的代码与文件现状不一致——" +
+                            "多为缩进/空白差异、或本轮早前的修改已改变了该区域。请先 readfile 目标区段拿到当前原文，" +
+                            "或直接采用失配回传里的最相近候选作为 old_string 修正后重试；不要再凭记忆盲试。）"
+                    )
+                    editMissRounds = 0
+                }
             }
 
             // 中途轻量冒烟（2026-09）：写作期不盲写——NaN/引用类灾难从"首次宣告才发现"
@@ -2513,6 +3128,7 @@ class GameAgent(
 
         while (true) {
             round++
+            _session.update { it.copy(currentTurnRounds = round) }
             // 兼容模式每轮都是整文件再生成（最贵路径），必须有硬上限：
             // 超限如实失败并保留最新候选版本，不做带错交付。
             if (round > LEGACY_MAX_ROUNDS) {
@@ -2623,6 +3239,12 @@ class GameAgent(
                 append("【上一轮遗留问题（未解决，本轮最优先处理）】\n$leftovers\n\n")
             }
             append("游戏工作区已有 index.html，最新内容请通过 readfile 获取（上下文中的代码可能已过期）。\n\n")
+            // 工作区文件地图（确定性符号索引）：开局即可见"哪个函数/元素在哪个文件哪行"，
+            // 定位类任务（删按钮/改文案/找 boot 逻辑）不再需要多轮 readfile 通读侦查。
+            WorkspaceMap.render(workspaceFilesView())?.let {
+                append(it)
+                append("\n\n")
+            }
         }
         // 知名游戏忠实度规则先于指令：对标的理解由 LLM 按指令原话自行完成，
         // 但"它实际怎么玩就做什么"的纪律必须显式注入，防通用清单把它拉偏。
@@ -2685,6 +3307,12 @@ class GameAgent(
     /** 当前会话工作区的辅助文件读取器（路径守卫在 GameFileWorkspace.resolve 内）。 */
     fun workspaceRead(rel: String): String? =
         runCatching { GameFileWorkspace(gameWorkspaceDir()).read(rel) }.getOrNull()
+
+    /** 当前工作区全量视图（相对路径 → 内容；供文件地图等确定性派生，读取失败静默为空）。 */
+    private fun workspaceFilesView(): Map<String, String> = runCatching {
+        val ws = GameFileWorkspace(gameWorkspaceDir())
+        ws.manifest().files.mapNotNull { f -> ws.read(f.path)?.let { f.path to it } }.toMap()
+    }.getOrDefault(emptyMap())
 
     /** 当前会话工作区是否存在某文件（多文件契约的存在性裁决）。 */
     private fun workspaceFileExists(rel: String): Boolean =
@@ -3140,9 +3768,20 @@ class GameAgent(
             _session.update { it.copy(streamPreview = preview) }
         }
         try {
-            return llm.streamChat(
+            // 慢轮观测（实测两天 90 个 ≥120s 慢轮、TOP 672s，且均为小响应轮——需要
+            // 区分"首 token 前等待"（网关排队/静默重试）与"首 token 后慢流"（超长思考）：
+            // 首 token 延迟大 = 网关侧问题；首 token 快但总时长大 = 模型思考/输出长）。
+            val callStartAt = android.os.SystemClock.elapsedRealtime()
+            var firstSignalAt = 0L
+            fun markFirstSignal() { if (firstSignalAt == 0L) firstSignalAt = android.os.SystemClock.elapsedRealtime() }
+            // 输入侧度量（本轮 prefill 规模）：消息正文 + 历史工具调用参数——效率审计
+            // 的缺口此前只在输出侧（text/thinking/toolArgs），"整读折叠/失配短路省了
+            // 多少上下文"无法量化，全靠 totalMs 间接推断。
+            val promptChars = messages.sumOf { it.content.length.toLong() + it.toolCalls.sumOf { c -> c.arguments.length.toLong() } }
+            val response = llm.streamChat(
                 messages = messages,
                 onDelta = { delta ->
+                    markFirstSignal()
                     sb.append(delta)
                     if (stageLabel != null && textReceived() - lastProgressMark >= 200) {
                         lastProgressMark = textReceived()
@@ -3153,6 +3792,7 @@ class GameAgent(
                     pumpPreview()
                 },
                 onThinking = { thinking ->
+                    markFirstSignal()
                     thinkingSb.append(thinking)
                     if (stageLabel != null && textReceived() - lastProgressMark >= 200) {
                         lastProgressMark = textReceived()
@@ -3165,9 +3805,18 @@ class GameAgent(
                 onToolCallDelta = { chars ->
                     // 参数字节只作预览后备信号（纯工具轮的活性），不进"已接收字符"计数
                     toolArgChars += chars
+                    markFirstSignal()
                     pumpPreview()
                 }
             )
+            val totalMs = android.os.SystemClock.elapsedRealtime() - callStartAt
+            val firstMs = if (firstSignalAt > 0) firstSignalAt - callStartAt else -1L
+            alog(
+                "llm stats: total=${totalMs}ms firstSignal=${firstMs}ms " +
+                    "text=${sb.length}B thinking=${thinkingSb.length}B toolArgs=${toolArgChars}B " +
+                    "promptChars=$promptChars msgs=${messages.size} stage=${stageLabel ?: "-"}"
+            )
+            return response
         } catch (e: CancellationException) {
             if (salvageHtmlOnCancel) {
                 // 兼容模式的代码生成流被停止键中断时，抢救未收完的 HTML，
@@ -3204,7 +3853,20 @@ class GameAgent(
     }
 
     private fun saveGlobalErrorSignatures(list: List<KnownError>) {
-        runCatching { errorLibraryFile().writeText(sessionJson.encodeToString(list), Charsets.UTF_8) }
+        runCatching {
+            // 合并写入（防档案清空）：会话 knownErrors 不再从全局库播种，若沿用整表
+            // 覆盖，新会话的第一个错误就会把全局档案覆写成仅 1 条。同签名取累计次数
+            // 较大者（会话内计数与库内计数互不吞并），超上限按次数优先淘汰。
+            val bySignature = loadGlobalErrorSignatures().associateBy { it.signature } +
+                list.associateBy { it.signature }
+            val merged = bySignature.values.groupBy { it.signature }.map { (_, group) ->
+                group.reduce { a, b -> if (a.occurrences >= b.occurrences) a else b }
+            }
+            val capped = if (merged.size > RetryBookkeeping.MAX_ENTRIES) {
+                merged.sortedByDescending { it.occurrences }.take(RetryBookkeeping.MAX_ENTRIES)
+            } else merged
+            errorLibraryFile().writeText(sessionJson.encodeToString(capped), Charsets.UTF_8)
+        }
     }
 
     private fun decodeSession(persisted: String?): GameSession {

@@ -45,6 +45,17 @@ class GameRepository(private val context: Context) {
         /** 保存点目录名（保存时冻结的上下文快照，撤销锚点）。 */
         const val SAVEPOINT_DIR = ".savepoint"
 
+        /**
+         * 上一版保存点目录名（保存时由旧保存点轮转而来，附上一版文件快照）：
+         * 交付自动保存模式下"撤销到上一版本"从这里恢复——单保存点会被每次
+         * 交付刷新成当前版，撤销目标与当前版相同即恒为无操作（实测失效）。
+         * prev 槽同样随游戏删除顺带删除；撤销成功后晋升为当前保存点（单步撤销）。
+         */
+        const val SAVEPOINT_PREV_DIR = ".savepoint_prev"
+
+        /** 保存点内的文件快照子目录（prev 槽专用：上一版游戏文件全量副本）。 */
+        const val SAVEPOINT_FILES_DIR = "files"
+
         /** 版本化归档目录名（与 GameFileWorkspace 的 .versions 约定一致）。 */
         const val VERSIONS_DIR = ".versions"
 
@@ -149,19 +160,21 @@ class GameRepository(private val context: Context) {
         title: String,
         description: String,
         files: Map<String, String>,
-        session: List<ChatMessage>
+        session: List<ChatMessage>,
+        deliveredVersion: Int = 0
     ): GameMeta = withContext(Dispatchers.IO) {
         writeMutex.withLock {
             val id = System.currentTimeMillis()
             val dir = File(gamesDir, id.toString()).apply { mkdirs() }
             writeGameFilesLocked(dir, files)
-            File(dir, "session.json").writeText(json.encodeToString(session), Charsets.UTF_8)
+            atomicWriteText(File(dir, "session.json"), json.encodeToString(session))
             val meta = GameMeta(
                 id = id,
                 title = title,
                 description = description,
                 createdAt = id,
-                updatedAt = id
+                updatedAt = id,
+                deliveredVersion = deliveredVersion
             )
             val idx = readIndex()
             writeIndex(GameIndex(idx.games + meta))
@@ -178,20 +191,26 @@ class GameRepository(private val context: Context) {
         gameId: Long,
         files: Map<String, String>,
         session: List<ChatMessage>,
-        title: String? = null
+        title: String? = null,
+        deliveredVersion: Int? = null
     ) {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
                 val dir = File(gamesDir, gameId.toString())
                 if (!dir.exists()) return@withLock
                 writeGameFilesLocked(dir, files)
-                File(dir, "session.json").writeText(json.encodeToString(session), Charsets.UTF_8)
+                atomicWriteText(File(dir, "session.json"), json.encodeToString(session))
                 val idx = readIndex()
                 writeIndex(
                     GameIndex(
                         idx.games.map {
                             if (it.id == gameId) {
-                                it.copy(updatedAt = System.currentTimeMillis(), title = title ?: it.title)
+                                it.copy(
+                                    updatedAt = System.currentTimeMillis(),
+                                    title = title ?: it.title,
+                                    // 版号随保存固化进索引（null=保持原值：改名等不触碰版本的路径）
+                                    deliveredVersion = deliveredVersion ?: it.deliveredVersion
+                                )
                             } else {
                                 it
                             }
@@ -221,7 +240,7 @@ class GameRepository(private val context: Context) {
             }
             val f = File(dir, name)
             f.parentFile?.mkdirs()
-            f.writeText(content, Charsets.UTF_8)
+            atomicWriteText(f, content)
         }
         cleanupLegacyVersionArtifactsLocked(dir)
         mirrorDeleteLocked(dir, files)
@@ -236,7 +255,8 @@ class GameRepository(private val context: Context) {
                     val rel = f.relativeTo(dir).invariantSeparatorsPath
                     val exempt = rel == "session.json" || rel == "agent_state.json" ||
                         rel == USER_CONFIG_FILE ||
-                        rel.startsWith("$SAVEPOINT_DIR/") || rel.startsWith("$LOG_DIR/")
+                        rel.startsWith("$SAVEPOINT_DIR/") || rel.startsWith("$SAVEPOINT_PREV_DIR/") ||
+                        rel.startsWith("$LOG_DIR/")
                     if (!exempt && rel !in files) f.delete()
                 }
             // 清空后的孤儿目录（如 js/ 被整个删光）一并移除
@@ -268,7 +288,7 @@ class GameRepository(private val context: Context) {
             writeMutex.withLock {
                 val dir = File(gamesDir, gameId.toString())
                 if (!dir.exists()) return@withLock
-                File(dir, "session.json").writeText(json.encodeToString(session), Charsets.UTF_8)
+                atomicWriteText(File(dir, "session.json"), json.encodeToString(session))
             }
         }
     }
@@ -316,7 +336,8 @@ class GameRepository(private val context: Context) {
             .filter { rel ->
                 rel != "session.json" && rel != "agent_state.json" && rel != USER_CONFIG_FILE &&
                     rel != POINTER_FILE && !rel.endsWith(".sha256") &&
-                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$VERSIONS_DIR/") &&
+                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$SAVEPOINT_PREV_DIR/") &&
+                    !rel.startsWith("$VERSIONS_DIR/") &&
                     !rel.startsWith("$LOG_DIR/")
             }
             .associateWith { rel -> File(dir, rel).readText(Charsets.UTF_8) }
@@ -332,7 +353,7 @@ class GameRepository(private val context: Context) {
             writeMutex.withLock {
                 val dir = File(gamesDir, gameId.toString())
                 if (dir.exists()) {
-                    File(dir, "agent_state.json").writeText(stateJson, Charsets.UTF_8)
+                    atomicWriteText(File(dir, "agent_state.json"), stateJson)
                 }
             }
         }
@@ -370,7 +391,7 @@ class GameRepository(private val context: Context) {
             writeMutex.withLock {
                 val dir = File(gamesDir, gameId.toString())
                 if (!dir.exists()) return@withLock false
-                File(dir, USER_CONFIG_FILE).writeText(trimmed, Charsets.UTF_8)
+                atomicWriteText(File(dir, USER_CONFIG_FILE), trimmed)
                 true
             }
         }
@@ -395,8 +416,8 @@ class GameRepository(private val context: Context) {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
                 val dir = savepointDir(gameId).apply { mkdirs() }
-                File(dir, "session.json").writeText(json.encodeToString(session), Charsets.UTF_8)
-                File(dir, "agent_state.json").writeText(agentStateJson, Charsets.UTF_8)
+                atomicWriteText(File(dir, "session.json"), json.encodeToString(session))
+                atomicWriteText(File(dir, "agent_state.json"), agentStateJson)
             }
         }
     }
@@ -407,8 +428,81 @@ class GameRepository(private val context: Context) {
     }
 
     suspend fun loadSavepointAgentState(gameId: Long): String? = withContext(Dispatchers.IO) {
-        val f = File(savepointDir(gameId), "agent_state.json")
+        val f = File(savepointDir(gameId), AGENT_STATE_FILE)
         if (f.isFile) f.readText(Charsets.UTF_8) else null
+    }
+
+    // ---------- 上一版保存点（.savepoint_prev：撤销到上一版本的锚点） ----------
+
+    private fun savepointPrevDir(gameId: Long): File =
+        File(File(gamesDir, gameId.toString()), SAVEPOINT_PREV_DIR)
+
+    /**
+     * 旧保存点轮转为上一版锚点（saveCurrentGame 在覆盖保存区【之后】、写新保存点
+     * 【之前】调用）：现有 .savepoint 整体改名为 .savepoint_prev，并把 [prevFiles]
+     * （覆盖前的保存区文件 = 上一交付版本全量）快照进 prev 槽的 files/ 子目录——
+     * 撤销"回到上一版本"需要的不只是会话，还有上一版的文件本体（单保存点方案里
+     * 保存点随每次交付刷新为当前版，撤销目标与当前版相同即恒为无操作）。
+     * 无既有保存点（首次入库）时 prev 槽只含文件快照、无会话成员——撤销按
+     * "无上一版"处理（loadPrevSavepointAgentState 返回 null）。
+     */
+    suspend fun rotateSavepointToPrev(gameId: Long, prevFiles: Map<String, String>) {
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                runCatching {
+                    val prev = savepointPrevDir(gameId)
+                    if (prev.exists()) prev.deleteRecursively()
+                    val cur = savepointDir(gameId)
+                    if (cur.exists()) cur.renameTo(prev) else prev.mkdirs()
+                    val filesDir = File(prev, SAVEPOINT_FILES_DIR)
+                    if (prevFiles.isNotEmpty()) filesDir.mkdirs()
+                    prevFiles.forEach { (rel, content) ->
+                        val target = File(filesDir, rel)
+                        target.parentFile?.mkdirs()
+                        atomicWriteText(target, content)
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun loadPrevSavepointSession(gameId: Long): List<ChatMessage>? = withContext(Dispatchers.IO) {
+        val f = File(savepointPrevDir(gameId), SESSION_FILE)
+        if (f.isFile) decodeOrEmpty(f).takeIf { it.isNotEmpty() } else null
+    }
+
+    suspend fun loadPrevSavepointAgentState(gameId: Long): String? = withContext(Dispatchers.IO) {
+        val f = File(savepointPrevDir(gameId), AGENT_STATE_FILE)
+        if (f.isFile) f.readText(Charsets.UTF_8) else null
+    }
+
+    /** 上一版锚点的文件快照（rel → 内容）；prev 槽缺失或无快照返回空Map。 */
+    suspend fun loadPrevSavepointFiles(gameId: Long): Map<String, String> = withContext(Dispatchers.IO) {
+        val filesDir = File(savepointPrevDir(gameId), SAVEPOINT_FILES_DIR)
+        if (!filesDir.isDirectory) return@withContext emptyMap()
+        filesDir.walkTopDown()
+            .filter { it.isFile }
+            .map { it.relativeTo(filesDir).invariantSeparatorsPath to it.readText(Charsets.UTF_8) }
+            .toMap()
+    }
+
+    /**
+     * 撤销成功后 prev 槽晋升为当前保存点（单步撤销语义）：撤销后系统三处一致
+     * （工作区 = 保存区 = 会话 = 上一版），当前锚点即上一版本身；下一次交付保存
+     * 会再次轮转出新的 prev。晋升后 prev 槽消失——连续第二次撤销按"无可撤销"处理。
+     */
+    suspend fun promotePrevSavepoint(gameId: Long) {
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                runCatching {
+                    val prev = savepointPrevDir(gameId)
+                    if (!prev.exists()) return@runCatching
+                    val cur = savepointDir(gameId)
+                    if (cur.exists()) cur.deleteRecursively()
+                    prev.renameTo(cur)
+                }
+            }
+        }
     }
 
     suspend fun deleteGame(gameId: Long) {
@@ -564,7 +658,9 @@ class GameRepository(private val context: Context) {
             SESSION_FILE to { b: ByteArray -> isSessionBytes(b) },
             AGENT_STATE_FILE to { b: ByteArray -> isAgentStateBytes(b) },
             "$SAVEPOINT_DIR/$SESSION_FILE" to { b: ByteArray -> isSessionBytes(b) },
-            "$SAVEPOINT_DIR/$AGENT_STATE_FILE" to { b: ByteArray -> isAgentStateBytes(b) }
+            "$SAVEPOINT_DIR/$AGENT_STATE_FILE" to { b: ByteArray -> isAgentStateBytes(b) },
+            "$SAVEPOINT_PREV_DIR/$SESSION_FILE" to { b: ByteArray -> isSessionBytes(b) },
+            "$SAVEPOINT_PREV_DIR/$AGENT_STATE_FILE" to { b: ByteArray -> isAgentStateBytes(b) }
         ).forEach { (name, valid) ->
             val bytes = result[name]
             if (bytes != null && !valid(bytes)) {
@@ -651,7 +747,19 @@ class GameRepository(private val context: Context) {
                             lastModified = f.lastModified()
                         )
                     }
-                    ?.sortedWith(compareByDescending<GameFileEntry> { it.isDirectory }.thenBy { it.name })
+                    ?.let { entries ->
+                        // log 目录按文件名逆序（新的在前——log 文件名是时间戳，正序会把
+                        // 最新的 Agent 回合压到列表底部）；其余目录保持名称正序的浏览习惯。
+                        if (relativePath.trimEnd('/') == LOG_DIR) {
+                            entries.sortedWith(
+                                compareByDescending<GameFileEntry> { it.isDirectory }.thenByDescending { it.name }
+                            )
+                        } else {
+                            entries.sortedWith(
+                                compareByDescending<GameFileEntry> { it.isDirectory }.thenBy { it.name }
+                            )
+                        }
+                    }
                     ?: emptyList()
             }.getOrDefault(emptyList())
         }
@@ -753,6 +861,7 @@ class GameRepository(private val context: Context) {
                     rel != "session.json" && rel != "agent_state.json" && rel != USER_CONFIG_FILE &&
                     !rel.startsWith("$VERSIONS_DIR/") && !rel.contains("/$VERSIONS_DIR/") &&
                     !rel.startsWith("$SAVEPOINT_DIR/") && !rel.contains("/$SAVEPOINT_DIR/") &&
+                    !rel.startsWith("$SAVEPOINT_PREV_DIR/") && !rel.contains("/$SAVEPOINT_PREV_DIR/") &&
                     !rel.startsWith("$LOG_DIR/") && !rel.contains("/$LOG_DIR/")
             }
             .sorted()
@@ -777,8 +886,8 @@ class GameRepository(private val context: Context) {
     suspend fun saveDraft(html: String, session: List<ChatMessage>) {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
-                File(draftsDir, "latest.html").writeText(html, Charsets.UTF_8)
-                File(draftsDir, "session.json").writeText(json.encodeToString(session), Charsets.UTF_8)
+                atomicWriteText(File(draftsDir, "latest.html"), html)
+                atomicWriteText(File(draftsDir, "session.json"), json.encodeToString(session))
                 cleanupLegacyVersionArtifactsLocked(draftsDir)
             }
         }
@@ -787,7 +896,7 @@ class GameRepository(private val context: Context) {
     suspend fun saveDraftSessionOnly(session: List<ChatMessage>) {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
-                File(draftsDir, "session.json").writeText(json.encodeToString(session), Charsets.UTF_8)
+                atomicWriteText(File(draftsDir, "session.json"), json.encodeToString(session))
             }
         }
     }
@@ -795,7 +904,7 @@ class GameRepository(private val context: Context) {
     suspend fun saveDraftAgentState(stateJson: String) {
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
-                File(draftsDir, "agent_state.json").writeText(stateJson, Charsets.UTF_8)
+                atomicWriteText(File(draftsDir, "agent_state.json"), stateJson)
             }
         }
     }
@@ -827,6 +936,9 @@ class GameRepository(private val context: Context) {
      */
     private val unsavedFlagRegex = Regex("\"unsavedVersion\"\\s*:\\s*true")
 
+    /** 中断续跑态探测（agent_state.json 里 resumableTurn 非 null 即 `"resumableTurn":{`）。 */
+    private val resumableFlagRegex = Regex("\"resumableTurn\"\\s*:\\s*\\{")
+
     suspend fun hasDraftUnsaved(): Boolean = withContext(Dispatchers.IO) {
         File(draftsDir, "agent_state.json")
             .takeIf { it.exists() }?.readText(Charsets.UTF_8)
@@ -839,6 +951,22 @@ class GameRepository(private val context: Context) {
                 val id = dir.name.toLongOrNull() ?: return@mapNotNull null
                 val state = File(dir, "agent_state.json")
                 if (state.exists() && unsavedFlagRegex.containsMatchIn(state.readText(Charsets.UTF_8))) id else null
+            }
+            ?.toSet() ?: emptySet()
+    }
+
+    /**
+     * 存在"停止中断的未交付修改"的游戏（冷启动扫描 agent_state.json）：
+     * resumableTurn 非 null（explicitNulls=false 序列化下 null 字段缺席，
+     * 出现 `"resumableTurn":{` 即中断态）。首页卡片据此显示「第 N+ 版」角标；
+     * hub 装载会话后可由 runState 的中断维度实时接管。
+     */
+    suspend fun listInterruptedGameIds(): Set<Long> = withContext(Dispatchers.IO) {
+        gamesDir.listFiles { f -> f.isDirectory }
+            ?.mapNotNull { dir ->
+                val id = dir.name.toLongOrNull() ?: return@mapNotNull null
+                val state = File(dir, "agent_state.json")
+                if (state.exists() && resumableFlagRegex.containsMatchIn(state.readText(Charsets.UTF_8))) id else null
             }
             ?.toSet() ?: emptySet()
     }
@@ -906,6 +1034,31 @@ class GameRepository(private val context: Context) {
     }
 
     private fun writeIndex(idx: GameIndex) {
-        indexFile.writeText(json.encodeToString(idx), Charsets.UTF_8)
+        atomicWriteText(indexFile, json.encodeToString(idx))
+    }
+
+    /**
+     * 原子文本写入（tmp + rename）：覆盖类写入先写同目录临时文件再改名落位——
+     * 进程在写入中途被杀时，目标文件要么是完整旧版、要么是完整新版，绝不出现
+     * 半截文件（撕裂 JSON / 半截 js）。自动保存（交付即入库）把保存区写入频率
+     * 从"玩家手动"提高到"每回合交付"，撕裂窗口必须先于自动保存消除。
+     * rename 失败（占用/文件系统边缘）退化为先删后改名，再不行回退直接写——
+     * 与旧行为等价，不因原子化引入新的失败面。
+     */
+    private fun atomicWriteText(file: File, text: String) {
+        val tmp = File(file.parentFile, file.name + ".tmp")
+        runCatching {
+            tmp.writeText(text, Charsets.UTF_8)
+            if (!tmp.renameTo(file)) {
+                file.delete()
+                if (!tmp.renameTo(file)) {
+                    tmp.delete()
+                    file.writeText(text, Charsets.UTF_8)
+                }
+            }
+        }.onFailure {
+            runCatching { tmp.delete() }
+            file.writeText(text, Charsets.UTF_8)
+        }
     }
 }

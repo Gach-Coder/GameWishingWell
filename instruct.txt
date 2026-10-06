@@ -100,6 +100,17 @@ log 标为 Agent 日志文件夹）、
 		  （GameAgent.boundGameId）：仅首次保存（未命名草稿）弹命名对话框（默认名=会话首条
 		  用户消息前 20 字）；会话已绑定已命名游戏则直接覆盖保持原名。改名入口只在首页
 		  卡片菜单（此前对话页保存无条件弹命名框，改进已命名游戏也被要求重命名）。
+		  交付后自动保存（方案 A，2026-10-01 落地，设置页开关"交付后自动保存"默认开）：
+		  已入库会话（game-<id>）的每个成功回合交付后自动执行保存——编辑区整体覆盖保存区 +
+		  冻结保存点 + unsavedVersion 清零（内联等待于回合协程内，先于回合结束，与下回合/撤销
+		  无并发；失败 runCatching 不连带回合失败）。草稿首存（命名/入库身份升级）仍手动；
+		  失败/中断回合不触发（未交付不固化）。撤销语义随之变化：保存点每次交付都刷新，
+		  "撤销"=回到上一交付（逐回合粒度，确认对话框文案随开关切换）。关闭开关恢复纯手动。
+		  保存链路原子化（前置工程，GameRepository.atomicWriteText）：全部覆盖类写入
+		  （游戏文件/session/agent_state/savepoint/草稿簿记/索引/user_config）改为
+		  tmp+rename——进程死在写入中途时文件要么完整旧版要么完整新版，消灭撕裂文件
+		  （自动保存把保存区写入频率从手动提高到每回合交付，撕裂窗口必须先消除；
+		  rename 失败退化为先删后改名，再不行回退直接写，与旧行为等价）。
 		- 成品可保存到本地游戏库，每个游戏对应一个文件夹。
 3. “设置”页面可选择 LLM 厂商模型并配置 API Key：
    DeepSeek / Kimi (Moonshot) / OpenAI / Anthropic Claude / 智谱 GLM / 小米 MiMo / MiniMax / OpenRouter / 自定义，
@@ -235,7 +246,27 @@ Agent处理message流程如下：
 	→ Agent Loop：（bug 修复轮数不设上限，多轮属正常；仅无进展与运行验证环境异常两类非修复性退出；
 	  输出零截断：不携带 max_tokens、工具观察与消息全量透传；网络层超时（连接30s/读静默12min/写60s）是死连接探测器
 	  而非 LLM 时长限制——只要流上有字节就永不触发，触发后走自动重试不截断输出；整体时长不设限，停止键是用户侧唯一主动中断）
-		主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/writefile/appendfile/editfile，沙箱严格限游戏工作区目录）
+		主路径为工具模式（ReAct 循环）：LLM 请求携带 tools（listfiles/readfile/grepfile/writefile/appendfile/editfile，沙箱严格限游戏工作区目录）
+		效率与确定性加固（2026-10-01 落地，源于"删一个开始弹窗耗时 35 分钟"事故复盘）：
+		- grepfile 工具：工作区内容搜索（正则/文本，返回 文件:行号:匹配行，上限 200 行；非法正则退回文本匹配）
+		  ——定位类任务（找函数/元素 id/文案在哪）从多轮 readfile 切片通读压缩为一轮搜索；
+		- 工作区文件地图（WorkspaceMap，确定性零 LLM）：修改轮上下文注入"符号→行号"索引
+		  （js 函数/window.X 模块/入口元素 id，≥400 行文件才注入，每文件 50 符号上限）——
+		  开局即可见结构，配合 grepfile 消灭"11 轮纯读侦查"；
+		- 删除残留检查（GameStaticCheck.danglingReferenceViolations，写入时刻致命拦截）：
+		  写入使某标识符在工作区内声明消失仍有裸引用（'use strict' 下赋值同样抛 ReferenceError）
+		  即拒绝不落盘并点名 文件:行——bashQ 事故（删系统漏删重置赋值，两个回合后引爆）从源头拦截；
+		  声明收集跨文件全局视角（var 多声明/函数形参/catch/for/window.X=），引用扫描剥离注释与字符串；
+		- 大幅删除咨询（非硬门）：单文件相对回合起点删除非空行 ≥30% 且未授权重做时，成功写入的
+		  观察附"⚠ 大幅删除提醒"——行相似度护栏拦不住"删一半留一半"（实测 index.html 被削 48% 仍过 0.35 门）；
+		- 沙箱失败反馈附本轮改动摘要（executor.turnChangeSummary）：各文件 +N/-M 行 vs 回合起点，
+		  并提示"新问题大概率出在删改最多的文件"——帮模型区分存量 bug 与本轮自引入回归；
+		- 回合健康度干预：累计口径侦查提醒（5 轮只读未修改一次性注入"用 grepfile 定位，别通读"——
+		  补失速跟踪器连续口径被"读一轮宣告一轮"交错重置的盲区）；轮次 ≥15 起阶段条附
+		  "（本轮已 N 轮，可随时停止）"；
+		- 意图层防误判（GameIntent）：dev 动词匹配前剔除否定窗口（"禁止文件改动"的"改"不再命中）；
+		  元问题特征（为什么/多久/难度在哪+问号）命中时置信降 0.7 强制 Lite 复核——
+		  "纯聊天回复禁止文件改动：…为什么半个小时无法完成？"曾被判 dev 0.9 短路复核直入 Agent Loop。
 		多文件组织为工具模式默认工作方式：首生成先列文件计划（index.html 骨架引用 + css/style.css + js/config.js、
 		  js/<系统>.js、js/main.js 按依赖顺序），同一轮并行 writefile 建立（先写被引用文件、最后写入口——
 		  入口校验即时核对引用存在性）；跨文件经全局命名空间协作（普通 script，无 ES module）；
@@ -551,8 +582,13 @@ Agent处理message流程如下：
 		  writeGameFilesLocked 对模型写入的同名文件拒收防通道冒用；导出/导入 zip 随保存区整体往返；
 		  仓库 writeUserConfig 写入前校验为 JSON 对象，坏 JSON 一律拒绝落盘——注入管道只消费合法
 		  JSON，该文件永远不把游戏页面弄挂）。
-		  入口与生效：游戏页设置面板"参数调整"（仅运行区 source=game 且游戏定义了 GAME_CONFIG 时
-		  显示；预览/草稿不注入——编辑区版本与保存区参数空间不同步）。编辑器为直列模式
+		  入口与生效（2026-09-29 菜单迁移）：「参数调整」与「清除存档」入口在首页游戏卡片菜单
+		  （参数调整=共享直列编辑器 ConfigEditorDialog 首页打开，HomeViewModel 装载保存区参数表
+		  （与游戏页同管道：内联合并→GAME_CONFIG 提取→注释/覆盖盖顶）、保存写 user_config——
+		  首页无活动页面不重载，下次进游戏注入生效；清除存档=确认框→路由 game?clearSave=true→
+		  游戏页首次 onPageFinished 清 ww:save 并整页重载（一次性 flag 自清防重入））；
+		  游戏页设置面板已移除这两项，仅保留音量/自定义设置项/重新游戏（预览态另有保存游戏）。
+		  编辑器为直列模式
 		  （2026-09-29 改版，取代两栏检测式/JSON 文本编辑）：进页即列全部参数——每行"名称（等宽）+
 		  行尾注释 + 当前生效值"（GameConfigContract.buildParamList：默认表按声明序展开、玩家覆盖
 		  盖顶为生效值、只存在于覆盖中的自定义键追加末尾，ConfigParam 行数据）；点任意行内联展开
@@ -566,6 +602,17 @@ Agent处理message流程如下：
 		  关闭不保存即维持原值。沙箱验收不注覆盖——断言回归基准始终是 AI 交付的默认参数，
 		  玩家极端参数不污染 Agent 回合。旧游戏无 GAME_CONFIG 时入口不显示，可对话让 AI 一次性
 		  把参数外置后即获得该能力。
+		游戏自定义设置项 WW_SETTINGS（2026-09-29 落地，Agent 对话可增删游戏内设置选项）：
+		  契约：游戏在 js/config.js 的 GAME_CONFIG 之后声明 window.WW_SETTINGS = [
+		    { "key": "参数键", "label": "显示名", "type": "toggle"|"choice", "options": [候选值...] }]——
+		    key 必须是 GAME_CONFIG 已有参数键；toggle=布尔开关，choice=候选值数组（JSON 标量）。
+		  平台侧（GameConfigContract.extractSettings，括号配对+规范化解析，缺 key 条目跳过）：
+		    GameViewModel.gameSettings 流装载合并视图声明，游戏页设置面板渲染"游戏设置"区——
+		    toggle=Switch 开关、choice=候选 TextButton（当前生效值高亮，覆盖优先）；玩家更改即
+		    saveUserConfigChanges 写参数覆盖并整页重载生效（游戏逻辑读 GAME_CONFIG[key] 消费）。
+		  生成侧（GamePrompt 参数外置契约第 10 条附款 + game_template.html 示范）：用户要求
+		    "设置页增加/删除某选项"即增删 WW_SETTINGS 条目——新选项必须同时在 GAME_CONFIG 建键
+		    并让游戏逻辑真正消费该值（只加声明不接逻辑=无效选项）。
 		参数外置契约·修复轮维护（2026-09-28 落地，写入时刻执行层强制 + 上下文注入）：
 		  - 写入护栏（GameStaticCheck.configContractViolations，GameTools 写 js/入口时预检、
 		    违规致命拒绝且不落盘，与模块导出契约同族；参与条件=回合起点工作区已定义 GAME_CONFIG
@@ -719,7 +766,7 @@ GameWishingWell/
       │  │     ├─ WishwellApp.kt            # NavHost / 底部导航 / 路由表
       │  │     ├─ Theme.kt                  # 亮色/暗色 Material3 主题
       │  │     ├─ Container.kt              # 从 Application 获取容器
-		      │  │     ├─ home/HomeScreen.kt        # 我的游戏页（卡片动效运行标识：会话 Agent Loop 运行中显示旋转 logo + 阶段）；草稿卡菜单：文件夹/删除（与成品游戏卡同款）
+		      │  │     ├─ home/HomeScreen.kt        # 我的游戏页（卡片动效运行标识：会话 Agent Loop 运行中显示旋转 logo + 阶段）；草稿卡菜单：文件夹/删除（与成品游戏卡同款）；游戏卡菜单：继续编辑/参数调整（共享直列编辑器）/清除存档（确认后路由 clearSave 进游戏清档重载）/重命名/文件夹/导出zip/删除
       │  │     ├─ chat/ChatScreen.kt        # 创作/编辑对话页
       │  │     ├─ game/GameScreen.kt        # WebView 游戏运行页（横板游戏按 Game Schema 请求横屏，退出恢复；沉浸式全屏见下；每游戏独立子域假 origin 加载——ww:save 进度存档的隔离与跨重启持久化；设置面板含"参数调整"入口——user_config.json 运行时覆盖，见参数外置与玩家调参）
       │  │     ├─ files/FileBrowserScreen.kt # 文件可视系统：文件夹逐级浏览（games/<id> 与草稿 drafts/）+ 文件只读查看器（长按选中复制、顶栏“导出文件”SAF 另存完整内容）

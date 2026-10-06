@@ -130,6 +130,34 @@ class GameConfigContractTest {
     }
 
     @Test
+    fun `WW_SETTINGS 提取-开关与选项`() {
+        val html = """
+            <html><script>
+            window.GAME_CONFIG = { "difficulty": "普通", "autoAim": true, "speed": 3 };
+            Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});
+            window.WW_SETTINGS = [
+              { "key": "difficulty", "label": "难度", "type": "choice", "options": ["简单", "普通", "困难"] },
+              { "key": "autoAim", "type": "toggle" },   // label 缺省用 key
+              { "label": "无key跳过" }
+            ];
+            </script></html>
+        """.trimIndent()
+        assertTrue(GameConfigContract.hasSettingsSchema(html))
+        val settings = GameConfigContract.extractSettings(html)!!
+        assertEquals(2, settings.size)
+        assertEquals("difficulty", settings[0].key)
+        assertEquals("难度", settings[0].label)
+        assertEquals("choice", settings[0].type)
+        assertEquals(3, settings[0].options.size)
+        assertEquals("autoAim", settings[1].key)        // label 缺省
+        assertEquals("toggle", settings[1].type)
+        assertTrue(settings[1].options.isEmpty())
+        // 无声明 → null
+        assertNull(GameConfigContract.extractSettings("<html><script>var a=1;</script></html>"))
+        assertFalse(GameConfigContract.hasSettingsSchema("<html></html>"))
+    }
+
+    @Test
     fun `宽松值解析-数字布尔数组按JSON-其余按字符串`() {
         assertEquals("260", (GameConfigContract.parseValueOrString("260") as kotlinx.serialization.json.JsonPrimitive).content)
         assertEquals("true", (GameConfigContract.parseValueOrString("true") as kotlinx.serialization.json.JsonPrimitive).content)

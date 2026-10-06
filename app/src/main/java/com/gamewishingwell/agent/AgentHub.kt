@@ -141,6 +141,11 @@ class AgentHub(
             gameUnsaved = agents.entries.mapNotNull { (key, agent) ->
                 if (!agent.session.value.unsavedVersion) return@mapNotNull null
                 key.removePrefix("game-").toLongOrNull()
+            }.toSet(),
+            // 中断续跑态（停止时工作区有未交付修改）：卡片「第 N+ 版」角标的实时来源
+            gameInterrupted = agents.entries.mapNotNull { (key, agent) ->
+                if (agent.session.value.resumableTurn == null) return@mapNotNull null
+                key.removePrefix("game-").toLongOrNull()
             }.toSet()
         )
     }
@@ -169,5 +174,7 @@ data class SessionRunState(
     val draftStage: String? = null,
     val gameStages: Map<Long, String> = emptyMap(),
     val draftUnsaved: Boolean = false,
-    val gameUnsaved: Set<Long> = emptySet()
+    val gameUnsaved: Set<Long> = emptySet(),
+    /** 存在停止中断的未交付修改（resumableTurn 非 null）的游戏：卡片「第 N+ 版」角标。 */
+    val gameInterrupted: Set<Long> = emptySet()
 )

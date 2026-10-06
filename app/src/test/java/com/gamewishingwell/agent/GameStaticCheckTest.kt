@@ -208,4 +208,90 @@ var v = CFG.speed + CFG.hp;
         val commented = startView() + ("js/main.js" to MAIN_JS + "\n// 修 CFG.critRate 的注释")
         assertTrue(GameStaticCheck.configContractViolations(commented, startView()) { false }.isEmpty())
     }
+
+    // ---------- 删除残留检查（声明消失 → 全工作区裸引用扫描） ----------
+
+    @Test
+    fun `声明收集-多声明列表-函数形参-window模块`() {
+        val src = """
+'use strict';
+var a = 1, b, c = f(x);
+let d = { m: 1 }, e;
+function g(p, q = 2){ var inner; }
+try {} catch (err) {}
+for (k of [1,2]) {}
+window.M = (function(){ return {}; })();
+""".trimIndent()
+        val names = GameStaticCheck.declaredNames(src)
+        assertTrue("实际收集：$names", names.containsAll(setOf("a", "b", "c", "d", "e", "g", "p", "q", "inner", "err", "k", "M")))
+    }
+
+    @Test
+    fun `删除残留-bashQ事故形态被点名`() {
+        // 事故最小复现：起点声明了 var bashQ，写入删掉声明、重置函数里仍留裸赋值
+        val start = mapOf(
+            "js/main.js" to "'use strict';\nvar bashQ = null;\nfunction newGame(){ bashQ = null; }\nfunction boot(){ newGame(); }"
+        )
+        val after = mapOf(
+            "js/main.js" to "'use strict';\nfunction newGame(){ bashQ = null; }\nfunction boot(){ newGame(); }"
+        )
+        val v = GameStaticCheck.danglingReferenceViolations(after, start)
+        assertEquals(1, v.size)
+        assertTrue(v.first().contains("bashQ"))
+        assertTrue("应点名引用位置 js/main.js:2", v.first().contains("js/main.js:2"))
+    }
+
+    @Test
+    fun `删除残留-引用一并清除则放行`() {
+        val start = mapOf(
+            "js/main.js" to "'use strict';\nvar bashQ = null;\nfunction newGame(){ bashQ = null; }\nfunction boot(){ newGame(); }"
+        )
+        val after = mapOf(
+            "js/main.js" to "'use strict';\nfunction newGame(){ }\nfunction boot(){ newGame(); }"
+        )
+        assertTrue(GameStaticCheck.danglingReferenceViolations(after, start).isEmpty())
+    }
+
+    @Test
+    fun `删除残留-注释与字符串里的同名不算引用`() {
+        val start = mapOf(
+            "js/main.js" to "'use strict';\nvar bashQ = null;\nfunction f(){ bashQ = null; }"
+        )
+        val after = mapOf(
+            "js/main.js" to "'use strict';\nfunction f(){ }\n// bashQ 已删除\nvar s = 'bashQ 残留？';"
+        )
+        assertTrue(GameStaticCheck.danglingReferenceViolations(after, start).isEmpty())
+    }
+
+    @Test
+    fun `删除残留-属性访问与对象键不算引用`() {
+        val start = mapOf(
+            "js/main.js" to "'use strict';\nvar bashQ = null;\nfunction f(){ bashQ = null; }"
+        )
+        // obj.bashQ 属性访问与 { bashQ: 1 } 对象键均合法，不构成 ReferenceError
+        val after = mapOf(
+            "js/main.js" to "'use strict';\nvar o = { bashQ: 1 };\nfunction f(){ var x = o.bashQ; }"
+        )
+        assertTrue(GameStaticCheck.danglingReferenceViolations(after, start).isEmpty())
+    }
+
+    @Test
+    fun `删除残留-跨文件声明仍在则放行`() {
+        // plain script 共享全局：声明搬去另一文件不算删除
+        val start = mapOf(
+            "js/a.js" to "var bashQ = null;\nfunction f(){ bashQ = null; }"
+        )
+        val after = mapOf(
+            "js/a.js" to "function f(){ bashQ = null; }",
+            "js/b.js" to "var bashQ = null;"
+        )
+        assertTrue(GameStaticCheck.danglingReferenceViolations(after, start).isEmpty())
+    }
+
+    @Test
+    fun `删除残留-起点为空不参与`() {
+        // 首次生成轮：起点快照为空，自然无"声明消失"
+        val after = mapOf("js/main.js" to "'use strict';\nfunction f(){ bashQ = null; }")
+        assertTrue(GameStaticCheck.danglingReferenceViolations(after, emptyMap()).isEmpty())
+    }
 }

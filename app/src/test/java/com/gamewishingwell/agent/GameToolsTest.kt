@@ -451,19 +451,29 @@ class GameToolsTest {
     fun `readfile 支持行区间`() = runBlocking {
         val (ws, dir) = newWorkspace()
         val executor = GameToolExecutor(ws)
-        // 大文件（超整读阈值）才保留真正的切片语义。
-        val big = (1..GameTools.WHOLE_READ_MAX_LINES + 5).joinToString("\n") { "l$it" }
-        ws.writeInitial("index.html", big)
+        // 超大文件（超出放宽后的整读预算）才保留真正的切片语义。
+        val hugeN = GameTools.WHOLE_READ_MAX_LINES_LARGE + 10
+        val huge = (1..hugeN).joinToString("\n") { "l$it" }
+        ws.writeInitial("index.html", huge)
         val full = executor.execute(call(GameTools.READ_FILE, "{}"))
-        assertTrue(full.observation.contains("共 ${GameTools.WHOLE_READ_MAX_LINES + 5} 行"))
+        assertTrue(full.observation.contains("共 ${hugeN} 行"))
         assertTrue(full.observation.contains("l1"))
         val slice = executor.execute(call(GameTools.READ_FILE, """{"start_line":2,"end_line":3}"""))
         assertTrue(slice.ok)
         assertTrue(slice.observation.contains("第 2-3 行"))
         assertTrue(slice.observation.contains("l2"))
         assertTrue(slice.observation.contains("l3"))
-        assertFalse(slice.observation.contains("l${GameTools.WHOLE_READ_MAX_LINES + 5}\n"))
-        dir.deleteRecursively()
+        assertFalse(slice.observation.contains("l$hugeN\n"))
+        assertTrue("超大文件切片应附定位提示", slice.observation.contains("outline"))
+        // 行数超小阈值但在放宽预算内（行多内容小）的文件：切片请求仍整读（省往返）。
+        val (ws2, dir2) = newWorkspace()
+        val executor2 = GameToolExecutor(ws2)
+        val wide = (1..GameTools.WHOLE_READ_MAX_LINES + 5).joinToString("\n") { "w$it" }
+        ws2.writeInitial("index.html", wide)
+        val relaxed = executor2.execute(call(GameTools.READ_FILE, """{"start_line":2,"end_line":3}"""))
+        assertTrue(relaxed.ok)
+        assertTrue("预算内大文件切片应被整读放宽", relaxed.observation.contains("已直接返回全文"))
+        dir.deleteRecursively(); dir2.deleteRecursively()
         Unit
     }
 
@@ -499,6 +509,305 @@ class GameToolsTest {
         val again = executor.execute(call(GameTools.APPEND_FILE, """{"content":"\n<script>var b = 2;</script>"}"""))
         assertTrue(again.ok)
         assertTrue(ws.read("index.html")!!.contains("var b = 2;"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    // ---------- grepfile（定位专用读取工具） ----------
+
+    @Test
+    fun `grepfile 正则与文本命中文件行号`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        ws.writeInitial("js/main.js", "var menuEl = null;\nfunction boot() {\n  startMenu();\n}\nfunction startMenu(){\n  // 开始游戏弹窗\n}")
+        ws.writeInitial("index.html", "<div id=\"menu\">开始游戏</div>")
+        // 文本命中两个文件，带行号（js/main.js 第 1 行 menuEl + index.html 第 1 行 id="menu"）
+        val out1 = executor.execute(call(GameTools.GREP_FILE, """{"pattern":"menu"}"""))
+        assertTrue(out1.ok)
+        assertTrue("grep输出：${out1.observation.take(300)}", out1.observation.contains("js/main.js"))
+        assertTrue(out1.observation.contains("index.html"))
+        assertTrue(out1.observation.contains("1: var menuEl = null;"))
+        // path 限定单文件 + 中文文案
+        val out2 = executor.execute(call(GameTools.GREP_FILE, """{"pattern":"开始游戏","path":"index.html"}"""))
+        assertTrue(out2.ok)
+        assertTrue(out2.observation.contains("1:"))
+        assertFalse(out2.observation.contains("js/main.js"))
+        // 无命中如实反馈
+        val out3 = executor.execute(call(GameTools.GREP_FILE, """{"pattern":"不存在的东西"}"""))
+        assertTrue(out3.ok)
+        assertTrue(out3.observation.contains("未命中"))
+        // 非法正则退回普通文本匹配
+        val out4 = executor.execute(call(GameTools.GREP_FILE, """{"pattern":"boot("}"""))
+        assertTrue(out4.ok)
+        assertTrue(out4.observation.contains("2: function boot() {"))
+        // 正常正则按正则语义匹配（raw string 单反斜杠即 JSON 转义，解码为 \s）
+        val out5 = executor.execute(call(GameTools.GREP_FILE, """{"pattern":"function\\s+boot"}"""))
+        assertTrue(out5.ok)
+        assertTrue(out5.observation.contains("2: function boot() {"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    // ---------- 删除残留预检（写入时刻致命拦截） ----------
+
+    @Test
+    fun `editfile 删除声明留裸引用被致命拒绝且不落盘`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val start = "'use strict';\nvar bashQ = null;\nfunction newGame(){ bashQ = null; }\nfunction boot(){ newGame(); }"
+        val executor = GameToolExecutor(ws, turnStartSnapshot = mapOf("js/main.js" to start))
+        ws.writeInitial("js/main.js", start)
+        // 多行 old_string 经 Json.encodeToString 编码（raw string 内 \\n 不构成换行转义）
+        val out = executor.execute(
+            call(GameTools.EDIT_FILE, """{"path":"js/main.js","old_string":${Json.encodeToString("var bashQ = null;\n")},"new_string":""}""")
+        )
+        assertFalse(out.ok)
+        assertTrue(out.observation.contains("删除残留"))
+        assertTrue(out.observation.contains("bashQ"))
+        assertEquals("致命拒绝不得落盘", start, ws.read("js/main.js"))
+        // 声明与引用一并删除则放行
+        val okOut = executor.execute(
+            call(
+                GameTools.EDIT_FILE,
+                """{"path":"js/main.js","old_string":${Json.encodeToString("var bashQ = null;\nfunction newGame(){ bashQ = null; }")},"new_string":"function newGame(){ }"}"""
+            )
+        )
+        assertTrue(okOut.ok)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    // ---------- 大幅删除咨询信号（非硬门） ----------
+
+    @Test
+    fun `大幅删除触发咨询但写入仍成功`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        // 20 个非空行起点；删掉 8 行（40%）——行相似度 2*12/(20+12)=0.75 仍过 0.35 硬门
+        val origin = (1..20).joinToString("\n") { "line$it keep" }
+        val cut = (13..20).joinToString("\n") { "line$it keep" }
+        val executor = GameToolExecutor(ws, turnStartSnapshot = mapOf("index.html" to origin))
+        ws.writeInitial("index.html", origin)
+        val out = executor.execute(
+            call(GameTools.EDIT_FILE, """{"old_string":${Json.encodeToString(cut)},"new_string":""}""")
+        )
+        assertTrue("编辑结果：${out.observation.take(300)}", out.ok)
+        assertTrue("应附大幅删除提醒：${out.observation.take(200)}", out.observation.contains("大幅删除提醒"))
+        assertTrue(out.observation.contains("40%"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    // ---------- 回合改动摘要（沙箱失败反馈附带） ----------
+
+    @Test
+    fun `回合改动摘要列出增删行数`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val origin = "a\nb\nc"
+        val executor = GameToolExecutor(ws, turnStartSnapshot = mapOf("js/main.js" to origin))
+        ws.writeInitial("js/main.js", origin)
+        executor.execute(call(GameTools.EDIT_FILE, """{"path":"js/main.js","old_string":"c","new_string":"c2\\nd"}"""))
+        val summary = executor.turnChangeSummary()
+        assertTrue(summary.contains("js/main.js"))
+        assertTrue(summary.contains("+1"))
+        assertTrue(summary.contains("-1"))
+        // 无改动的执行器摘要为空
+        val (ws2, dir2) = newWorkspace()
+        ws2.writeInitial("js/main.js", origin)
+        val executor2 = GameToolExecutor(ws2, turnStartSnapshot = mapOf("js/main.js" to origin))
+        assertTrue(executor2.turnChangeSummary().isEmpty())
+        dir.deleteRecursively(); dir2.deleteRecursively()
+        Unit
+    }
+
+    // ---------- 新增工具：outline 符号地图 / revertfile 单文件回滚 / 失配候选 ----------
+
+    @Test
+    fun `outline 返回符号地图与行号区间`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        ws.writeInitial(
+            "js/main.js",
+            "var CFGX = 1;\nfunction alpha() {\n  return 1;\n}\nclass Beta {\n  run() {}\n}\nconst GAMMA = 2;\n"
+        )
+        val out = executor.execute(call(GameTools.OUTLINE, """{"path":"js/main.js"}"""))
+        assertTrue(out.ok)
+        assertFalse(out.workspaceTouched)
+        assertTrue(out.observation.contains("1-1 const CFGX"))
+        assertTrue(out.observation.contains("2-4 function alpha"))
+        assertTrue(out.observation.contains("5-7 class Beta"))
+        assertTrue(out.observation.contains("8-9 const GAMMA"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `editfile 失配时返回最相近候选段`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        ws.writeInitial("js/main.js", "function f() {\n  var a = 1;\n  return a;\n}\n")
+        // old_string 与原文高度相似但逐字符不一致（return 行少了分号）
+        val miss = executor.execute(
+            call(
+                GameTools.EDIT_FILE,
+                """{"path":"js/main.js","old_string":${Json.encodeToString("function f() {\n  var a = 1;\n  return a\n}")},"new_string":"g"}"""
+            )
+        )
+        assertFalse(miss.ok)
+        assertTrue(miss.observation.contains("未找到"))
+        assertTrue("应给出最相近候选与行号：${miss.observation.take(200)}",
+            miss.observation.contains("最相近") && miss.observation.contains("第 1 行"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `grepfile 同pattern同范围去重回指针，写入后失效`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        ws.writeInitial("js/main.js", "function a(){}\nfunction b(){}\n")
+        val q = """{"pattern":"function","path":"js/main.js"}"""
+        val out1 = executor.execute(call(GameTools.GREP_FILE, q))
+        assertTrue(out1.observation.contains("命中 2 行"))
+        // 无写入时完全相同的重复搜索只回指针（结果在上文，不重发）
+        val out2 = executor.execute(call(GameTools.GREP_FILE, q))
+        assertTrue("重复搜索应回指针", out2.observation.contains("已在相同范围") && out2.observation.contains("搜索过"))
+        assertFalse("指针不应重发命中清单", out2.observation.contains("命中 2 行"))
+        // 不同范围是不同键：不受去重影响
+        val out3 = executor.execute(call(GameTools.GREP_FILE, """{"pattern":"function"}"""))
+        assertTrue(out3.observation.contains("命中"))
+        // 写入使 grep 结果过期：去重清空，同 pattern 可重新搜索
+        executor.execute(
+            call(GameTools.EDIT_FILE, """{"path":"js/main.js","old_string":"function a(){}","new_string":"function a(x){}"}""")
+        )
+        val out4 = executor.execute(call(GameTools.GREP_FILE, q))
+        assertTrue("写入后应可重新搜索", out4.observation.contains("命中 2 行"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `revertfile 单文件回滚到回合起点`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val origin = "function f() {\n  return 1;\n}\n"
+        val executor = GameToolExecutor(ws, turnStartSnapshot = mapOf("js/main.js" to origin))
+        ws.writeInitial("js/main.js", origin)
+        // 本回合内修改该文件后回滚：内容恢复、计入工作区写入（读过期/空转清零同编辑）
+        executor.execute(call(GameTools.EDIT_FILE, """{"path":"js/main.js","old_string":"return 1;","new_string":"return 2;"}"""))
+        val out = executor.execute(call(GameTools.REVERT_FILE, """{"path":"js/main.js"}"""))
+        assertTrue(out.ok)
+        assertTrue(out.workspaceTouched)
+        assertEquals(origin, ws.read("js/main.js"))
+        assertTrue(out.observation.contains("回滚到本回合开始"))
+        // 未修改过的文件：无操作
+        val noop = executor.execute(call(GameTools.REVERT_FILE, """{"path":"index.html"}"""))
+        assertTrue(noop.ok)
+        assertFalse(noop.workspaceTouched)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `editfile 空行与行尾空白差异唯一命中自动归一化应用`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 原文：块内多一个空行、第二行有行尾空格；old_string 空行位置不同且无行尾空格
+        val origin = "function f() {\n  var a = 1;   \n\n  return a;\n}\nfunction g() {\n  return 2;\n}\n"
+        ws.writeInitial("js/main.js", origin)
+        val out = executor.execute(
+            call(
+                GameTools.EDIT_FILE,
+                """{"path":"js/main.js","old_string":${Json.encodeToString("function f() {\n  var a = 1;\n  return a;\n}")},"new_string":"function f() {\n  var a = 2;\n  return a;\n}"}"""
+            )
+        )
+        assertTrue("应自动归一化应用：${out.observation.take(200)}", out.ok)
+        assertTrue(out.observation.contains("空白归一化"))
+        // 区间外逐字保留（g 函数与原空行结构不变），区间内被 new_string 整段替换
+        assertEquals(
+            "function f() {\n  var a = 2;\n  return a;\n}\nfunction g() {\n  return 2;\n}\n",
+            ws.read("js/main.js")
+        )
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `editfile 归一化后多处同形不自动应用回退候选提示`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        val origin = "function tick() {\n  step();\n}\n\nfunction draw() {\n  step();\n}\n"
+        ws.writeInitial("js/main.js", origin)
+        // "step();" 在两处出现，且带不同空白包装——归一化同形，绝不猜
+        val out = executor.execute(
+            call(
+                GameTools.EDIT_FILE,
+                """{"path":"js/main.js","old_string":${Json.encodeToString("\n  step();\n\n")},"new_string":"  step(2);\n"}"""
+            )
+        )
+        assertFalse(out.ok)
+        assertTrue(out.observation.contains("未找到"))
+        assertTrue("多处同形应维持失败提示而非自动应用", !out.observation.contains("已按空白归一化"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `editfile anchor_line 窗口消歧同文多处`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 同一段代码出现在第 2 行与第 102 行（相距超过 ±40 窗口），anchor 指向后者
+        val block = "function dup() {\n  return 1;\n}\n"
+        val filler = (1..97).joinToString("\n") { "// filler $it" }
+        val origin = block + "\n" + filler + "\n" + block
+        ws.writeInitial("js/main.js", origin)
+        val out = executor.execute(
+            call(
+                GameTools.EDIT_FILE,
+                """{"path":"js/main.js","old_string":${Json.encodeToString(block)},"new_string":${Json.encodeToString("function dup() {\n  return 2;\n}\n")},"anchor_line":101}"""
+            )
+        )
+        assertTrue("锚定窗口应消歧并应用：${out.observation.take(200)}", out.ok)
+        assertTrue(out.observation.contains("窗口匹配应用"))
+        val updated = ws.read("js/main.js")!!
+        assertTrue("第一处保持原样", updated.contains("return 1;"))
+        assertTrue("第二处被替换", updated.contains("return 2;"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `editfile anchor_line 窗口未命中回退全文唯一匹配`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 目标在 101 行，anchor 指向第 1 行（±40 窗口够不到）；全文唯一命中仍应应用并注明回退
+        val filler = (1..99).joinToString("\n") { "// pad $it" }
+        val origin = "$filler\nvar b = 2;\n"
+        ws.writeInitial("js/main.js", origin)
+        val out = executor.execute(
+            call(
+                GameTools.EDIT_FILE,
+                """{"path":"js/main.js","old_string":"var b = 2;","new_string":"var b = 20;","anchor_line":1}"""
+            )
+        )
+        assertTrue(out.ok)
+        assertTrue(out.observation.contains("回退全文匹配"))
+        assertTrue(ws.read("js/main.js")!!.contains("var b = 20;"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `listfiles 超阈值 js 文件附一次性拆分建议`() = runBlocking {
+        val (ws, dir) = newWorkspace()
+        val executor = GameToolExecutor(ws)
+        // 4200 行 × 每行 ~27 字节 ≈ 113KB，同时越过行数与字节双门槛
+        val bigJs = (1..4200).joinToString("\n") { "var pad$it = 1111111111111;" } + "\n"
+        ws.writeInitial("js/main.js", bigJs)
+        ws.writeInitial("index.html", validHtml)
+        val out1 = executor.execute(call(GameTools.LIST_FILES, "{}"))
+        assertTrue(out1.observation.contains("拆分"))
+        assertTrue(out1.observation.contains("4000"))
+        // 同回合重复 listfiles（清单未变走指针前）：建议只给一次——此处验证去重指针路径不含建议
+        val out2 = executor.execute(call(GameTools.LIST_FILES, "{}"))
+        assertFalse(out2.observation.contains("⚠"))
         dir.deleteRecursively()
         Unit
     }
