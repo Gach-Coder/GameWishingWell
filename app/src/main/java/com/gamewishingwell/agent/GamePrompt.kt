@@ -334,6 +334,23 @@ $seedSystems
             "重写模块文件时必须保留既有导出成员（入口调用的每个 X.fn 都在 return {...} 导出表中），" +
             "多文件全量重写只有用户明确要求重做时才允许"
 
+    /**
+     * 参照模板摘要段（首生成回合条件注入）：借鉴模板的"怎么写"，不照抄其"写了什么"。
+     * 摘要由子代理预先生成（GameReferenceDigest），主 Agent 侧只是消费这段文本。
+     */
+    fun referenceDigestSection(title: String, digest: String): String =
+        "【参照模板摘要（同类游戏的实现参照，非用户需求）】\n" +
+            "以下是模板游戏《$title》的技术摘要，可借鉴其架构与实现模式。纪律：参照其\"怎么写\"，" +
+            "不照抄其\"写了什么\"——文案、数值、断言 id 必须按本游戏设计重写；与本轮设计清单冲突时" +
+            "以设计清单为准；模板的短板不要复刻。\n<reference_digest>\n$digest\n</reference_digest>"
+
+    /** 参照工具纪律（listrefs/readref 对模型可见时注入）：先定位后读、读后即用、禁照抄身份性内容。 */
+    const val REFERENCE_TOOL_RULE =
+        "【参照工具纪律】listrefs 列出模板库（玩家甄选的高质量游戏）清单，readref 读取其中" +
+            "指定文件（参数 game=游戏id、path=相对路径）。只用于借鉴实现写法：先定位再读、只读" +
+            "需要的文件（大文件优先带 start_line/end_line 或先 outline）；禁止照抄模板的文案、" +
+            "数值与断言 id；拿到要借鉴的写法就开始用 writefile 落盘本游戏，不要把参照读成通读。"
+
     /** 可玩性质量清单：与系统勾选无关的一次成稿质量底线（两种生成模式共用）。 */
     fun playabilityRequirements(): String = """
         【可玩性要求（交付底线）】

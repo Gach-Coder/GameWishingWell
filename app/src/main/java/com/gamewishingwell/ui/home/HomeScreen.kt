@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -240,7 +241,8 @@ fun HomeScreen(
                             onExportZip = {
                                 pendingExportGameId = meta.id
                                 exportZipLauncher.launch(zipFileNameFor(meta.title))
-                            }
+                            },
+                            onToggleTemplate = { vm.toggleTemplate(meta.id, it) }
                         )
                     }
                 }
@@ -387,7 +389,8 @@ private fun GameCard(
     onFiles: () -> Unit,
     onParams: () -> Unit,
     onClearSave: () -> Unit,
-    onExportZip: () -> Unit
+    onExportZip: () -> Unit,
+    onToggleTemplate: (Boolean) -> Unit
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -501,6 +504,11 @@ private fun GameCard(
                         text = { Text("文件夹") },
                         leadingIcon = { Icon(WwFolderIcon, contentDescription = null) },
                         onClick = { menuOpen = false; onFiles() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text(if (meta.isTemplate) "移出模板库" else "加入模板库") },
+                        leadingIcon = { Icon(Icons.Filled.Star, contentDescription = null) },
+                        onClick = { menuOpen = false; onToggleTemplate(!meta.isTemplate) }
                     )
                     DropdownMenuItem(
                         text = { Text("导出zip") },

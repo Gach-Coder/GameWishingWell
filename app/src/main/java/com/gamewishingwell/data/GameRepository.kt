@@ -10,7 +10,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -116,6 +120,20 @@ class GameRepository(private val context: Context) {
 
         /** 首轮对话环境的 Agent 状态初值：GameSession 全字段默认值的 JSON 形态。 */
         const val EMPTY_AGENT_STATE_JSON = "{}"
+
+        /**
+         * 游戏文件白名单判定（相对 games/<id> 的路径是否属于"游戏代码文件"）：
+         * 排除会话簿记、玩家参数覆盖（平台通道）、保存点/归档与回合日志——
+         * [loadGameTextFiles]、[savedGameFilePaths] 过滤与参照读取（loadGameRefFile）
+         * 共用同一份口径，任何 Agent 视野（摘要输入/listrefs 清单/readref）都
+         * 只能看到纯游戏文件，簿记永不外泄。
+         */
+        fun isGameFileRel(rel: String): Boolean =
+            rel != SESSION_FILE && rel != AGENT_STATE_FILE && rel != USER_CONFIG_FILE &&
+                rel != POINTER_FILE && !rel.endsWith(".sha256") &&
+                !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$SAVEPOINT_PREV_DIR/") &&
+                !rel.startsWith("$VERSIONS_DIR/") &&
+                !rel.startsWith("$LOG_DIR/")
     }
 
     private val json = Json {
@@ -310,6 +328,85 @@ class GameRepository(private val context: Context) {
         }
     }
 
+    // ---------- 参照模板库（玩家甄选 + 出厂预置，首生成回合的相似游戏参照源） ----------
+
+    /** 玩家甄选标记（首页卡片菜单）：只写索引标志位，不动游戏文件与会话。 */
+    suspend fun setTemplateFlag(gameId: Long, isTemplate: Boolean): Boolean = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            val idx = readIndex()
+            if (idx.games.none { it.id == gameId }) return@withLock false
+            writeIndex(GameIndex(idx.games.map { if (it.id == gameId) it.copy(isTemplate = isTemplate) else it }))
+            true
+        }
+    }
+
+    /** 模板库清单（玩家甄选 + 出厂预置的并集），按最近更新优先。 */
+    suspend fun listTemplateGames(): List<GameMeta> = withContext(Dispatchers.IO) {
+        readIndex().games.filter { it.isTemplate }.sortedByDescending { it.updatedAt }
+    }
+
+    /**
+     * 参照读取（readref 的数据源）：读取模板游戏保存区内的单个游戏文件。
+     * 白名单口径同 [loadGameTextFiles]（簿记/玩家参数覆盖/保存点/日志不可见），
+     * 且路径解析限定在 games/<gameId> 之内（拒绝 .. 逃逸与绝对路径）——参照访问
+     * 是独立于工作区沙箱的第二条只读通道，但不因此放松路径守卫。
+     */
+    suspend fun loadGameRefFile(gameId: Long, relPath: String): String? = withContext(Dispatchers.IO) {
+        if (!isGameFileRel(relPath)) return@withContext null
+        val root = File(gamesDir, gameId.toString())
+        val target = runCatching { File(root, relPath).canonicalFile }.getOrNull() ?: return@withContext null
+        if (!target.path.startsWith(root.canonicalPath + File.separator) || !target.isFile) {
+            return@withContext null
+        }
+        runCatching { target.readText(Charsets.UTF_8) }.getOrNull()
+    }
+
+    /**
+     * 出厂模板安装（幂等，C 阶段机制）：assets/templates/manifest.json 列出随包
+     * 出厂的模板 zip；已安装（登记表有记录且游戏仍存在）则跳过，否则走导入链路
+     * 落成新游戏并置模板标记。登记表 agent/factory_templates.json 只做"装过没"
+     * 的判定，不参与任何游戏行为——与玩家甄选位（isTemplate）同库不同源。
+     * 出厂内容槽位默认为空（manifest 为空数组），高质量模板 zip 后续按需放入。
+     */
+    suspend fun ensureFactoryTemplatesInstalled(assets: android.content.res.AssetManager) {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val names = runCatching {
+                    assets.open("templates/manifest.json").bufferedReader().use { it.readText() }
+                }.getOrNull()?.let { txt ->
+                    runCatching {
+                        json.parseToJsonElement(txt).jsonObject["zips"]?.let { el ->
+                            (el as? kotlinx.serialization.json.JsonArray)?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }
+                        }
+                    }.getOrNull()
+                } ?: return@runCatching
+                if (names.isEmpty()) return@runCatching
+                val registryFile = File(File(context.filesDir, "agent"), "factory_templates.json").apply { parentFile?.mkdirs() }
+                val registry = runCatching {
+                    json.parseToJsonElement(registryFile.readText(Charsets.UTF_8)).jsonObject
+                        .mapValues { (_, v) -> (v as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull }
+                }.getOrNull()?.filterValues { it != null }?.mapValues { it.value!! } ?: emptyMap()
+                var changed = false
+                val updated = registry.toMutableMap()
+                for (name in names) {
+                    val installed = updated[name]?.toLongOrNull()
+                    if (installed != null && readIndex().games.any { it.id == installed }) continue
+                    val stream = runCatching { assets.open("templates/$name") }.getOrNull()
+                    if (stream == null) continue
+                    val meta = stream.use { importGameZip(it) } ?: continue
+                    if (setTemplateFlag(meta.id, true)) {
+                        updated[name] = meta.id.toString()
+                        changed = true
+                        Log.i(LOG_TAG, "factory template installed: $name -> game-${meta.id}")
+                    }
+                }
+                if (changed) {
+                    atomicWriteText(registryFile, json.encodeToString(updated))
+                }
+            }
+        }
+    }
+
     suspend fun loadGameHtml(gameId: Long): String? = withContext(Dispatchers.IO) {
         val f = File(File(gamesDir, gameId.toString()), ENTRY_HTML)
         if (f.exists()) f.readText(Charsets.UTF_8) else null
@@ -333,13 +430,7 @@ class GameRepository(private val context: Context) {
         dir.walkTopDown()
             .filter { it.isFile }
             .map { it.relativeTo(dir).invariantSeparatorsPath }
-            .filter { rel ->
-                rel != "session.json" && rel != "agent_state.json" && rel != USER_CONFIG_FILE &&
-                    rel != POINTER_FILE && !rel.endsWith(".sha256") &&
-                    !rel.startsWith("$SAVEPOINT_DIR/") && !rel.startsWith("$SAVEPOINT_PREV_DIR/") &&
-                    !rel.startsWith("$VERSIONS_DIR/") &&
-                    !rel.startsWith("$LOG_DIR/")
-            }
+            .filter { rel -> isGameFileRel(rel) }
             .associateWith { rel -> File(dir, rel).readText(Charsets.UTF_8) }
     }
 

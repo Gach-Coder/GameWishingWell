@@ -81,6 +81,18 @@ class HomeViewModel(
     }
 
     /**
+     * 模板库甄选开关（卡片菜单「加入/移出模板库」）：只写索引标志位——被标记的
+     * 游戏自身行为不变，只是此后同类新游戏的首生成回合会参照它（摘要注入 +
+     * listrefs/readref 只读工具）。
+     */
+    fun toggleTemplate(id: Long, isTemplate: Boolean) {
+        viewModelScope.launch {
+            repository.setTemplateFlag(id, isTemplate)
+            refresh()
+        }
+    }
+
+    /**
      * 删除草稿（草稿卡片菜单）：等同"新创作"的清空语义——停掉草稿会话的生成并
      * 删除草稿文件（含草稿日志），完成后刷新首页（草稿卡片消失）。
      */

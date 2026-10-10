@@ -1,5 +1,6 @@
 package com.gamewishingwell.agent
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -195,5 +196,28 @@ class GameValidatorTest {
         // 就必须带合并行（补一行不违反修改范围契约）
         val report = GameValidator.validate(partial)
         assertTrue(report.errors.any { it.category == "config" && it.message.contains("__wwConfigOverride") })
+    }
+
+    @Test
+    fun `missingLocalFileRefs-只报缺失的本地js与css引用`() {
+        // 保险丝的判定口径：本地 js/css 引用中"不存在"的才上报；外链、
+        // 协议相对、内联脚本与存在的本地引用一律不报。
+        val html = "<html><head>" +
+            "<link rel=\"stylesheet\" href=\"css/ok.css\">" +
+            "<link rel=\"stylesheet\" href=\"css/gone.css\">" +
+            "<link rel=\"stylesheet\" href=\"https://cdn.example.com/x.css\">" +
+            "</head><body>" +
+            "<script src=\"js/ok.js\"></script>" +
+            "<script src=\"js/gone.js\"></script>" +
+            "<script src=\"https://cdn.example.com/x.js\"></script>" +
+            "<script src=\"//cdn.example.com/y.js\"></script>" +
+            "<script>inline();</script>" +
+            "</body></html>"
+        val present = setOf("css/ok.css", "js/ok.js")
+        val missing = GameValidator.missingLocalFileRefs(html) { it in present }
+        assertEquals(setOf("js/gone.js", "css/gone.css"), missing.toSet())
+        // 全部存在 → 空清单（完整，不触发保险丝）
+        val full = GameValidator.missingLocalFileRefs(html) { true }
+        assertTrue(full.isEmpty())
     }
 }

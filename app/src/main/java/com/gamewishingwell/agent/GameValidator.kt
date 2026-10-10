@@ -61,6 +61,29 @@ object GameValidator {
     private val cssUrlRegex = Regex("""url\(\s*['"]?([^)'"\s]+)['"]?\s*\)""", RegexOption.IGNORE_CASE)
     private val externalUrlRegex = Regex("""(?:https?://|//[a-z][a-z0-9.-]*[/'"])""", RegexOption.IGNORE_CASE)
 
+    /**
+     * 入口 HTML 引用的本地 JS/CSS 中"不存在"的相对路径清单：与 validate 内
+     * script/link 的本地引用存在性裁决同语义（script 排除 http(s)/协议相对，
+     * css 走 [GameBundle.isLocalRef]），供回合起点完整性预检（保险丝）在模型
+     * 进场前发现"引用存在、文件无处可寻"的撕裂状态。空清单 = 完整。
+     */
+    fun missingLocalFileRefs(html: String, exists: (String) -> Boolean): List<String> {
+        val doc = runCatching { Jsoup.parse(html) }.getOrNull() ?: return emptyList()
+        val missing = mutableListOf<String>()
+        doc.getElementsByTag("script").forEach { el ->
+            val src = el.attr("src")
+            if (el.hasAttr("src") && src.isNotBlank() &&
+                !src.startsWith("http://") && !src.startsWith("https://") && !src.startsWith("//") &&
+                !exists(src)
+            ) missing += src
+        }
+        doc.select("link[rel=stylesheet][href]").forEach { el ->
+            val href = el.attr("href").trim()
+            if (GameBundle.isLocalRef(href) && !exists(href)) missing += href
+        }
+        return missing.distinct()
+    }
+
     fun validate(
         html: String,
         /** 本轮条件允许的引擎集合（条件引入机制）；缺省=全部内置引擎。 */

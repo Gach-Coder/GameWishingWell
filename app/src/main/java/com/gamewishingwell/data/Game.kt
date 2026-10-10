@@ -13,7 +13,13 @@ data class GameMeta(
      * 保存区当前的成品版号（每次成功交付 +1，保存时随索引固化）：首页卡片据此显示
      * 「第 N 版」。手动保存不计数（沿用会话语义）；导入/旧索引缺省 0（不显示）。
      */
-    val deliveredVersion: Int = 0
+    val deliveredVersion: Int = 0,
+    /**
+     * 玩家甄选的参照模板（首页卡片菜单「加入/移出模板库」）：只影响首生成回合的
+     * 参照链路（摘要注入 + listrefs/readref 只读工具），不改变该游戏自身的任何
+     * 行为——单一职责，杜绝"标记后被特殊对待"的新 bug 面。
+     */
+    val isTemplate: Boolean = false
 )
 
 @Serializable

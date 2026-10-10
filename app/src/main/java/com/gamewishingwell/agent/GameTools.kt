@@ -9,6 +9,7 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.longOrNull
 
 /** Agent Loop 的最小工具集定义（JSON Schema 参数原样字符串，由协议层嵌入请求）。 */
 object GameTools {
@@ -20,6 +21,8 @@ object GameTools {
     const val APPEND_FILE = "appendfile"
     const val OUTLINE = "outline"
     const val REVERT_FILE = "revertfile"
+    const val LIST_REFS = "listrefs"
+    const val READ_REF = "readref"
 
     private const val PATH_DESC =
         "工作区内的相对路径：index.html（唯一入口）、js/*.js 或 css/*.css（多文件组织，" +
@@ -82,8 +85,29 @@ object GameTools {
     /** 读取类工具名集合：侦查门禁期从工具清单摘除并在执行层直接拒绝（见 Agent 侧门禁）。 */
     val READ_TOOL_NAMES = setOf(LIST_FILES, READ_FILE, GREP_FILE, OUTLINE)
 
+    /** 参照类工具名集合：独立于工作区读取——有自己的压力链（参照门禁只摘参照工具）。 */
+    val REF_TOOL_NAMES = setOf(LIST_REFS, READ_REF)
+
     /** 门禁期工具集（仅写入类）：侦查超限且拒不落盘时，模型只剩"落盘或交付"两条出口。 */
     fun writeOnlySpecs(): List<ToolSpec> = specs().filter { it.name !in READ_TOOL_NAMES }
+
+    /**
+     * 参照工具集（仅首生成回合注入）：listrefs/readref 读玩家甄选的模板库，借鉴
+     * 同类游戏的实现写法。不进 [specs()]——修改/修复回合不暴露（修复轮纪律是
+     * "只改点名的"，开参照等于鼓励跑题）。
+     */
+    fun refSpecs(): List<ToolSpec> = listOf(
+        ToolSpec(
+            name = LIST_REFS,
+            description = "列出模板库（玩家甄选的高质量同类游戏）清单：游戏id、标题、版号与文件列表。开发新游戏可参照其中写法；先看清单再用 readref 读需要的文件。",
+            parameters = """{"type":"object","properties":{},"required":[]}"""
+        ),
+        ToolSpec(
+            name = READ_REF,
+            description = "读取模板库中某模板游戏的一个文件（借鉴实现写法）。参数 game=模板游戏id（来自 listrefs）、path=该游戏内相对路径；大文件带 start_line/end_line 取区段。只读需要的文件；禁止照抄模板的文案、数值与断言 id。",
+            parameters = """{"type":"object","properties":{"game":{"type":"integer","description":"模板游戏id（来自 listrefs 清单）"},"path":{"type":"string","description":"该模板游戏内的文件相对路径，如 js/world.js"},"start_line":{"type":"integer","description":"起始行号（从 1 计），可选"},"end_line":{"type":"integer","description":"结束行号（含），可选"}},"required":["game","path"]}"""
+        )
+    )
 
     /**
      * 大幅删除咨询阈值：单文件相对回合起点删除非空行比例达到该值即提示（非硬门）。
@@ -165,6 +189,19 @@ data class ToolOutcome(
 )
 
 /**
+ * 参照库（模板游戏只读访问）：listrefs/readref 的执行数据源。独立于工作区
+ * 沙箱（读取走保存区白名单通道，见 GameRepository.loadGameRefFile），null
+ * 时两工具不注入清单、执行层也拒绝——修复/迭代回合即此形态。
+ */
+interface RefLibrary {
+    /** 模板库清单文本（游戏id/标题/文件列表）。 */
+    suspend fun list(): String
+
+    /** 读取模板游戏的单个游戏文件；不存在/越权路径返回 null。 */
+    suspend fun read(gameId: Long, path: String): String?
+}
+
+/**
  * 工具沙箱执行器：所有路径经 [GameFileWorkspace.resolve] 校验，严格限制在游戏文件夹内。
  * 写入类工具执行后自动运行 [GameValidator]，把结构化校验结果作为观察附在返回里——
  * 校验是“观察”而非“门”：模型看到报告自行决定下一步修复方式。
@@ -206,7 +243,9 @@ class GameToolExecutor(
      * revertfile）——双层硬保障的第二层（第一层是只传读类工具 spec），即使模型
      * 硬调写工具也只得到拒绝观察，工作区不可能被修改。
      */
-    private val readOnly: Boolean = false
+    private val readOnly: Boolean = false,
+    /** 参照库（首生成回合注入；null = 本轮无参照工具，listrefs/readref 执行层兜底拒绝）。 */
+    private val refLibrary: RefLibrary? = null
 ) {
 
     /**
@@ -300,6 +339,8 @@ class GameToolExecutor(
                 GameTools.WRITE_FILE -> writeFile(call, args)
                 GameTools.APPEND_FILE -> appendFile(call, args)
                 GameTools.EDIT_FILE -> editFile(call, args)
+                GameTools.LIST_REFS -> listRefs(call)
+                GameTools.READ_REF -> readRef(call, args)
                 else -> outcome(call, ok = false, observation = "未知工具：${call.name}（可用：${GameTools.specs().joinToString { it.name }}）")
             }
         } catch (e: Exception) {
@@ -321,6 +362,55 @@ class GameToolExecutor(
                     ""
                 }
         )
+    }
+
+    /** readref 单次返回的字符上限：参照是借鉴写法不是搬源码，超长截断引导按区段取。 */
+    private val READ_REF_MAX_CHARS = 24_000
+
+    /** listrefs：模板库清单（refLibrary 缺席时本轮无参照能力，兜底拒绝）。 */
+    private suspend fun listRefs(call: ToolCallData): ToolOutcome {
+        val lib = refLibrary ?: return outcome(
+            call, ok = false,
+            observation = "参照工具本轮不可用（仅首次生成回合启用）。"
+        )
+        return outcome(call, ok = true, observation = lib.list())
+    }
+
+    /** readref：读模板游戏文件（白名单与路径守卫在仓库侧 loadGameRefFile）。 */
+    private suspend fun readRef(call: ToolCallData, args: JsonObject): ToolOutcome {
+        val lib = refLibrary ?: return outcome(
+            call, ok = false,
+            observation = "参照工具本轮不可用（仅首次生成回合启用）。"
+        )
+        val gameId = args["game"]?.let { el ->
+            ((el as? JsonPrimitive)?.longOrNull ?: (el as? JsonPrimitive)?.contentOrNull?.toLongOrNull())
+        }
+        val path = args["path"]?.let { el -> (el as? JsonPrimitive)?.contentOrNull }?.trim()
+        if (gameId == null || path.isNullOrBlank()) {
+            return outcome(
+                call, ok = false,
+                observation = "readref 参数：game=模板游戏id（数字，来自 listrefs）、path=文件相对路径（如 js/world.js）。"
+            )
+        }
+        val content = lib.read(gameId, path) ?: return outcome(
+            call, ok = false,
+            observation = "参照文件不存在或不可读：game-$gameId/$path（可用 listrefs 查看模板清单与文件列表）。"
+        )
+        val body = run {
+            val start = args["start_line"]?.let { el -> (el as? JsonPrimitive)?.intOrNull }
+            val end = args["end_line"]?.let { el -> (el as? JsonPrimitive)?.intOrNull }
+            if (start != null || end != null) {
+                val lines = content.lines()
+                val s = ((start ?: 1) - 1).coerceIn(0, lines.size)
+                val e = (end ?: lines.size).coerceIn(s, lines.size)
+                "（第 ${s + 1}-$e 行 / 共 ${lines.size} 行）\n" + lines.subList(s, e).joinToString("\n")
+            } else if (content.length > READ_REF_MAX_CHARS) {
+                content.take(READ_REF_MAX_CHARS) + "\n（参照文件超长已截断；需要后半段请带 start_line/end_line 取区段。）"
+            } else {
+                content
+            }
+        }
+        return outcome(call, ok = true, observation = "模板 game-$gameId 文件 $path 内容如下：\n$body")
     }
 
     private suspend fun listFiles(call: ToolCallData): ToolOutcome {

@@ -31,7 +31,10 @@ import org.mockito.ArgumentMatchers.anyString
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.`when`
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
  * GameAgent 回合级集成测试：脚本化 LLM（按调用序回放响应/异常）+ 桩沙箱，
@@ -1581,6 +1584,545 @@ function restart(){}
         agent.saveCurrentGame("")
         assertTrue(File(dir, "games/${meta.id}/index.html").readText(Charsets.UTF_8).contains("score: 2"))
         assertFalse(agent.session.value.unsavedVersion)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    // ---------- 工作区补全（20261006 树叶透明事故的回归防线） ----------
+    // 事故形态：草稿期多文件游戏（入口引用 js/css）入库后，编辑区目录切到空的
+    // game-<id>，后续修复回合只被种回 index.html 壳——被引用的 js "不存在"，
+    // 修复被缺文件校验逼成整体重建，三轮全毁第一轮代码。
+
+    /** 多文件游戏夹具：入口引用 css/style.css、js/world.js、js/main.js（契约在 main.js）。 */
+    private val mfEntryHtml = """<!DOCTYPE html><html lang="zh"><head>
+<link rel="stylesheet" href="css/style.css">
+</head><body><script src="js/world.js"></script><script src="js/main.js"></script></body></html>"""
+    private val mfWorldJs = "var WORLD_MARKER = 1;\nvar LEAF_OPACITY = 0.35;"
+    private val mfMainJs = "window.GAME_CONFIG = { \"speed\": 10 };\n" +
+        "Object.assign(window.GAME_CONFIG, window.__wwConfigOverride || {});\n" +
+        "window.__wwDebugState = function(){ return { state: 'playing', score: 0 }; };\nfunction restart(){}"
+    private val mfCss = "body{margin:0;background:#111}"
+
+    private fun mfWrite(path: String, content: String, tag: String) = ToolCallData(
+        tag, "writefile", """{"path":"$path","content":${jsonStr(content)}}"""
+    )
+
+    /** 草稿期多文件游戏首作 + 入库（各测试共用的前半场脚本）。 */
+    private fun mfFirstTurnScript() = listOf(
+        LlmResponse("""{"intent":"dev","confidence":0.9}"""),
+        LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+        LlmResponse(
+            "", toolCalls = listOf(
+                mfWrite("css/style.css", mfCss, "f-css"),
+                mfWrite("js/world.js", mfWorldJs, "f-world"),
+                mfWrite("js/main.js", mfMainJs, "f-main"),
+                mfWrite("index.html", mfEntryHtml, "f-idx")
+            )
+        ),
+        LlmResponse("完成")
+    )
+
+    @Test
+    fun `草稿入库后修复回合可见全部游戏文件并可最小修改`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-wsfill-main-${System.nanoTime()}")
+        val script = ScriptedLlmClient(
+            mfFirstTurnScript() + listOf(
+                // 修复回合：读取被引用的 js（应看到第一轮原文）→ 最小 editfile → 交付
+                LlmResponse("""{"intent":"dev","confidence":0.9,"reason":"修复树叶"}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("f-read", "readfile", """{"path":"js/world.js"}""")
+                    )
+                ),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData(
+                            "f-fix", "editfile",
+                            """{"path":"js/world.js","old_string":${jsonStr("LEAF_OPACITY = 0.35")},"new_string":${jsonStr("LEAF_OPACITY = 1.0")}}"""
+                        )
+                    )
+                ),
+                LlmResponse("已修复树叶透明")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        val meta = agent.saveCurrentGame("树叶镇") ?: throw AssertionError("保存失败")
+
+        agent.sendUserMessage("树叶是透明的，修复一下", qualityTier = "fast")
+        val s = agent.session.value
+        assertFalse(s.isGenerating)
+        assertTrue("修复回合应正常交付", s.gameGenerated)
+
+        // 修复回合确实看到了第一轮的源文件（事故形态下 readfile 返回
+        // "文件不存在或不可读"，模型被迫整体重建）。
+        val observations = script.calls.drop(5).flatMap { it.first }
+            .filter { it.role == ChatMessage.ROLE_TOOL }
+        assertTrue(
+            "readfile 应返回 world.js 原文",
+            observations.any { it.content.contains("WORLD_MARKER") }
+        )
+        assertFalse(
+            "不得出现文件不存在观察",
+            observations.any { it.content.contains("文件不存在或不可读") }
+        )
+        // 交付落盘：world.js 是最小修改（锚点行仍在），main.js 原样未被重写
+        val wsRoot = File(dir, "agent/workspace/game-${meta.id}")
+        val worldOnDisk = File(wsRoot, "js/world.js").readText()
+        assertTrue(worldOnDisk.contains("LEAF_OPACITY = 1.0"))
+        assertTrue("最小修改不得抹掉原内容", worldOnDisk.contains("WORLD_MARKER"))
+        assertEquals("未被点名的文件必须原样", mfMainJs, File(wsRoot, "js/main.js").readText())
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `草稿入库时工作区文件随身份切换即时迁移`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-wsfill-migrate-${System.nanoTime()}")
+        val script = ScriptedLlmClient(mfFirstTurnScript())
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        val meta = agent.saveCurrentGame("迁移镇") ?: throw AssertionError("保存失败")
+
+        // 入库瞬间（无需等下一回合补全兜底）：新编辑区就应有全量文件，
+        // 保存后立即可预览/继续编辑
+        val wsRoot = File(dir, "agent/workspace/game-${meta.id}")
+        assertEquals(mfEntryHtml, File(wsRoot, "index.html").readText())
+        assertEquals(mfWorldJs, File(wsRoot, "js/world.js").readText())
+        assertEquals(mfMainJs, File(wsRoot, "js/main.js").readText())
+        assertEquals(mfCss, File(wsRoot, "css/style.css").readText())
+        // 交付的预览（GameBundle 内联读编辑区）随之完整
+        val preview = agent.runnablePreviewHtml() ?: ""
+        assertTrue(preview.contains("WORLD_MARKER"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `被引用文件在保存区与工作区双缺失时回合快速熔断`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-wsfill-fuse-${System.nanoTime()}")
+        val script = ScriptedLlmClient(
+            mfFirstTurnScript() + listOf(
+                // 只有意图判定这一步响应：保险丝必须在任何模型工具轮之前终止
+                LlmResponse("""{"intent":"dev","confidence":0.9,"reason":"修复树叶"}""")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        val meta = agent.saveCurrentGame("残缺镇") ?: throw AssertionError("保存失败")
+        // 制造双撕裂：被引用的 js/main.js 在保存区与编辑区都不存在
+        File(dir, "games/${meta.id}/js/main.js").delete()
+        File(dir, "agent/workspace/game-${meta.id}/js/main.js").delete()
+
+        agent.sendUserMessage("树叶是透明的，修复一下", qualityTier = "fast")
+        val s = agent.session.value
+        assertFalse(s.isGenerating)
+        assertTrue("双缺失必须熔断回合", s.error?.contains("游戏文件不完整") == true)
+        // 意图判定之后零模型轮次：没进工具循环，也就没有重建机会
+        assertEquals("只应发生意图判定一次 LLM 调用", 5, script.calls.size)
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `工作区补全不得覆盖编辑区领先的未保存修改`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-wsfill-keep-${System.nanoTime()}")
+        val script = ScriptedLlmClient(
+            mfFirstTurnScript() + listOf(
+                LlmResponse("""{"intent":"dev","confidence":0.9,"reason":"继续调整"}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("k-read", "readfile", """{"path":"js/world.js"}""")
+                    )
+                ),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData(
+                            "k-fix", "editfile",
+                            """{"path":"js/world.js","old_string":${jsonStr("LEAF_OPACITY = 0.9")},"new_string":${jsonStr("LEAF_OPACITY = 1.0")}}"""
+                        )
+                    )
+                ),
+                LlmResponse("已调整")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        val meta = agent.saveCurrentGame("领先镇") ?: throw AssertionError("保存失败")
+        // 模拟"编辑区领先"：未保存的手改（0.9），保存区还是旧值 0.35——
+        // 补全只增不改，读到的必须是 0.9
+        GameFileWorkspace(File(dir, "agent/workspace/game-${meta.id}"))
+            .writeUpdated("js/world.js", mfWorldJs.replace("0.35", "0.9"))
+
+        agent.sendUserMessage("再调一下树叶", qualityTier = "fast")
+        val s = agent.session.value
+        assertFalse(s.isGenerating)
+        assertTrue(s.gameGenerated)
+        val observations = script.calls.drop(5).flatMap { it.first }
+            .filter { it.role == ChatMessage.ROLE_TOOL }
+        // 判据：editfile 的 old_string 是领先版的 "LEAF_OPACITY = 0.9"——替换成功
+        // 即证明模型面对的是编辑区领先版本（0.9），补全没有用保存区旧值（0.35）回灌；
+        // 若被回灌，old_string 必然失配（"未找到"）。readfile 原文观察会被平台在
+        // 写入后折叠为过期标记（设计行为），不能作为断言对象。
+        assertTrue(
+            "editfile 应成功替换领先版内容",
+            observations.any { it.content.contains("已替换 1 处") && it.content.contains("js/world.js") }
+        )
+        assertFalse(
+            "old_string 失配说明读到的不是编辑区领先版本",
+            observations.any { it.content.contains("未找到") }
+        )
+        val worldOnDisk = File(dir, "agent/workspace/game-${meta.id}/js/world.js").readText()
+        assertTrue("最终内容应为编辑后的 1.0", worldOnDisk.contains("LEAF_OPACITY = 1.0"))
+        assertTrue(worldOnDisk.contains("WORLD_MARKER"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `已入库游戏的chat只读查阅能看到全部游戏文件`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-wsfill-chat-${System.nanoTime()}")
+        val script = ScriptedLlmClient(
+            mfFirstTurnScript() + listOf(
+                // chat 提问：只读工具循环读 js/world.js 应看到原文（补全前同样只能看到入口壳）
+                LlmResponse("""{"intent":"chat","confidence":0.95,"reason":"询问实现"}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("h-read", "readfile", """{"path":"js/world.js"}""")
+                    )
+                ),
+                LlmResponse("树叶的透明度定义在 js/world.js 里。")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        agent.saveCurrentGame("问答镇") ?: throw AssertionError("保存失败")
+
+        agent.sendUserMessage("树叶的逻辑在哪个文件", qualityTier = "fast")
+        val s = agent.session.value
+        assertFalse(s.isGenerating)
+        // 回答轮（第 7 次调用）的请求历史里：readfile 带回了 world.js 原文
+        val answerReq = script.calls[6].first
+        assertTrue(
+            "chat 只读查阅应看到 js 原文",
+            answerReq.any { it.role == ChatMessage.ROLE_TOOL && it.content.contains("WORLD_MARKER") }
+        )
+        assertFalse(
+            "chat 查阅不得出现文件不存在",
+            answerReq.any { it.role == ChatMessage.ROLE_TOOL && it.content.contains("文件不存在或不可读") }
+        )
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `旧版游戏包导入后修复回合可见全部游戏文件`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-wsfill-import-${System.nanoTime()}")
+        // 模拟旧版导出的 zip：只有保存区内容（无 .ww-workspace 工作区条目）——
+        // 导入后新会话的编辑区目录为空，修复回合全靠回合起点补全从保存区恢复。
+        val bos = ByteArrayOutputStream()
+        ZipOutputStream(bos).use { zos ->
+            fun put(name: String, content: String) {
+                zos.putNextEntry(ZipEntry(name))
+                zos.write(content.toByteArray(Charsets.UTF_8))
+                zos.closeEntry()
+            }
+            put("index.html", mfEntryHtml)
+            put("css/style.css", mfCss)
+            put("js/world.js", mfWorldJs)
+            put("js/main.js", mfMainJs)
+            put("session.json", "[]")
+            put("agent_state.json", """{"gameGenerated":true}""")
+        }
+        val context = mock(Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        val assets = mock(AssetManager::class.java)
+        `when`(assets.open(anyString())).thenReturn(ByteArrayInputStream("<html>template</html>".toByteArray()))
+        `when`(context.assets).thenReturn(assets)
+        val repo = GameRepository(context)
+        val meta = repo.importGameZip(ByteArrayInputStream(bos.toByteArray()))
+            ?: throw AssertionError("导入失败")
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"intent":"dev","confidence":0.9,"reason":"修复树叶"}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("i-read", "readfile", """{"path":"js/world.js"}""")
+                    )
+                ),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData(
+                            "i-fix", "editfile",
+                            """{"path":"js/world.js","old_string":${jsonStr("LEAF_OPACITY = 0.35")},"new_string":${jsonStr("LEAF_OPACITY = 1.0")}}"""
+                        )
+                    )
+                ),
+                LlmResponse("已修复树叶透明")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.awaitReady()
+        agent.loadGameSession(meta.id)
+        // 前置：导入未带工作区条目，编辑区确实为空（纯靠保存区恢复的场景成立）
+        val wsRoot = File(dir, "agent/workspace/game-${meta.id}")
+        assertFalse("旧包无工作区条目，编辑区应为空", wsRoot.isDirectory && wsRoot.listFiles().orEmpty().isNotEmpty())
+
+        agent.sendUserMessage("树叶是透明的，修复一下", qualityTier = "fast")
+        val s = agent.session.value
+        assertFalse(s.isGenerating)
+        assertTrue("导入游戏的修复回合应正常交付", s.gameGenerated)
+        // readfile 原文观察 + 最小修改成功（若补全缺失，editfile old_string 必失配）
+        val observations = script.calls.drop(1).flatMap { it.first }
+            .filter { it.role == ChatMessage.ROLE_TOOL }
+        assertTrue(
+            "readfile 应返回导入包中的 world.js 原文",
+            observations.any { it.content.contains("WORLD_MARKER") }
+        )
+        assertTrue(
+            "editfile 应成功替换",
+            observations.any { it.content.contains("已替换 1 处") && it.content.contains("js/world.js") }
+        )
+        val worldOnDisk = File(wsRoot, "js/world.js").readText()
+        assertTrue(worldOnDisk.contains("LEAF_OPACITY = 1.0"))
+        dir.deleteRecursively()
+        Unit
+    }
+
+    // ---------- 参照模板库（A 摘要注入 / B 只读工具+独立压力链 / C 出厂机制） ----------
+
+    private val digestReply = "架构地图：index.html 为入口壳；js/world.js 管地形与树叶材质（含 WORLD_MARKER）。"
+
+    /** 识别层响应（空系统：直达生成路径，系统由生成 LLM 按指令原话推导）。 */
+    private val plainRecognition =
+        LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}""")
+
+    /** 生成一份已入库并标记为模板的多文件游戏，返回共享同一 filesDir 的仓库。 */
+    private fun setupTemplateGame(dir: File): GameRepository {
+        val script = ScriptedLlmClient(mfFirstTurnScript())
+        val agent = newAgent(dir, client = script)
+        runBlocking {
+            agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+            agent.saveCurrentGame("我的世界·树叶镇") ?: throw AssertionError("保存失败")
+        }
+        val context = mock(Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        val repo = GameRepository(context)
+        runBlocking {
+            val meta = repo.listGames().single()
+            check(repo.setTemplateFlag(meta.id, true))
+        }
+        return repo
+    }
+
+    @Test
+    fun `首生成轮注入参照摘要且同模板二次生成命中缓存`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-ref-digest-${System.nanoTime()}")
+        val repo = setupTemplateGame(dir)
+        val templateId = repo.listTemplateGames().single().id
+
+        val script = ScriptedLlmClient(
+            listOf(
+                // 第一次首生成：意图 → 识别 → 子代理摘要 → 循环（写入 → 完成）
+                LlmResponse("""{"intent":"dev","confidence":0.9}"""),
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse(digestReply),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("d-w", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                LlmResponse("完成"),
+                // 第二次首生成（同模板，缓存命中）：无摘要调用
+                LlmResponse("""{"intent":"dev","confidence":0.9}"""),
+                LlmResponse("""{"visualDimension":null,"screenOrientation":null,"gameSystems":[],"confidence":0.9,"hasGameCommand":true}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("d-w2", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("再做一个我的世界游戏", qualityTier = "fast")
+        assertTrue(agent.session.value.gameGenerated)
+
+        // 子代理摘要调用（第 3 次）：系统提示词是摘要器角色，输入含模板源文件
+        val digestCalls = script.calls.filter { it.first.firstOrNull()?.content?.contains("游戏代码摘要器") == true }
+        assertEquals("首次生成应发生一次摘要调用", 1, digestCalls.size)
+        assertTrue(digestCalls.single().first.any { it.content.contains("js/world.js") })
+
+        // 循环首轮请求（第 4 次调用）：摘要段 + 纪律条款 + 参照工具均可见
+        val loopReq = script.calls[3]
+        assertTrue("应注入参照摘要段", loopReq.first.any { it.content.contains("参照模板摘要") && it.content.contains("WORLD_MARKER") })
+        assertTrue("应注入参照工具纪律", loopReq.first.any { it.content.contains("参照工具纪律") })
+        assertTrue("参照工具应对模型可见", loopReq.second.any { it.name == GameTools.READ_REF })
+
+        // 第二次首生成：缓存命中（摘要器角色总调用数仍为 1），且上下文仍有摘要段
+        agent.newSession(true)
+        agent.sendUserMessage("再再做一个我的世界游戏", qualityTier = "fast")
+        assertTrue(agent.session.value.gameGenerated)
+        assertEquals("缓存命中后不再调用子代理", 1, script.calls.count { it.first.firstOrNull()?.content?.contains("游戏代码摘要器") == true })
+        assertTrue(
+            "缓存摘要仍应注入上下文",
+            script.calls.last().first.any { it.content.contains("参照模板摘要") }
+        )
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `摘要子代理失败时静默回退为无参照生成`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-ref-fail-${System.nanoTime()}")
+        setupTemplateGame(dir)
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"intent":"dev","confidence":0.9}"""),
+                plainRecognition,
+                RuntimeException("digest boom"),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("f-w", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        val s = agent.session.value
+        assertTrue("无参照照常交付", s.gameGenerated)
+        assertNull(s.error)
+        // 无摘要段（参照是增强不是依赖），但参照工具与纪律仍在（库仍可用）
+        val loopReq = script.calls[3]
+        assertFalse(loopReq.first.any { it.content.contains("参照模板摘要") })
+        assertTrue(loopReq.first.any { it.content.contains("参照工具纪律") })
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `修改回合不注入摘要且参照工具不可见`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-ref-iterate-${System.nanoTime()}")
+        val script = ScriptedLlmClient(
+            mfFirstTurnScript() + listOf(
+                LlmResponse("""{"intent":"dev","confidence":0.9,"reason":"调整画面"}"""),
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("i-e", "editfile", """{"path":"js/world.js","old_string":${jsonStr("LEAF_OPACITY = 0.35")},"new_string":${jsonStr("LEAF_OPACITY = 0.9")}}""")
+                    )
+                ),
+                LlmResponse("已调整")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        val meta = agent.saveCurrentGame("迭代镇") ?: throw AssertionError("保存失败")
+        val context = mock(Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        check(GameRepository(context).setTemplateFlag(meta.id, true))
+
+        agent.sendUserMessage("调整一下树叶透明度", qualityTier = "fast")
+        assertTrue(agent.session.value.gameGenerated)
+        // 修改回合：无摘要段、无参照纪律、工具清单无 readref/listrefs
+        val iterateCalls = script.calls.drop(4)
+        assertTrue(iterateCalls.isNotEmpty())
+        assertFalse("修改回合不得注入参照摘要", iterateCalls.any { c -> c.first.any { it.content.contains("参照模板摘要") } })
+        assertFalse("修改回合不得注入参照纪律", iterateCalls.any { c -> c.first.any { it.content.contains("参照工具纪律") } })
+        assertFalse("修改回合工具清单不得含参照工具", iterateCalls.any { c -> c.second.any { it.name in GameTools.REF_TOOL_NAMES } })
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `参照轮独立计压-不触侦查压力且门禁只摘参照工具写入恢复`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-ref-chain-${System.nanoTime()}")
+        val repo = setupTemplateGame(dir)
+        val templateId = repo.listTemplateGames().single().id
+        fun readref(tag: String, path: String = "js/world.js") = LlmResponse(
+            "", toolCalls = listOf(ToolCallData(tag, "readref", """{"game":$templateId,"path":"$path"}"""))
+        )
+        val script = ScriptedLlmClient(
+            listOf(
+                LlmResponse("""{"intent":"dev","confidence":0.9}"""),
+                plainRecognition,
+                LlmResponse(digestReply),
+                // 第 1 轮：listrefs + readref（两种参照工具都真实执行）
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-l", "listrefs", "{}"),
+                        ToolCallData("c-r1", "readref", """{"game":$templateId,"path":"js/world.js"}""")
+                    )
+                ),
+                readref("c-r2"), readref("c-r3"),   // 第 3 轮末 streak=3 → 参照提醒
+                readref("c-r4"), readref("c-r5"),   // 第 5 轮末 streak=5 → 参照门禁 ON
+                readref("c-r6"),                     // 门禁期幻觉调用 → 执行层拒绝
+                LlmResponse(
+                    "", toolCalls = listOf(
+                        ToolCallData("c-w", "writefile", """{"path":"index.html","content":${jsonStr(validHtml)}}""")
+                    )
+                ),
+                LlmResponse("完成")
+            )
+        )
+        val agent = newAgent(dir, client = script)
+        agent.sendUserMessage("做一个我的世界游戏", qualityTier = "fast")
+        assertTrue(agent.session.value.gameGenerated)
+
+        // listrefs/readref 真实返回（模板标题与原文可见）
+        assertTrue(script.calls[4].first.any { it.role == ChatMessage.ROLE_TOOL && it.content.contains("树叶镇") })
+        assertTrue(script.calls[4].first.any { it.role == ChatMessage.ROLE_TOOL && it.content.contains("WORLD_MARKER") })
+        // 第 3 轮末注入参照提醒（第 4 轮请求可见）
+        assertTrue("streak=3 应注入参照提醒", script.calls[6].first.any { it.content.contains("参照提醒") })
+        // 全程纯参照轮不触侦查口径：任何请求都不得出现侦查提醒/最后通牒
+        val allText = script.calls.flatMap { it.first }.joinToString(" ") { it.content }
+        assertFalse("参照轮不得触发侦查压力", allText.contains("侦查提醒"))
+        assertFalse(allText.contains("侦查超限"))
+        // 门禁只摘参照工具（第 6 轮请求仍有 writefile/readfile，无 readref）
+        val gatedTools = script.calls[8].second
+        assertFalse("门禁期参照工具应缺席", gatedTools.any { it.name in GameTools.REF_TOOL_NAMES })
+        assertTrue("门禁期本游戏工具不受影响", gatedTools.any { it.name == GameTools.WRITE_FILE })
+        // 门禁期幻觉 readref 被执行层拒绝（第 7 轮请求历史可见拒绝观察）
+        assertTrue(script.calls[9].first.any { it.role == ChatMessage.ROLE_TOOL && it.content.contains("参照门禁") })
+        // 写入后参照工具恢复（最后一轮请求的工具清单重新含 readref）
+        assertTrue("写入后参照工具应恢复", script.calls[10].second.any { it.name == GameTools.READ_REF })
+        dir.deleteRecursively()
+        Unit
+    }
+
+    @Test
+    fun `出厂模板幂等安装为模板库条目`() = runBlocking {
+        val dir = File(System.getProperty("java.io.tmpdir"), "agent-ref-factory-${System.nanoTime()}")
+        // 出厂包：manifest 登记一个 zip；zip 内含合法入口与簿记
+        val bos = ByteArrayOutputStream()
+        ZipOutputStream(bos).use { zos ->
+            fun put(name: String, content: String) {
+                zos.putNextEntry(ZipEntry(name)); zos.write(content.toByteArray(Charsets.UTF_8)); zos.closeEntry()
+            }
+            put("index.html", validHtml)
+            put("session.json", "[]")
+            put("agent_state.json", "{}")
+        }
+        val zipBytes = bos.toByteArray()
+        val manifestJson = """{"zips":["factory-sandbox.zip"]}"""
+        val context = mock(Context::class.java)
+        `when`(context.filesDir).thenReturn(dir)
+        val assets = mock(AssetManager::class.java)
+        `when`(assets.open("templates/manifest.json")).thenReturn(ByteArrayInputStream(manifestJson.toByteArray()))
+        `when`(assets.open("templates/factory-sandbox.zip")).thenReturn(ByteArrayInputStream(zipBytes))
+        `when`(context.assets).thenReturn(assets)
+        val repo = GameRepository(context)
+
+        repo.ensureFactoryTemplatesInstalled(assets)
+        val first = repo.listGames()
+        assertEquals("出厂模板应安装为一个游戏", 1, first.size)
+        assertTrue("出厂模板自动置模板标记", repo.listTemplateGames().single().isTemplate)
+        val firstId = first.single().id
+
+        // 幂等：重复安装不产生第二个游戏
+        repo.ensureFactoryTemplatesInstalled(assets)
+        assertEquals(listOf(firstId), repo.listGames().map { it.id })
         dir.deleteRecursively()
         Unit
     }

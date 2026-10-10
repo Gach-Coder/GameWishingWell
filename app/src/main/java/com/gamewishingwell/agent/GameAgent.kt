@@ -1165,6 +1165,14 @@ class GameAgent(
         editingGameId = meta.id
         // 身份升级通知（AgentHub 重挂键位）：同一实例以 game-<id> 续作，草稿键位让位。
         onAdoptedGameId?.invoke(meta.id)
+        // 草稿工作区随身份切换迁移：入库后工作区路径切到 game-<id>（原草稿目录不再
+        // 被读取），把刚入库的全量文件（files 此刻就在内存里）同步种进新编辑区——
+        // 保存后到下一回合之间的预览与继续编辑立即看到完整文件，不依赖回合起点的
+        // completeWorkspaceFromSaved 兜底。
+        runCatching {
+            val ws = GameFileWorkspace(editingWorkspaceDir(meta.id))
+            files.forEach { (path, content) -> ws.writeInitial(path, content) }
+        }.onFailure { alog("draft workspace migration failed: ${it.message}") }
         // 草稿期回合日志随会话迁入游戏文件夹（入库不是删除，日志只随游戏删除）；
         // 必须先于 clearDraft——后者会把 drafts/log 连带删掉。
         repository.adoptDraftLogs(meta.id)
@@ -1764,6 +1772,10 @@ class GameAgent(
     ): String {
         val workspace = GameFileWorkspace(gameWorkspaceDir())
         seedWorkspace(workspace, s.currentHtml)
+        // 已入库游戏的 chat 查代码同样要全量视野：js/css/断言从保存区补全
+        //（与 dev 回合共用同一补全原语，只增不改），否则"计分逻辑在哪"类
+        // 问题同样只能看到入口壳。
+        completeWorkspaceFromSaved(workspace)
         val executor = GameToolExecutor(workspace, readOnly = true)
         val readToolSpecs = GameTools.specs().filter {
             it.name in setOf(GameTools.LIST_FILES, GameTools.READ_FILE, GameTools.GREP_FILE, GameTools.OUTLINE)
@@ -1899,12 +1911,40 @@ class GameAgent(
         // 工具沙箱工作区：会话级目录（草稿或已保存游戏），种子为当前代码版本。
         val workspace = GameFileWorkspace(gameWorkspaceDir())
         seedWorkspace(workspace, existingHtml)
-        // 回归断言随保存入库、随编辑恢复：编辑会话的工作区缺失 scenarios.json 时
-        // 从保存区带回（保存后继续编辑不丢断言套件——"修好新问题弄坏旧功能"的回归保护）。
-        val editingIdForWs = editingGameId
-        if (editingIdForWs != null && workspace.read(GameScenarios.FILE) == null) {
-            repository.loadGameFile(editingIdForWs, GameScenarios.FILE)?.let { saved ->
-                runCatching { workspace.writeInitial(GameScenarios.FILE, saved) }
+        // 工作区补全（原 scenarios.json 单文件带回特例的推广）：js/css 与回归断言等
+        // 全部辅助文件从保存区一并带回，修复回合必须看到当前版本的全量文件。
+        // 必须在下方回合起点快照与种子指纹之前完成——回填是恢复基线而非模型修改，
+        // 补全进快照的文件从此受写入铁律相似度护栏保护（事故里护栏正因快照缺文件
+        // 而对 20KB 级"重建式新建"完全失明）。
+        completeWorkspaceFromSaved(workspace)
+        // 完整性保险丝：补全后入口仍引用无处可寻的本地文件 = 保存区与工作区双撕裂，
+        // 进工具循环只会被"缺文件"错误勒索成整体重建——如实终止，请用户重新保存/导入。
+        if (existingHtml != null) {
+            val entry = workspace.read(GameFileWorkspaceEntryPoint.DEFAULT) ?: existingHtml
+            val missing = GameValidator.missingLocalFileRefs(entry) { workspaceFileExists(it) }
+            if (missing.isNotEmpty()) {
+                failTurn(
+                    "游戏文件不完整（${missing.size} 个被引用的文件缺失），已停止本轮修改以避免损坏游戏。请重新保存或重新导入该游戏后再试。",
+                    internalDetail = "integrity fuse: missing local refs after completeWorkspaceFromSaved: $missing (game-$editingGameId)"
+                )
+                return
+            }
+        }
+        // 参照模板（仅首生成回合，A/C 阶段）：出厂模板幂等安装 → 玩家甄选清单 →
+        // 类型匹配择优生成预回合摘要（子代理一次性调用 + 缓存，失败静默回退为无参照）；
+        // listrefs/readref 只读工具同期开放（参照轮走独立压力链，见 runToolLoop）。
+        // 修改/修复回合一律不启用——修复轮的纪律是"只改点名的"，开参照只会鼓励跑题。
+        // 主 Agent 的消费面恒为"多一段动态 prompt + 两个只读工具"，其余链路零感知。
+        var referenceDigest: Pair<String, String>? = null
+        var refLibrary: RefLibrary? = null
+        if (existingHtml.isNullOrBlank()) {
+            runCatching { repository.ensureFactoryTemplatesInstalled(appContext.assets) }
+            val templates = runCatching { repository.listTemplateGames() }.getOrDefault(emptyList())
+            if (templates.isNotEmpty()) {
+                refLibrary = TemplateRefLibrary(templates)
+                pickReferenceTemplate(plan, instruction, templates)?.let { picked ->
+                    referenceDigest = obtainReferenceDigest(picked, llm)?.let { picked.title to it }
+                }
             }
         }
         // 条件引入机制：本轮允许的内置引擎只算一次（提示词/执行器/写入校验/验收同源共用）。
@@ -1955,6 +1995,8 @@ class GameAgent(
             advisoryScope = advisoryScope,
             // 3D 硬性契约：视角旋转断言必含且不得改弱（写入校验打回，防断言作弊）
             requireViewAssertion = plan.visualDimension == GameSchema.DIMENSION_3D,
+            // 参照库（首生成回合注入；修复/迭代轮为 null，listrefs/readref 不可用）
+            refLibrary = refLibrary,
             // 参数外置契约维护：参数键删除/改名的授权判定——用户指令点名键名或授权
             // 重做才放行（sanitizedInstruction 已剔除否定窗口，防"不要删 X"误授权）
             configKeyDeletionAuthorized = { allowFullRewrite || sanitizedInstruction.contains(it) }
@@ -1971,7 +2013,9 @@ class GameAgent(
             seedWorkspaceFp = workspaceFingerprint(workspace),
             allowedEngines = allowedEngines,
             fixTurn = isFixTurn,
-            scopeFence = scopeFence
+            scopeFence = scopeFence,
+            referenceDigest = referenceDigest,
+            refLibrary = refLibrary
         )
         if (outcome is GenOutcome.LegacyFallback) {
             outcome = runLegacyRewriteLoop(
@@ -2087,7 +2131,11 @@ class GameAgent(
         /** 修复轮（运行报错回传/修复快车道）：自检降为一轮回归检查，且不参与预算复核。 */
         fixTurn: Boolean = false,
         /** 修改范围契约：修改回合且未获重做授权时注入提示词（仅提示词层约束，执行层不检查）。 */
-        scopeFence: Boolean = false
+        scopeFence: Boolean = false,
+        /** 参照模板摘要（title → digest；首生成轮命中模板时注入，null=无参照段）。 */
+        referenceDigest: Pair<String, String>? = null,
+        /** 参照库（首生成轮注入 listrefs/readref；null=无参照工具与参照压力链）。 */
+        refLibrary: RefLibrary? = null
     ): GenOutcome {
         val customSystem = settingsRepository.settings.value.systemPrompt.trim()
         // 玩家参数覆盖注入（参数面板 user_config.json）：编辑已保存游戏且玩家有覆盖时，
@@ -2101,7 +2149,10 @@ class GameAgent(
             ChatMessage("system", GamePrompt.systemPrompt(customSystem.ifBlank { null }, toolMode = true)),
             ChatMessage(
                 "user",
-                buildToolContextMessage(instruction, plan, firstGeneration, scopeFence, playerOverrideNote)
+                buildToolContextMessage(
+                    instruction, plan, firstGeneration, scopeFence, playerOverrideNote,
+                    referenceDigest, referenceToolsEnabled = refLibrary != null
+                )
             )
         )
 
@@ -2170,6 +2221,14 @@ class GameAgent(
         // 24 轮熔断全废）——机制门禁是唯一可靠干预。
         var reconToolsGated = false
         var reconUltimatumRound = 0
+        // 参照压力链（独立于侦查链，① 阶段）：纯参照轮（只调 listrefs/readref、无任何
+        // 本游戏动作）不计入侦查口径——参照是首生成轮的合法准备动作，混计会让"看几眼
+        // 模板就开工"误触 5/8 轮侦查压力；但连续只参照不动工同样在烧轮次，先提醒
+        // （3 轮）再摘参照工具（5 轮，本游戏读写工具不受影响），写入即恢复。全局
+        // 失速熔断（LoopStallTracker）仍统计参照轮——独立链防误伤，不豁免兜底。
+        var refStreak = 0
+        var refAdvised = false
+        var refToolsGated = false
         // 已记录的 readfile 结果在消息历史中的下标：文件一旦被修改即失效，
         // 替换为过期提示——既防上下文膨胀（每读一次多几万 token 拷贝），
         // 也防模型拿旧拷贝当编辑依据导致 old_string 失配、浪费轮次。
@@ -2258,8 +2317,13 @@ class GameAgent(
             //（定位+小编辑为主，思考轮 3~4 倍时延在此性价比最低）；其余回合尊重用户思考开关。
             if (quietRound && round > 1) alog("quiet round (thinking off)")
             // 侦查门禁期只提供写入类工具：读取既不可能被调用（specs 缺席），
-            // 幻觉调用也会在执行层被拒（双保险见下方执行分支）。
-            val roundTools = if (reconToolsGated) GameTools.writeOnlySpecs() else GameTools.specs()
+            // 幻觉调用也会在执行层被拒（双保险见下方执行分支）。参照工具（listrefs/
+            // readref）随首生成轮注入，参照门禁期只摘参照两件（本游戏读写不受影响）。
+            val roundTools = when {
+                reconToolsGated -> GameTools.writeOnlySpecs()
+                refLibrary != null && !refToolsGated -> GameTools.specs() + GameTools.refSpecs()
+                else -> GameTools.specs()
+            }
             val resp = try {
                 callLlm(if (quietRound) llmQuiet else llm, messages, roundTools, stageLabel = genStage)
             } catch (e: CancellationException) {
@@ -2731,6 +2795,20 @@ class GameAgent(
                                 "做最小修改并交付，验证反馈会指出偏差。发生一次写入后读取类工具立即恢复。）"
                         )
                     }
+                    // 参照门禁的执行层兜底（同款双保险，只拦参照两件）。
+                    refToolsGated && call.name in GameTools.REF_TOOL_NAMES -> {
+                        alog("ref gate: reject ${call.name} #${call.id}")
+                        ToolOutcome(
+                            callId = call.id,
+                            name = call.name,
+                            ok = false,
+                            mutated = false,
+                            html = null,
+                            report = null,
+                            observation = "（参照门禁：连续只参照未落盘，listrefs/readref 已停用。" +
+                                "请基于已获取的参照信息立即 writefile 本游戏；发生一次写入后参照工具自动恢复。）"
+                        )
+                    }
                     call.name == GameTools.EDIT_FILE && targetPath != null && targetPath in failedEditPaths -> {
                         alog("editfile short-circuit: $targetPath 前序同轮编辑已失配，跳过 #${call.id}")
                         ToolOutcome(
@@ -2830,7 +2908,11 @@ class GameAgent(
             lastReport?.takeIf { it.hasErrors }?.let { recordKnownErrors(it) }
             // 轮次结局分类（Mutated/Recon）交由失速跟踪器统一裁决：侦查空转沿用
             // 24 轮熔断 + 每 8 轮催促；任何写入同时清零被驳回宣告链（行动即出狱）。
-            if (!mutatedThisRound) readOnlyRounds++
+            // 纯参照轮（仅 listrefs/readref、零写入）不计入侦查口径：参照是首生成轮的
+            // 合法准备动作，独立参照链在下方管束——两链互不越界。
+            val refOnlyRound = !mutatedThisRound && resp.toolCalls.isNotEmpty() &&
+                resp.toolCalls.all { it.name in GameTools.REF_TOOL_NAMES }
+            if (!mutatedThisRound && !refOnlyRound) readOnlyRounds++
             // 侦查占比干预（累计口径，一次性）：连续口径被"读取轮与宣告轮交错"重置时，
             // 整回合仍可能在纯侦查——实测删弹窗回合开局 11 轮纯读（约 4.5 分钟）才
             // 做第一次修改，期间的 8 轮催促被模型无视后没有任何更早的干预。
@@ -2898,8 +2980,42 @@ class GameAgent(
                     reconToolsGated = false
                     alog("recon gate OFF at round $round (write occurred, read tools restored)")
                 }
-            } else {
+            } else if (!refOnlyRound) {
                 consecutiveReadOnly++
+            }
+            // 参照链计数与门禁升降：写入 = 参照目的已达成（恢复工具并清零提醒）；
+            // 本地动作轮（读/写本游戏）= 模型已在动工（清零连续参照）；纯参照轮累进。
+            if (mutatedThisRound) {
+                refStreak = 0
+                refAdvised = false
+                if (refToolsGated) {
+                    refToolsGated = false
+                    alog("ref gate OFF at round $round (write occurred, ref tools restored)")
+                }
+            } else if (refOnlyRound) {
+                refStreak++
+                if (!refAdvised && refStreak >= 3) {
+                    refAdvised = true
+                    alog("ref advisory at round $round (ref-only streak $refStreak)")
+                    messages += ChatMessage(
+                        "user",
+                        "（参照提醒：已连续 $refStreak 轮只读参照未动工，每轮都是一次完整的模型往返。" +
+                            "参照的目的是借鉴写法——定位到要借鉴的实现即可，请开始用 writefile 落盘本游戏；" +
+                            "还需要某个具体片段时用 readref 带行号区段精准取，不要把参照读成通读。）"
+                    )
+                }
+                if (!refToolsGated && refStreak >= 5) {
+                    refToolsGated = true
+                    alog("ref gate ON at round $round (ref-only streak $refStreak)")
+                    messages += ChatMessage(
+                        "user",
+                        "（参照门禁已生效：连续 $refStreak 轮只参照未落盘，listrefs/readref 已停用。" +
+                            "请基于已获取的参照信息立即 writefile 本游戏；发生一次写入后参照工具自动恢复。）"
+                    )
+                }
+            } else {
+                refStreak = 0
+                refAdvised = false
             }
             // 挣扎时恢复思考：quiet 的性价比前提是"机械轮"（有明确错误文本的修复/反馈
             // 轮），连续只读的开放侦查恰是需要思考判断"信息是否足够"的轮次——无思考
@@ -3218,7 +3334,11 @@ class GameAgent(
         /** 修改范围契约：修改回合且用户未明确要求重做时注入（仅提示词层约束，执行层不检查）。 */
         scopeFence: Boolean = false,
         /** 玩家参数覆盖清单（GameConfigContract.renderOverrideNote 产物；null=无覆盖不注入）。 */
-        playerConfigOverride: String? = null
+        playerConfigOverride: String? = null,
+        /** 参照模板摘要（title → digest；null=无参照段不注入——参照是增强不是依赖）。 */
+        referenceDigest: Pair<String, String>? = null,
+        /** 参照工具（listrefs/readref）本轮可见：注入参照工具纪律。 */
+        referenceToolsEnabled: Boolean = false
     ): String = buildString {
         if (firstGeneration) {
             append(
@@ -3227,6 +3347,11 @@ class GameAgent(
             )
             append(GamePrompt.readTemplate(appContext))
             append("\n</game_template>\n\n")
+            // 同类模板摘要（③ 预回合注入）：借鉴"怎么写"，不照抄"写了什么"。
+            referenceDigest?.let { (title, digest) ->
+                append(GamePrompt.referenceDigestSection(title, digest))
+                append("\n\n")
+            }
         } else {
             _session.value.rollingSummary.takeIf { it.isNotBlank() }?.let {
                 append("rolling summary：\n$it\n\n")
@@ -3269,6 +3394,10 @@ class GameAgent(
         append("用户指令：$instruction\n\n")
         append(gameContractBlock(plan, instruction))
         append("\n\n")
+        if (referenceToolsEnabled) {
+            append(GamePrompt.REFERENCE_TOOL_RULE)
+            append("\n\n")
+        }
         append(GamePrompt.toolWorkflowPrompt(firstGeneration))
         append("\n\n")
         append(GamePrompt.playabilityRequirements())
@@ -3348,6 +3477,109 @@ class GameAgent(
             workspace.writeInitial(GameFileWorkspaceEntryPoint.DEFAULT, html)
         } else {
             workspace.writeUpdated(GameFileWorkspaceEntryPoint.DEFAULT, html)
+        }
+    }
+
+    /**
+     * 参照库实现（listrefs/readref 数据源，B 阶段）：清单在回合起点固定（快照语义，
+     * 中途加入的模板下一回合才可见）；读取走仓库白名单通道——簿记、玩家参数覆盖、
+     * 保存点与日志对参照视野不可见，且只能读清单内的模板游戏（不能顺藤摸别的游戏）。
+     */
+    private inner class TemplateRefLibrary(private val templates: List<GameMeta>) : RefLibrary {
+        override suspend fun list(): String {
+            if (templates.isEmpty()) {
+                return "模板库为空（可在首页游戏卡菜单把高质量游戏「加入模板库」，同类新游戏会自动参照）。"
+            }
+            // map 为 inline（内部可挂起调用），joinToString 的 transform 不是——先 map 再拼接。
+            val lines = templates.map { t ->
+                val files = runCatching { repository.savedGameFilePaths(t.id) }.getOrDefault(emptyList())
+                    .filter { GameRepository.isGameFileRel(it) }
+                "game-${t.id} 《${t.title}》" +
+                    (if (t.deliveredVersion > 0) "（第 ${t.deliveredVersion} 版）" else "") +
+                    "\n  文件：${files.joinToString("、").ifEmpty { "（无游戏文件）" }}"
+            }
+            return "模板库（玩家甄选的高质量游戏，可 readref 借鉴写法）：\n" + lines.joinToString("\n")
+        }
+
+        override suspend fun read(gameId: Long, path: String): String? =
+            if (templates.none { it.id == gameId }) null else repository.loadGameRefFile(gameId, path)
+    }
+
+    /**
+     * 模板择优（确定性启发式，③ 阶段）：两条匹配线——
+     * ① 强：设计清单的系统/维度关键词出现在模板标题+描述（确认门流程的类型化请求，
+     *    如"塔防游戏，50波可升级"对上《星际塔防旗舰版》）；
+     * ② 弱：模板标题的实体词（≥3 字，按非文字字符切分）出现在用户指令里——直达
+     *    流程的裸需求（如"做一个我的世界游戏"）plan.systems 已被剥离（direct-make
+     *    契约），只能靠指令原文反查标题《我的世界·树叶镇》。
+     * 零分不注入：不相关的参照只会污染上下文，宁缺毋滥；同分取最近更新。
+     */
+    private fun pickReferenceTemplate(plan: DesignPlan, instruction: String, templates: List<GameMeta>): GameMeta? {
+        val strongKeywords = (plan.gameSystems + plan.visualDimension).filter { it.isNotBlank() }
+        fun score(t: GameMeta): Int {
+            val hay = t.title + " " + t.description
+            var s = strongKeywords.count { hay.contains(it) } * 2
+            t.title.split(Regex("[^\\p{L}\\p{N}]+"))
+                .filter { it.length >= 3 }
+                .forEach { token -> if (instruction.contains(token)) s += 1 }
+            return s
+        }
+        return templates.filter { score(it) > 0 }.maxByOrNull { score(it) }
+    }
+
+    /**
+     * 预回合摘要获取（③ 阶段）：缓存命中直接用；否则子代理一次性调用生成并落缓存
+     * （key = 游戏id + 文件清单指纹，模板改版自动失效）。任何失败返回 null——
+     * 参照是增强不是依赖，无摘要照常生成，主路径零影响。
+     */
+    private suspend fun obtainReferenceDigest(meta: GameMeta, llm: LlmClient): String? = runCatching {
+        val files = repository.loadGameTextFiles(meta.id)
+        if (files.isEmpty()) return@runCatching null
+        val fingerprint = files.toSortedMap().entries.joinToString("|") { (p, c) ->
+            "$p@${GameFileWorkspace.sha256(c).take(12)}"
+        }
+        val cacheKey = "${meta.id}-${GameFileWorkspace.sha256(fingerprint).take(12)}"
+        val cache = GameReferenceDigest.Cache(File(appContext.filesDir, "agent/digests"))
+        cache.read(cacheKey)?.let { return@runCatching it }
+        _session.update { it.copy(agentStage = "正在提炼参照模板《${meta.title}》的实现要点") }
+        val reply = collectTextReply(
+            llm,
+            listOf(
+                ChatMessage("system", GameReferenceDigest.SUB_AGENT_SYSTEM),
+                ChatMessage(
+                    "user",
+                    GameReferenceDigest.subAgentUserPrompt(
+                        meta.title, meta.deliveredVersion,
+                        GameReferenceDigest.buildFilesText(files)
+                    )
+                )
+            )
+        )
+        GameReferenceDigest.sanitize(reply)?.also { cache.write(cacheKey, it) }
+    }.getOrNull()
+
+    /**
+     * 工作区补全：以保存区为冷备，把"保存区有、工作区无"的游戏文件补进工作区。
+     * 多文件游戏的辅助文件（js/css/回归断言）不在会话状态里，编辑区目录随身份
+     * 换位（草稿入库切到 game-<id> 新目录）或清空后，只靠 [seedWorkspace] 只能
+     * 种回入口——修复回合会面对"引用存在、文件缺失"的撕裂状态，被缺文件校验
+     * 逼成整体重写（20261006 树叶透明事故：三个修复回合全部全量重建）。只增
+     * 不改不删，幂等：
+     * - 不覆盖工作区已有文件（工作区可能领先于保存区：自动保存关闭/失败时的
+     *   未保存修改；[GameFileWorkspace.writeInitial] 对已存在文件本身即拒绝）；
+     * - 不动入口文件（入口以会话 currentHtml 种子为准，保存区副本不得反超）；
+     * - 草稿会话（无 editingGameId）不补：防止把别的游戏的文件带进草稿。
+     * 调用时机必须早于回合起点快照与种子指纹：回填是恢复基线而非模型修改，
+     * 补全进快照的文件也因此受写入铁律相似度护栏的保护。
+     */
+    private suspend fun completeWorkspaceFromSaved(workspace: GameFileWorkspace) {
+        val gameId = editingGameId ?: return
+        val saved = repository.loadGameTextFiles(gameId)
+        if (saved.isEmpty()) return
+        val existing = workspace.listPaths().toSet()
+        for ((path, content) in saved) {
+            if (path == GameFileWorkspaceEntryPoint.DEFAULT || path in existing) continue
+            runCatching { workspace.writeInitial(path, content) }
         }
     }
 
